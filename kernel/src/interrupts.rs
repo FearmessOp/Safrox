@@ -154,7 +154,23 @@ fn read_cr2() -> u64 {
 
 /// Decode the #PF error code into something readable.
 ///
-/// Reference: Intel SDM Vol. 3A, Figure 6-9 "Page-Fault Error Code".
+/// Five bits, not three. M1 decoded only P, W/R and U/S, which was enough
+/// for the faults M1 could produce -- but it made an instruction fetch
+/// indistinguishable from a read, and it said nothing at all about a
+/// reserved-bit violation. M3 produces both:
+///
+/// * The NX test's entire proof is bit 4. An error code of 0x11 is a
+///   *fetch* from a no-execute page; the old decoder printed it as
+///   "supervisor read protection-violation", which is not what happened
+///   and which would have let a broken NX mapping look like an ordinary
+///   permission fault.
+/// * Bit 3 is what the CPU reports when EFER.NXE is clear and an entry
+///   sets bit 63 anyway -- exactly the failure `cpu::init` asserts against.
+///   Naming it means that if the assertion were ever removed, the symptom
+///   would still be legible instead of appearing as a mysterious fault.
+///
+/// Reference: Intel SDM Vol. 3A, Figure 6-9 "Page-Fault Error Code" and
+/// Table 6-7 ("Page-Fault Error Code Bits").
 fn page_fault_cause(error_code: u64) -> (&'static str, &'static str, &'static str) {
     // Bit 0, P: 0 = the fault was caused by a non-present page.
     let present = if error_code & (1 << 0) != 0 {
@@ -162,18 +178,33 @@ fn page_fault_cause(error_code: u64) -> (&'static str, &'static str, &'static st
     } else {
         "not-present"
     };
-    // Bit 1, W/R: 1 = the access was a write.
-    let access = if error_code & (1 << 1) != 0 {
+
+    // Bits 1, 3 and 4 together say what the access was. Order matters:
+    //
+    // * Bit 4 (I/D) is an instruction fetch, and the CPU only ever sets it
+    //   when EFER.NXE is enabled -- so seeing it is also evidence that
+    //   cpu::init did its job. A fetch is never a write, so it is checked
+    //   first.
+    // * Bit 3 (RSVD) means a reserved bit was set in some level of the
+    //   paging structures. It overrides the W/R interpretation because the
+    //   walk failed before the access type mattered.
+    let access = if error_code & (1 << 3) != 0 {
+        "reserved-bit set in a paging structure"
+    } else if error_code & (1 << 4) != 0 {
+        "instruction fetch"
+    } else if error_code & (1 << 1) != 0 {
         "write"
     } else {
         "read"
     };
+
     // Bit 2, U/S: 1 = the access came from user mode.
     let mode = if error_code & (1 << 2) != 0 {
         "user"
     } else {
         "supervisor"
     };
+
     (present, access, mode)
 }
 

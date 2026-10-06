@@ -20,13 +20,25 @@
 //!      out frame 0, the kernel image, or its own metadata, and which
 //!      detects a double free rather than corrupting itself quietly.
 //!
-//! Deliberately absent: virtual memory (we still run on the bootloader's
-//! page tables), external interrupts (the PIC is masked as Limine left it),
-//! user space, and any heap -- there is no `alloc` before M4.
+//! Added by M3:
+//!  10. EFER.NXE, SMEP, SMAP and PGE enabled from CPUID, not assumed.
+//!  11. Our own page tables: a physical window that is NX and covers only
+//!      RAM, the kernel image mapped W^X section by section, and the
+//!      double-fault stack behind a genuinely unmapped guard page.
+//!  12. map/unmap/translate, with TLB invalidation enforced by the type
+//!      system.
+//!  13. The kernel moved onto a stack of its own, because the one Limine
+//!      gives us sits in the memory we are about to reclaim.
+//!  14. The bootloader's memory reclaimed, after copying out everything
+//!      still being read.
+//!
+//! Deliberately absent: external interrupts (the PIC is masked as Limine
+//! left it), user space, and any heap -- there is no `alloc` before M4.
 
 #![no_std]
 #![no_main]
 
+mod cpu;
 mod faults;
 mod gdt;
 mod idt;
@@ -37,6 +49,7 @@ mod memtest;
 mod panic;
 mod qemu;
 mod serial;
+mod vmtest;
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
@@ -48,7 +61,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M2");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M3");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -302,10 +315,28 @@ pub extern "C" fn kstart() -> ! {
         gdt::DOUBLE_FAULT_IST_INDEX
     );
 
+    // ---- CPU features (M3) ---------------------------------------------
+    //
+    // Before any page table, because EFER.NXE decides whether bit 63 of an
+    // entry means "no execute" or "reserved, fault on use". Every NX
+    // mapping built below depends on it.
+
+    // SAFETY: First and only call, single-threaded, interrupts disabled.
+    // Modifies EFER and CR4; no page table currently in use sets bit 63,
+    // so changing that bit's meaning cannot invalidate a live mapping.
+    //
+    // The result is also stashed in a static, because `kmain` runs on a
+    // different stack and nothing in this frame survives the switch.
+    unsafe {
+        cpu::init();
+    }
+
     // ---- Physical memory (M2) ------------------------------------------
     //
     // After the IDT, so that a fault while walking the memory map produces
     // a report rather than a triple fault.
+
+    let kernel_slide = virtual_base.wrapping_sub(physical_base);
 
     // SAFETY: First and only call, on the single-threaded boot path. The
     // HHDM offset and the kernel slide come from the responses validated
@@ -313,12 +344,105 @@ pub extern "C" fn kstart() -> ! {
     // which is what lets the allocator claim storage for its own bitmap out
     // of the memory it is about to manage.
     unsafe {
-        memory::init(
-            &MEMMAP,
-            hhdm.offset,
-            virtual_base.wrapping_sub(physical_base),
-        );
+        memory::init(&MEMMAP, hhdm.offset, kernel_slide);
     }
+
+    // ---- Virtual memory (M3) -------------------------------------------
+    //
+    // Copy before switching. Limine's responses live in memory we are about
+    // to reclaim, and the crate hands them out as `&'static`, so nothing
+    // will warn when they go stale. See ADR 013.
+
+    // SAFETY: First and only call, while the responses are still valid.
+    unsafe {
+        memory::bootinfo::capture(&BOOTLOADER_INFO, &CMDLINE, &MEMMAP);
+    }
+
+    memory::vm::set_kernel_slide(kernel_slide);
+
+    let memmap_entries = MEMMAP
+        .response()
+        .expect("Limine did not answer the memory map request")
+        .entries();
+
+    // SAFETY: After cpu::init (NX enabled, or the NX bits below would be
+    // reserved) and after the frame allocator is up, since building tables
+    // needs frames. Interrupts are disabled.
+    unsafe {
+        memory::vm::init(memmap_entries);
+    }
+
+    // IST1 moved during vm::init; report where it landed now rather than
+    // the bootstrap address printed earlier.
+    let (ist_low, ist_high) = gdt::ist1_range();
+    println!(
+        "[cpu] ist1 now: {:#018x} .. {:#018x} ({} KiB), guard page below",
+        ist_low,
+        ist_high,
+        (ist_high - ist_low) / 1024
+    );
+
+    // ---- Off the bootloader's stack ------------------------------------
+    //
+    // Everything below this line runs on a stack the kernel allocated, and
+    // nothing in this frame reaches it: changing RSP abandons the locals,
+    // the saved registers and the return address all at once. That is why
+    // `kstart` ends here instead of calling `kmain` and carrying on.
+    //
+    // The reason it must happen at all is `reclaim`. Limine's stack is in
+    // BOOTLOADER_RECLAIMABLE memory -- on this machine at physical
+    // 0x0ff6e000, inside the 0x0ff45000..0x0ffdf000 reclaimable region --
+    // so poisoning that memory while standing on it corrupts the live
+    // stack. The kernel took a #GP at rip=0xdededededededede exactly once
+    // before this existed, which was the poison pattern arriving via `ret`.
+    //
+    // SAFETY: vm::init mapped the main stack in the tables now in CR3 and
+    // verified them before the switch; interrupts are still disabled; and
+    // `kmain` diverges.
+    unsafe { memory::vm::switch_to_main_stack(kmain) }
+}
+
+/// The kernel proper, running on a stack the kernel owns.
+///
+/// Reached only through [`memory::vm::switch_to_main_stack`], which jumps
+/// rather than calls -- there is no return address on the stack and no
+/// caller to return to.
+///
+/// `extern "C"` so that the jump in the stack-switch assembly is to a
+/// function with a known ABI rather than to a Rust item whose calling
+/// convention is unspecified.
+extern "C" fn kmain() -> ! {
+    println!("[boot] now on the kernel's own stack");
+
+    // Off the bootloader's tables *and* off its stack, so its memory is
+    // ours to take. SAFETY: After capture(), after vm::init switched CR3,
+    // and after the stack switch above; reclaim asserts all three before
+    // releasing anything.
+    let reclaimed = unsafe { memory::bootinfo::reclaim() };
+
+    // The copies had to outlive the memory they came from -- that was the
+    // entire point of capture(). Reading them back here proves it on every
+    // boot, not only in the vm-test scenario.
+    let boot_info = memory::bootinfo::get();
+    println!(
+        "[boot] after reclaim: bootloader still reported as {} {} ({} frames gained)",
+        boot_info.bootloader_name(),
+        boot_info.bootloader_version(),
+        reclaimed
+    );
+
+    // The command line comes from our copy, never from Limine's response.
+    // The pointer Limine returned addresses memory that reclaim has just
+    // poisoned and handed to the allocator; reading it now yields 0xDE
+    // bytes. `kstart`'s binding cannot reach here -- it died with the old
+    // stack -- which is a sturdier guarantee than remembering not to use
+    // it.
+    let cmdline = boot_info.cmdline();
+
+    // What the CPU supports, from the static cpu::init filled in. The
+    // `Features` value it returned lived in `kstart`'s frame, which no
+    // longer exists.
+    let features = cpu::features();
 
     // ---- Fault-injection hooks -----------------------------------------
     //
@@ -365,7 +489,33 @@ pub extern "C" fn kstart() -> ! {
         memtest::run();
     }
 
-    println!("[boot] M2 checks passed");
+    // M3 virtual memory scenarios.
+    if cmdline.contains("vm-stale-tlb") {
+        println!("[boot] cmdline requested the stale-TLB check");
+        vmtest::run_stale_tlb();
+    }
+
+    if cmdline.contains("vm-guard-page") {
+        println!("[boot] cmdline requested the guard page test");
+        vmtest::run_guard_page();
+    }
+
+    if cmdline.contains("vm-nx") {
+        println!("[boot] cmdline requested the NX test");
+        vmtest::run_nx();
+    }
+
+    if cmdline.contains("vm-test") {
+        println!("[boot] cmdline requested the virtual memory tests");
+        vmtest::run(&features);
+    }
+
+    if cmdline.contains("vm-stack-overflow") {
+        println!("[boot] cmdline requested the main stack overflow test");
+        vmtest::run_stack_overflow();
+    }
+
+    println!("[boot] M3 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

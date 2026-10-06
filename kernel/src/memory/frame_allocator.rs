@@ -250,13 +250,36 @@ pub unsafe fn init(entries: &[&memmap::Entry]) {
 
     // --- How many frames must the bitmap cover? -------------------------
     //
-    // Up to the highest address of any usable region. Reserved regions
-    // above that need no bits: nothing will ever ask about them, and
-    // `is_used` reports out-of-range frames as used anyway.
+    // Up to the highest address of any frame the allocator may *ever*
+    // manage. Reserved regions above that need no bits: nothing will ask
+    // about them, and `is_used` reports out-of-range frames as used anyway.
+    //
+    // "Ever" is doing real work in that sentence. M2 sized this by the
+    // highest USABLE address, which was correct while usable memory was
+    // the only kind the allocator handled. M3's reclaim then donates the
+    // bootloader-reclaimable regions -- and on the test machine the last
+    // of those, 0x0ff45000..0x0ffdf000, starts exactly where the last
+    // usable region ends. Every frame in it was out of range, and the
+    // first `release` panicked with "out-of-range frame 65349".
+    //
+    // Sizing by both kinds costs a few hundred bytes of bitmap and makes
+    // the bound a property of what the allocator can be given rather than
+    // of what it starts with.
+    let mut highest_managed_end: u64 = 0;
     let mut highest_usable_end: u64 = 0;
     for entry in entries {
-        if entry.type_ == memmap::MEMMAP_USABLE {
-            highest_usable_end = highest_usable_end.max(entry.base + entry.length);
+        match entry.type_ {
+            memmap::MEMMAP_USABLE => {
+                highest_usable_end = highest_usable_end.max(entry.base + entry.length);
+                highest_managed_end = highest_managed_end.max(entry.base + entry.length);
+            }
+            // Not released here -- ADR 008 keeps it until the kernel is off
+            // the bootloader's tables and stack -- but it is released
+            // eventually, so it needs bits.
+            memmap::MEMMAP_BOOTLOADER_RECLAIMABLE => {
+                highest_managed_end = highest_managed_end.max(entry.base + entry.length);
+            }
+            _ => {}
         }
     }
     assert!(
@@ -264,7 +287,7 @@ pub unsafe fn init(entries: &[&memmap::Entry]) {
         "memory map contains no usable regions"
     );
 
-    let frame_count = highest_usable_end.div_ceil(FRAME_SIZE);
+    let frame_count = highest_managed_end.div_ceil(FRAME_SIZE);
     let bitmap_words = frame_count.div_ceil(BITS_PER_WORD);
     let bitmap_bytes = bitmap_words * 8;
 
@@ -546,6 +569,52 @@ pub fn free(frame: PhysFrame) {
 
             // Reuse freed memory first: it is more likely to be in cache,
             // and it keeps the bitmap's low end dense.
+            if frame.0 < allocator.next_hint {
+                allocator.next_hint = frame.0;
+            }
+        });
+    }
+}
+
+/// Hand a frame to the allocator that it has never managed before.
+///
+/// Distinct from [`free`] on purpose. `free` is the counterpart of
+/// `allocate` and treats an already-free frame as a double free, which is
+/// a bug. This is for memory that was excluded from the start and is now
+/// being donated -- the bootloader's, once ADR 013's gates are satisfied.
+/// The frame is expected to be marked used, because every frame outside a
+/// USABLE region starts that way.
+///
+/// # Panics
+///
+/// If the frame is already free. That would mean the allocator already
+/// owned it, which makes this a double donation.
+pub fn release(frame: PhysFrame) {
+    // SAFETY: Not called from inside `with`.
+    unsafe {
+        with(|allocator| {
+            assert!(
+                frame.0 < allocator.frame_count,
+                "release of out-of-range {}",
+                frame
+            );
+
+            // Range checked above; the enclosing unsafe block carries the
+            // argument.
+            assert!(
+                allocator.is_used(frame.0),
+                "release of {}, which the allocator already considers free",
+                frame
+            );
+
+            let changed = allocator.mark_free(frame.0);
+            debug_assert!(changed, "mark_free disagreed with is_used");
+
+            // Donated memory joins the pool, so the baseline moves with it
+            // -- otherwise the leak check in memtest would see the extra
+            // frames as a discrepancy.
+            allocator.initial_free_count += 1;
+
             if frame.0 < allocator.next_hint {
                 allocator.next_hint = frame.0;
             }

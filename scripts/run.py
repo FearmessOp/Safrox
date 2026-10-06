@@ -95,6 +95,46 @@ CPU_INIT_LINES = [
     re.compile(r"^\[cpu\] idt: 32 exception vectors installed", re.M),
 ]
 
+# M3 switches to its own page tables on every boot, before any cmdline hook
+# runs. If any of this is missing, the kernel is still on Limine's tables
+# and nothing downstream means what it claims to.
+VM_INIT_LINES = [
+    # NX must be enabled before any table sets the NX bit, or every such
+    # mapping faults on first use.
+    re.compile(r"^\[cpu\] nx: supported \(efer\.nxe set\)", re.M),
+    re.compile(r"^\[vm\] pmap: \d+ MiB of RAM at 0xffff800000000000, rw\+nx\+global", re.M),
+    # W^X: .text executable and not writable, .rodata neither.
+    re.compile(r"^\[vm\] image \.text: .*PageFlags\(READ \| EXEC \| GLOBAL\)", re.M),
+    re.compile(r"^\[vm\] image \.rodata: .*PageFlags\(READ \| GLOBAL\)", re.M),
+    re.compile(r"^\[vm\] image \.writable: .*PageFlags\(READ \| WRITE \| GLOBAL\)", re.M),
+    # The guard page is real now, not the dead space of M1/M2. Two stacks:
+    # slot 0 for #DF via IST1, slot 1 for the kernel proper.
+    re.compile(r"^\[vm\] kstack\[0\]: .* guard page at 0xffffc80000000000 \(ist1\)", re.M),
+    re.compile(r"^\[vm\] kstack\[1\]: .* guard page at 0xffffc80000005000 \(main\)", re.M),
+    # The pre-switch check is what stands between us and a triple fault.
+    re.compile(r"^\[vm\] pre-switch check: \d+ image pages mapped", re.M),
+    re.compile(r"^\[vm\] now running on our own page tables", re.M),
+    # Off Limine's stack before anything poisons it. Limine allocates the
+    # boot stack from BOOTLOADER_RECLAIMABLE memory, so reclaiming while
+    # still standing on it overwrites the live stack -- which is what the
+    # kernel did until this step existed, taking a #GP with
+    # rip=0xdededededededede. The order of these two lines is the whole
+    # point, so both are required.
+    re.compile(r"^\[vm\] switching stack: 0x[0-9a-f]+ -> 0xffffc8000000[0-9a-f]+", re.M),
+    re.compile(r"^\[boot\] now on the kernel's own stack", re.M),
+    # Bootloader memory reclaimed, and the copies outlived it.
+    re.compile(r"^\[mem\] poisoned \d+ KiB of reclaimable memory with 0xde", re.M),
+    re.compile(r"^\[mem\] reclaimed \d+ frames \(\d+ KiB\) from bootloader-reclaimable", re.M),
+    re.compile(r"^\[boot\] after reclaim: bootloader still reported as \S+ \S+", re.M),
+]
+
+# The poison pattern, as it appears when something follows a pointer into
+# reclaimed bootloader memory. Forbidden everywhere: 0xDE was chosen so that
+# a stale pointer produces a non-canonical address and an immediate fault
+# rather than a plausible read, and seeing it in a register dump means
+# something outlived the memory it pointed at.
+POISON_IN_REGISTERS = re.compile(r"0xdededededededede", re.M)
+
 # Lines the acceptance test demands on the serial console.
 EXPECTATIONS = {
     "success": Expectation(
@@ -103,11 +143,13 @@ EXPECTATIONS = {
         required=[
             *COMMON_BOOT_LINES,
             *CPU_INIT_LINES,
-            re.compile(r"^\[boot\] M2 checks passed", re.M),
+            *VM_INIT_LINES,
+            re.compile(r"^\[boot\] M3 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
             re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
         ],
     ),
     "panic": Expectation(
@@ -121,7 +163,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M2 checks passed", re.M)],
+        forbidden=[re.compile(r"M3 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -138,7 +180,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M2 checks passed", re.M),
+            re.compile(r"^\[boot\] M3 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -157,7 +199,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M2 checks passed", re.M)],
+        forbidden=[re.compile(r"M3 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -176,7 +218,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M2 checks passed", re.M),
+            re.compile(r"M3 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -196,6 +238,16 @@ EXPECTATIONS = {
             re.compile(r"^\[mem\] allocator ready: \d+ free frames", re.M),
             # The kernel's own verdict on each phase.
             re.compile(r"^\[mem\] image frames verified in use: \d+\.\.=\d+", re.M),
+            # The frames the kernel's own page tables and stacks hold are
+            # counted and bounded. M2 asserted the count had not moved at
+            # all, which M3 made false -- vm::init allocates. Narrowed
+            # rather than dropped: an unbounded drift here is a leak during
+            # boot, and nothing else would catch it.
+            re.compile(
+                r"^\[memtest\] \d+ frames held by boot structures .* within "
+                r"the bound of \d+",
+                re.M,
+            ),
             re.compile(r"^\[memtest\] alloc: 10000 unique, aligned, in-range", re.M),
             re.compile(
                 r"^\[memtest\] alloc: none in the kernel image, none is frame 0", re.M
@@ -207,7 +259,7 @@ EXPECTATIONS = {
             ),
             re.compile(r"^\[memtest\] recovery: freed .* and got it straight back", re.M),
             re.compile(r"^\[memtest\] all frame allocator tests passed", re.M),
-            re.compile(r"^\[boot\] M2 checks passed", re.M),
+            re.compile(r"^\[boot\] M3 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant the kernel checks is an assert, so a violation
@@ -234,9 +286,189 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M2 checks passed", re.M),
+            re.compile(r"M3 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
+        ],
+    ),
+    # --- M3: virtual memory ---------------------------------------------
+    "vmtest": Expectation(
+        name="virtual memory",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            re.compile(r"^\[vmtest\] cpu: efer\.nxe set, w\^x is meaningful", re.M),
+            re.compile(
+                r"^\[vmtest\] cr3: own tables; pmap at 0xffff800000000000 is rw\+nx",
+                re.M,
+            ),
+            # The kernel is on a stack it owns, with a guard page, in memory
+            # nobody may reclaim. The kernel checks all three and says so.
+            re.compile(
+                r"^\[vmtest\] stack: rsp 0xffffc8[0-9a-f]+ in kstack\[1\].*"
+                r"guard page at 0xffffc80000005000 unmapped, not reclaimable",
+                re.M | re.S,
+            ),
+            # map -> write -> read back.
+            re.compile(r"^\[vmtest\] map: 0x[0-9a-f]+ -> frame \d+ @ 0x[0-9a-f]+, wrote and read back", re.M),
+            # translate agrees about address and flags.
+            re.compile(r"^\[vmtest\] translate: 0x[0-9a-f]+ -> 0x[0-9a-f]+ PageFlags\(", re.M),
+            # unmap returns the same frame.
+            re.compile(r"^\[vmtest\] unmap: returned frame \d+ @ 0x[0-9a-f]+ as expected", re.M),
+            # The leaf frame comes back; the intermediate tables do not, and
+            # the kernel asserts the exact count rather than ignoring it.
+            re.compile(
+                r"^\[vmtest\] frames: leaf frame returned; 3 page-table frames "
+                r"remain allocated by design",
+                re.M,
+            ),
+            # All four error cases return errors rather than panicking --
+            # this is what matters for M11, where the caller is user space.
+            re.compile(r"^\[vmtest\] error: map over a live mapping -> AlreadyMapped", re.M),
+            re.compile(r"^\[vmtest\] error: unmap an absent page -> NotMapped", re.M),
+            re.compile(r"^\[vmtest\] error: map at non-canonical .* -> NotCanonical", re.M),
+            re.compile(r"^\[vmtest\] error: map with WRITE\|EXEC -> InvalidFlags", re.M),
+            re.compile(r"^\[vmtest\] error: all four cases returned errors, none panicked", re.M),
+            # The copies outlived the memory they came from.
+            re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
+            re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
+            re.compile(r"^\[boot\] M3 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "staletlb": Expectation(
+        name="stale TLB (advisory)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *VM_INIT_LINES,
+            re.compile(r"^\[vmtest\] stale-TLB check \(advisory", re.M),
+            re.compile(r"^\[vmtest\] unmapped it WITHOUT invalidating the TLB", re.M),
+            # Either outcome is accepted. QEMU's TLB is not obliged to
+            # behave like real silicon: it usually drops the entry, in
+            # which case the read faults and we never get here. When it
+            # does not, the kernel says so and the check is advisory --
+            # it proves the test ran, not that the hardware is correct.
+            # Re-running this on real hardware is in the known gaps.
+            re.compile(r"^\[vmtest\] read after unmap returned", re.M),
+        ],
+        forbidden=[re.compile(r"KERNEL PANIC", re.M)],
+    ),
+    "guardpage": Expectation(
+        name="guard page",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *VM_INIT_LINES,
+            re.compile(r"^\[vmtest\] guard page test: writing to 0xffffc80000000000", re.M),
+            re.compile(r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\) \*\*\*", re.M),
+            # CR2 must be the exact byte written: the last qword of the
+            # guard page, which is where an overflow running off the bottom
+            # of the IST stack lands first. In M1/M2 this address was
+            # mapped dead space and the write simply succeeded.
+            re.compile(r"^\[trap\] cr2=0xffffc80000000ff8\b", re.M),
+            # Error code 0x2: not-present (bit 0 clear), write (bit 1 set),
+            # supervisor (bit 2 clear). A *present* page would mean the
+            # guard is mapped and the test proved nothing.
+            re.compile(r"^\[trap\] error_code=0x0{15}2\b", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"the guard page did not fault", re.M),
+        ],
+    ),
+    "nx": Expectation(
+        name="NX enforcement",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *VM_INIT_LINES,
+            re.compile(r"^\[vmtest\] nx test: jumping to 0xffff8", re.M),
+            re.compile(r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\) \*\*\*", re.M),
+            # Error-code bit 4 is instruction-fetch, and the CPU only sets
+            # it when EFER.NXE is enabled -- so this line is also proof
+            # that cpu::init did its job.
+            # Bits: P=1 (protection violation), I/D=1 (fetch) -> 0x11.
+            re.compile(r"^\[trap\] error_code=0x0{14}11\b", re.M),
+            # And the kernel must say so in words. The decoder used to
+            # report bit 4 as an ordinary read, which made an NX violation
+            # indistinguishable from a permission fault -- so matching the
+            # hex alone would not prove the kernel understood what happened.
+            re.compile(
+                r"^\[trap\] cr2=0xffff8[0-9a-f]+\s+\(supervisor instruction fetch "
+                r"protection-violation\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"executing from an NX page succeeded", re.M),
+        ],
+    ),
+    "stackovf": Expectation(
+        name="main stack overflow",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            re.compile(r"^\[vmtest\] stack overflow test: recursing off the bottom", re.M),
+            # RSP must actually descend through the stack. Requiring a depth
+            # well past zero rules out a run where the recursion was
+            # optimised into something that does not grow the stack, which
+            # would make the test pass without testing anything.
+            re.compile(r"^\[vmtest\] depth 8, rsp 0xffffc8000000[0-9a-f]+", re.M),
+            # The recursion must reach the lowest page of the stack
+            # (0xffffc80000006000..0xffffc80000006fff), not stop somewhere
+            # comfortable above it.
+            re.compile(r"^\[vmtest\] depth \d+, rsp 0xffffc80000006[0-9a-f]{3}", re.M),
+            # And then: #DF, not #PF.
+            #
+            # The first draft of this expectation demanded #PF and forbade
+            # #DF, which was wrong, and wrong in a way worth keeping a note
+            # about. RSP descends into the guard page; the CPU wants to
+            # deliver #PF; delivering it means pushing a five-qword frame
+            # onto the stack -- the stack that just ran out. The push
+            # faults, the fault cannot be delivered, and the CPU escalates
+            # to #DF.
+            #
+            # This is precisely what IST1 is for, and it is the first time
+            # in the project that a genuine (not manufactured) double fault
+            # has exercised it. A kernel without the IST would triple-fault
+            # here and reset, which the banner count would catch.
+            re.compile(r"^\*\*\* EXCEPTION: #DF double fault \(vector 8\) \*\*\*", re.M),
+            # The faulting RSP is at the very bottom of the stack or just
+            # inside the guard page below it. Which exact byte depends on
+            # how large a frame the compiler happened to be pushing when it
+            # ran out, so both the stack's last page (0x...6xxx) and the
+            # guard page (0x...5xxx) are legitimate; observed so far are
+            # 0xffffc80000005fc0 and 0xffffc80000006000.
+            #
+            # What is *not* legitimate is an RSP anywhere else, which would
+            # mean something other than the overflow caused this fault.
+            re.compile(r"^\[trap\] rflags=.*rsp=0xffffc8000000[56][0-9a-f]{3}", re.M),
+            # The handler got its own stack, inside IST1's range.
+            re.compile(
+                r"^\[trap\] IST1 stack: 0xffffc80000001000 \.\. 0xffffc80000005000, "
+                r"handler rsp=0xffffc8000000[1-4][0-9a-f]{3}",
+                re.M,
+            ),
+            re.compile(r"^\[trap\] IST1: ok\s*$", re.M),
+            re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"the stack overflow did not fault", re.M),
+            # If the IST had not engaged, the handler would be running on
+            # the dead stack -- and would fault again, into a triple fault.
+            re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
 }

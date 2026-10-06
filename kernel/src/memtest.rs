@@ -92,10 +92,54 @@ pub fn run() {
         "[memtest] baseline: {} free frames of {} total",
         initial_free, total_frames
     );
-    assert_eq!(
+
+    // M2 asserted `initial_free == initial_free_count()` here: nothing had
+    // allocated anything between init and the test, so any difference was
+    // a leak. M3 made that false. By the time this runs, `vm::init` has
+    // taken frames for the PML4, the intermediate tables, and two 16 KiB
+    // kernel stacks, and `reclaim` has donated the bootloader's memory
+    // back. The counts legitimately differ.
+    //
+    // Deleting the check would have been the easy move, and wrong: it is
+    // the only thing standing between a real leak during boot and nobody
+    // noticing. So it is narrowed to what is still true -- the kernel's
+    // own structures account for the entire difference, and that is a
+    // small, bounded number of frames rather than an unbounded drift.
+    //
+    //   PML4                                            1
+    //   PMAP: a PDPT, plus PDs for 2 MiB pages          up to ~4 here
+    //   image: PDPT + PD + PT                           3
+    //   two stacks: share the image's PDPT/PD, one PT   1
+    //   KSTACK PDPT + PD                                2
+    //
+    // The exact figure depends on the machine's memory map, so the bound
+    // is generous; what it rules out is the interesting failure, which is
+    // boot code allocating per-frame rather than per-table.
+    const MAX_BOOT_STRUCTURES: u64 = 64;
+
+    let donated = frames::initial_free_count();
+    let held_by_kernel = donated.saturating_sub(initial_free);
+
+    assert!(
+        initial_free <= donated,
+        "more frames are free ({}) than the allocator ever owned ({}); the \
+         accounting is broken",
         initial_free,
-        frames::initial_free_count(),
-        "free count already drifted from the post-init baseline"
+        donated
+    );
+    assert!(
+        held_by_kernel <= MAX_BOOT_STRUCTURES,
+        "{} frames are held by the kernel's own structures, which is more \
+         than the {} a page-table build and two stacks should need; \
+         something allocated per-frame during boot",
+        held_by_kernel,
+        MAX_BOOT_STRUCTURES
+    );
+
+    println!(
+        "[memtest] {} frames held by boot structures (page tables and {} \
+         kernel stacks), within the bound of {}",
+        held_by_kernel, 2, MAX_BOOT_STRUCTURES
     );
 
     bulk_allocate(initial_free);

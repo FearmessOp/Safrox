@@ -94,18 +94,55 @@ Koddaki karşılıkları (M3'te `kernel/src/memory/layout.rs`):
 
 ## Değişmezler
 
-Bunlar M3'te `debug_assert!` ve link sonrası denetimle zorlanır:
+Bunlar M3'te derleme zamanı `assert!`leri, çalışma zamanı kontrolleri ve
+link sonrası denetimle zorlanır. Her maddenin yanında onu *hangi şeyin*
+zorladığı yazıyor — zorlanmayan bir değişmez, değişmez değil dilektir.
 
 1. **Hiçbir user adresi `KERNEL_MIN`'in üstünde olamaz.** Tersi de geçerli:
    hiçbir kernel aralığı `USER_MAX`'ın altına inmez. Sınır tek bir
    karşılaştırmayla kontrol edilebilir.
+   *Zorlayan:* `layout.rs` içindeki `const _: ()` blokları (derleme zamanı).
+
 2. **PMAP yalnızca RAM içerir.** MMIO ve framebuffer PMAP'e girmez; KMMIO'ya
    eşlenir. Bir cihaz penceresini PMAP üzerinden okumak mümkün olmamalı.
+   *Zorlayan:* `vm::is_real_ram`, memory map tipine göre filtreliyor.
+
 3. **PMAP sayfaları NX'tir.** Veri olarak eşlenen hiçbir şey yürütülemez.
-4. **Kernel imajı dışındaki hiçbir kernel eşlemesi hem yazılabilir hem
-   yürütülebilir değildir** (W^X).
+   *Zorlayan:* `vm::init` pencereyi `READ|WRITE|GLOBAL` ile kuruyor (EXEC
+   yok); `vm-nx` senaryosu PMAP'teki bir sayfadan yürütmeyi deniyor ve #PF
+   alıyor (hata kodu 0x11, komut getirme biti set).
+
+4. **Hiçbir kernel *sayfası* hem yazılabilir hem yürütülebilir değildir**
+   (W^X), ve `paging::map` böyle bir bayrak çiftini `InvalidFlags` ile
+   reddeder.
+
+   **İstisna — PMAP takma adı.** Kernel imajının fiziksel çerçeveleri,
+   PMAP üzerinden *ayrıca* yazılabilir olarak görünür. Hiçbir tek sayfa
+   W∧X değil, ama `.text`'in baytları iki yoldan erişilebiliyor: imaj
+   eşlemesinden R-X, pencereden RW-NX. Yani W^X sanal sayfa düzeyinde
+   geçerli, fiziksel çerçeve düzeyinde değil.
+
+   Bu bilinçli bir kabul, kaza değil. M3'te PMAP'e yazan tek şey kernel'in
+   kendisi. Gerçek tehdit M8'de user kodu eşleme yaptırabildiğinde
+   başlıyor, ve o milestone'dan önce kapatılacak: PMAP kurulurken imajın
+   fiziksel aralığı salt okunur eşlenecek. Ayrıntı ve bedel
+   [ADR 010](adr/010-hhdm-kaderi.md), "PMAP, kernel .text'i yazılabilir
+   olarak takma adlıyor".
+
+   *Zorlayan:* `paging::map`'in bayrak doğrulaması; `check_kernel.py`
+   `.text`'in ELF'te bile yazılabilir işaretlenmediğini denetliyor;
+   `vm::verify_before_switch` geçiş öncesi `.text`'in RX ve yazılamaz
+   olduğunu doğruluyor. *Zorlanmayan:* takma ad — bu yüzden istisna olarak
+   yazılı.
+
 5. **Her kernel stack'inin altında eşlenmemiş bir sayfa vardır.** Taşma #PF
    üretir, sessiz bozulma değil.
+   *Zorlayan:* `layout::kstack_slot` her slotu bir guard sayfasıyla
+   başlatıyor; `vm-guard-page` senaryosu IST yığınının altına yazıp #PF
+   alıyor; `vm-stack-overflow` senaryosu ana yığından gerçekten taşıp
+   aynı sonuca ulaşıyor. İkincisi #DF'e yükseliyor — #PF'i teslim etmek
+   için gereken yığın da tükenmiş durumda — ve IST1 devreye giriyor, ki
+   M1'in bu tasarımının ilk gerçek (imal edilmemiş) sınavı.
 
 ## 5 seviyeli sayfalama (LA57)
 

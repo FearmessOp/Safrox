@@ -24,6 +24,7 @@
 
 use core::arch::asm;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Selector for the kernel code segment (GDT index 1, RPL 0).
 ///
@@ -48,65 +49,91 @@ const TSS_SELECTOR: u16 = 3 << 3;
 /// (the 64-bit TSS layout).
 pub const DOUBLE_FAULT_IST_INDEX: u8 = 1;
 
-/// Size of the dedicated double-fault stack.
-///
-/// A double fault handler only formats a short report and exits, so it needs
-/// very little. 16 KiB is generous and keeps us clear of the guard-page-less
-/// reality of this milestone.
-const IST_STACK_SIZE: usize = 16 * 1024;
-
-/// Dedicated stack for the double-fault handler.
+/// Bootstrap stack for the double-fault handler.
 ///
 /// The whole point of an IST entry is that the CPU switches to this stack
-/// unconditionally, regardless of what RSP contained when the fault hit. A
-/// double fault frequently *means* the current stack is unusable (overflowed,
-/// unmapped, or misaligned), so handling it on that same stack would fault
-/// again and escalate straight to a triple fault -- a silent machine reset
-/// with no diagnostic at all.
+/// unconditionally, whatever RSP contained when the fault hit. A double
+/// fault frequently *means* the current stack is unusable -- overflowed,
+/// unmapped, misaligned -- so handling it on that same stack would fault
+/// again and escalate to a triple fault: a silent reset with no diagnostic.
 ///
-/// 16-byte aligned because the SysV AMD64 ABI requires RSP to be 16-byte
-/// aligned at a function's entry, and the CPU does not re-align it for us.
+/// This copy lives in `.bss` and is only used between `gdt::init` and
+/// `vm::init`. It has no guard page, so a deep overflow here still
+/// scribbles over neighbouring data -- but the window is a few hundred
+/// instructions of single-threaded boot code with interrupts disabled, and
+/// the alternative (no IST at all until paging is up) is worse.
+///
+/// Once page tables exist, `vm::init` allocates a real stack in KSTACK with
+/// an unmapped page below it and calls [`set_ist1`]. See ADR 009 and the
+/// note at the end of linker.ld.
+///
+/// 4 KiB: enough for one exception frame and a short report, which is all
+/// that can happen before the switch.
+const BOOTSTRAP_IST_SIZE: usize = 4096;
+
+/// 16-byte aligned because the SysV AMD64 ABI wants RSP 16-byte aligned at
+/// function entry and the CPU does not re-align it for us.
 #[repr(C, align(16))]
-struct IstStack([u8; IST_STACK_SIZE]);
+struct IstStack([u8; BOOTSTRAP_IST_SIZE]);
 
-/// Backing storage for IST1.
+/// Backing storage for the bootstrap IST1 stack.
 ///
-/// `static mut` is unavoidable here: the CPU writes to this memory
-/// asynchronously (it pushes an exception frame onto it), so Rust's
-/// aliasing model cannot describe it. Access from Rust is confined to
-/// `ist1_range()` and the one-time address computation in `init()`.
-///
-/// `#[link_section]` puts this in `.ist_stacks`, which the linker script
-/// places at the very top of the image with a page of dead space below it.
-/// Stacks grow downwards, so an overflow runs off the *bottom*: left in the
-/// ordinary `.bss`, it would quietly overwrite whatever happened to be
-/// allocated underneath -- which was `.data` and the Limine response
-/// structures we still read.
-///
-/// The section is deliberately not called `.bss.something`: the linker
-/// assigns each input section to the *first* output section that matches,
-/// so `*(.bss.*)` would have claimed it before its own section was reached.
-/// `#[used]` keeps the symbol alive so the section is not dropped.
-#[used]
-#[link_section = ".ist_stacks"]
-static mut IST1_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
+/// `static mut` is unavoidable: the CPU writes here asynchronously when it
+/// pushes an exception frame, which Rust's aliasing model cannot describe.
+static mut BOOTSTRAP_IST1: IstStack = IstStack([0; BOOTSTRAP_IST_SIZE]);
 
-/// Inclusive-exclusive address range of the IST1 stack: `(lowest, one-past-highest)`.
+/// Current IST1 range, as `(lowest, one-past-highest)`.
 ///
-/// Used by the double-fault handler to prove it really is running on the IST
-/// stack and not on whatever stack was current when the fault occurred.
+/// The double-fault handler reads this to prove it is running on the IST
+/// stack rather than on whatever stack was current when the fault hit. It
+/// changes once, when `vm::init` swaps the bootstrap stack for a guarded
+/// one.
+static IST1_BOTTOM: AtomicU64 = AtomicU64::new(0);
+static IST1_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Inclusive-exclusive address range of the active IST1 stack.
 pub fn ist1_range() -> (u64, u64) {
-    let base = &raw const IST1_STACK as u64;
-    (base, base + IST_STACK_SIZE as u64)
+    (
+        IST1_BOTTOM.load(Ordering::Acquire),
+        IST1_TOP.load(Ordering::Acquire),
+    )
 }
 
-/// Top of the IST1 stack, as the CPU wants it.
+/// Point IST1 at a different stack.
 ///
-/// x86 stacks grow downwards, so the CPU is given the address one past the
-/// last byte; the first push lands inside the array.
-fn ist1_top() -> u64 {
-    let (_, top) = ist1_range();
-    top
+/// Called by `vm::init` once a guarded stack exists in KSTACK. Between the
+/// CR3 switch and this call the TSS still names the bootstrap stack, which
+/// the new tables do not map -- so a double fault in that window is
+/// unrecoverable. The window is a few dozen instructions with interrupts
+/// disabled.
+///
+/// # Safety
+///
+/// `top` must be one past the last byte of a mapped, writable, 16-byte
+/// aligned stack that nothing else is using.
+pub unsafe fn set_ist1(top: u64) {
+    assert!(
+        top.is_multiple_of(16),
+        "IST stack top must be 16-byte aligned"
+    );
+
+    // SAFETY: The TSS is a static this module owns; the only other reader
+    // is the CPU, and it only consults the IST on an exception, which
+    // cannot happen here because interrupts are disabled and this code
+    // does not fault. The write is a single aligned qword.
+    unsafe {
+        let tss = &raw mut TSS;
+        (*tss).interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = top;
+    }
+
+    IST1_BOTTOM.store(top - crate::memory::layout::KSTACK_SIZE, Ordering::Release);
+    IST1_TOP.store(top, Ordering::Release);
+}
+
+/// Top of the bootstrap IST1 stack.
+fn bootstrap_ist1_top() -> u64 {
+    let base = &raw const BOOTSTRAP_IST1 as u64;
+    base + BOOTSTRAP_IST_SIZE as u64
 }
 
 // ---- Task State Segment ------------------------------------------------
@@ -299,11 +326,18 @@ pub unsafe fn init() {
     unsafe {
         // Arm the double-fault stack before the TSS becomes visible to the
         // CPU: once `ltr` executes, a double fault could arrive at any time.
+        //
+        // This is the bootstrap stack; `vm::init` replaces it with a
+        // guarded one as soon as page tables exist.
+        let bootstrap_top = bootstrap_ist1_top();
         (&raw mut TSS).write_volatile({
             let mut tss = TaskStateSegment::new();
-            tss.interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = ist1_top();
+            tss.interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = bootstrap_top;
             tss
         });
+
+        IST1_BOTTOM.store(bootstrap_top - BOOTSTRAP_IST_SIZE as u64, Ordering::Release);
+        IST1_TOP.store(bootstrap_top, Ordering::Release);
 
         let tss_base = &raw const TSS as u64;
         // The TSS limit is the last valid byte offset, hence size - 1.

@@ -39,9 +39,17 @@ ISO_DF      := $(BUILD_DIR)/pythos-df.iso
 # M2 frame allocator images.
 ISO_MEMTEST := $(BUILD_DIR)/pythos-memtest.iso
 ISO_DFREE   := $(BUILD_DIR)/pythos-doublefree.iso
+# M3 virtual memory images.
+ISO_VMTEST   := $(BUILD_DIR)/pythos-vmtest.iso
+ISO_STALETLB := $(BUILD_DIR)/pythos-staletlb.iso
+ISO_GUARD    := $(BUILD_DIR)/pythos-guardpage.iso
+ISO_NX       := $(BUILD_DIR)/pythos-nx.iso
+ISO_STACKOVF := $(BUILD_DIR)/pythos-stackovf.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
-               $(ISO_MEMTEST) $(ISO_DFREE)
+               $(ISO_MEMTEST) $(ISO_DFREE) \
+               $(ISO_VMTEST) $(ISO_STALETLB) $(ISO_GUARD) $(ISO_NX) \
+               $(ISO_STACKOVF)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -50,7 +58,14 @@ LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 # requests (3) must match what the shipped bootloader blobs implement.
 LIMINE_TAG  := v9.x-binary
 
-RUST_SRCS := $(wildcard kernel/src/*.rs)
+# Every Rust source, at any depth. The flat `kernel/src/*.rs` this used to
+# be stopped being correct the moment M3 added `kernel/src/memory/`: Make
+# saw no change when a file in that directory was edited, skipped the
+# recipe, and left the previous kernel.elf in place. Cargo rebuilt the
+# binary anyway -- it does its own dependency tracking -- so the symptom was
+# an ISO built from a stale copy and a test run that disagreed with the
+# source in front of you.
+RUST_SRCS := $(shell find kernel/src -name '*.rs')
 
 # ---- QEMU --------------------------------------------------------------
 #
@@ -71,8 +86,14 @@ QEMU_FLAGS := \
 	-serial stdio \
 	-display none
 
-.PHONY: all kernel isos run run-panic run-int3 run-pf run-df \
+# `build` is listed here even though no such target exists, and that is the
+# point: `build/` is a *directory*, so without .PHONY an accidental
+# `make build` reports "Nothing to be done" and looks like a successful
+# no-op build. It happened during M3 and cost a confusing few minutes. The
+# alias below makes the obvious command do the obvious thing.
+.PHONY: all build kernel isos run run-panic run-int3 run-pf run-df \
         run-memtest run-doublefree \
+        run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -85,6 +106,9 @@ QEMU_FLAGS := \
 all: isos
 
 kernel: $(KERNEL)
+
+# Alias: `make build` is what everyone types first.
+build: $(KERNEL)
 
 isos: $(ALL_ISOS)
 
@@ -158,6 +182,21 @@ $(ISO_MEMTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 $(ISO_DFREE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 	$(call build_iso,$@,7)
 
+$(ISO_VMTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,8)
+
+$(ISO_STALETLB): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,9)
+
+$(ISO_GUARD): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,10)
+
+$(ISO_NX): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,11)
+
+$(ISO_STACKOVF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,12)
+
 # ---- Run & test --------------------------------------------------------
 
 run: $(ISO)
@@ -184,6 +223,22 @@ run-memtest: $(ISO_MEMTEST)
 run-doublefree: $(ISO_DFREE)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DFREE) --expect doublefree -- $(QEMU_FLAGS)
 
+# M3 virtual memory scenarios.
+run-vmtest: $(ISO_VMTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VMTEST) --expect vmtest -- $(QEMU_FLAGS)
+
+run-staletlb: $(ISO_STALETLB)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_STALETLB) --expect staletlb -- $(QEMU_FLAGS)
+
+run-guardpage: $(ISO_GUARD)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_GUARD) --expect guardpage -- $(QEMU_FLAGS)
+
+run-nx: $(ISO_NX)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_NX) --expect nx -- $(QEMU_FLAGS)
+
+run-stackovf: $(ISO_STACKOVF)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_STACKOVF) --expect stackovf -- $(QEMU_FLAGS)
+
 # The full acceptance suite, in order:
 #
 #   fmt        formatting is consistent
@@ -199,16 +254,22 @@ run-doublefree: $(ISO_DFREE)
 #   run-df     #DF is caught on the IST1 stack, kernel confirms it: exits 35
 #   run-memtest     bulk alloc/free with no leak, clean exhaustion: exits 33
 #   run-doublefree  a double free is detected and panics: exits 35
+#   run-vmtest      own page tables, map/unmap/translate, error cases: 33
+#   run-staletlb    unmap without invalidating -- advisory, see run.py: 33
+#   run-guardpage   writing below a kernel stack faults: exits 35
+#   run-nx          executing from a data page faults: exits 35
+#   run-stackovf    recursing off the main stack hits the guard: exits 35
 #   self-test  the runner itself is proven to validate: handed the panic ISO
 #              while expecting success, it must FAIL. Without this, a runner
 #              that accepted everything would look identical to a working one.
 #
 # Every scenario additionally fails if the kernel banner appears twice,
 # which would mean the machine triple-faulted and rebooted.
-test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
+test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree \
+      run-vmtest run-staletlb run-guardpage run-nx run-stackovf
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M2: all acceptance tests passed"
+	@echo "M3: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"

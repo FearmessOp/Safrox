@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! Physical memory: address types and the Limine memory map.
+//! Memory: address types, the Limine memory map, frames and page tables.
 //!
-//! M2 covers physical frames only. Virtual memory -- page tables, mapping,
-//! the higher-half direct map as something we manage rather than inherit --
-//! belongs to M3.
+//! * [`frame_allocator`] — physical frames (M2)
+//! * [`layout`] — the virtual address space map (ADR 009)
+//! * [`paging`] — page-table mechanism (ADR 011, 012)
+//! * [`vm`] — building and switching to our own tables (ADR 010)
+//! * [`bootinfo`] — copying out of bootloader memory and reclaiming it
+//!   (ADR 013)
 
+pub mod bootinfo;
 pub mod frame_allocator;
+pub mod layout;
+pub mod paging;
+pub mod vm;
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +79,39 @@ impl fmt::Display for PhysFrame {
     }
 }
 
+/// A virtual address.
+///
+/// Separate from [`PhysAddr`] so the compiler catches the confusion for
+/// free. Only this kind can be dereferenced -- and only if something has
+/// mapped it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct VirtAddr(pub u64);
+
+impl VirtAddr {
+    pub const fn new(addr: u64) -> Self {
+        VirtAddr(addr)
+    }
+
+    /// Whether this address is page aligned.
+    pub const fn is_frame_aligned(self) -> bool {
+        self.0.is_multiple_of(FRAME_SIZE)
+    }
+
+    /// This address as a raw pointer.
+    ///
+    /// Nothing about the returned pointer is guaranteed: whether it is
+    /// mapped, and with what permissions, is the caller's problem.
+    pub const fn as_ptr<T>(self) -> *mut T {
+        self.0 as *mut T
+    }
+}
+
+impl fmt::Display for VirtAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#018x}", self.0)
+    }
+}
+
 // ---- Address translation during boot -----------------------------------
 //
 // The kernel runs with paging already on, under tables Limine built. Two
@@ -93,12 +133,31 @@ static KERNEL_SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Offset at which Limine mapped all of physical memory.
 ///
-/// Adding this to a physical address yields a virtual address the kernel
-/// can dereference.
+/// Only meaningful during early boot and in the assertion that our own
+/// window lands at the same address. Everything else uses [`pmap_base`].
 pub fn hhdm_offset() -> u64 {
     let offset = HHDM_OFFSET.load(Ordering::Acquire);
     debug_assert!(offset != 0, "hhdm_offset() before memory::init()");
     offset
+}
+
+/// Base of the window through which the kernel reaches physical memory.
+///
+/// Before [`vm::init`] this is Limine's HHDM; afterwards it is ours. Both
+/// are at [`layout::PMAP_BASE`] -- `vm::init` asserts it -- so the value
+/// does not change, and no pointer computed before the switch becomes
+/// stale. See ADR 010.
+pub fn pmap_base() -> u64 {
+    layout::PMAP_BASE
+}
+
+/// Virtual address through which `phys` can be reached.
+pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
+    debug_assert!(
+        phys.0 < layout::PMAP_SIZE,
+        "physical address beyond the window"
+    );
+    VirtAddr::new(pmap_base() + phys.0)
 }
 
 /// Convert a kernel *image* virtual address to its physical address.

@@ -32,17 +32,29 @@ SECTIONS
 
     __kernel_image_start = .;
 
+    /* Section boundaries are exported so that M3 can map each one with the
+     * permissions it actually needs: .text RX, .rodata R, everything
+     * writable RW+NX. Limine maps the image as one blob; W^X is something
+     * we establish ourselves when we build our own tables.
+     *
+     * Every boundary is page aligned, because permissions have page
+     * granularity -- two sections sharing a page would force the looser of
+     * the two permissions onto both. */
     .text : {
+        __text_start = .;
         *(.text .text.*)
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_end = .;
 
     .rodata : {
+        __rodata_start = .;
         *(.rodata .rodata.*)
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_end = .;
 
     /* Limine base revision >= 2 requires the request markers to live in a
      * dedicated section. KEEP() defends them against --gc-sections: nothing
@@ -56,6 +68,13 @@ SECTIONS
      * the response pointer back into each request after loading the image,
      * so the pages must be mapped read/write -- which is also why the limine
      * crate wraps the pointer in an UnsafeCell. */
+    /* The request section is writable -- the bootloader stores response
+     * pointers into it -- so it is the first thing in the writable range,
+     * not a gap between .rodata and .data. M3 maps [__writable_start,
+     * __writable_end) as RW+NX in one go; leaving this section outside
+     * that range left a one-page hole that the pre-switch check caught. */
+    __writable_start = .;
+
     .limine_requests : {
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
@@ -82,53 +101,32 @@ SECTIONS
 
     .bss : {
         __bss_start = .;
-        /* Ordinary zero-initialised data.
-         *
-         * The IST stacks are deliberately NOT named `.bss.something`: input
-         * sections go to the first output section that matches, so
-         * `*(.bss.*)` here would swallow them before their own section
-         * below ever got a chance. Giving them an unrelated name
-         * (`.ist_stacks`) makes the separation structural instead of
-         * depending on wildcard ordering. */
         *(.bss .bss.*)
         *(COMMON)
-        __bss_end = .;
-    } :data
-
-    /* ---- Interrupt stacks -------------------------------------------
-     *
-     * The IST stacks live at the very top of the image, after every other
-     * symbol, with a page of dead space underneath.
-     *
-     * x86 stacks grow downwards, so an overflow runs off the *bottom* of
-     * the stack. Placed anywhere else, that overflow would silently
-     * overwrite whatever sits below -- which, before this was fixed, was
-     * .data and the Limine request/response structures we are still
-     * reading. The corruption would show up much later, somewhere
-     * unrelated.
-     *
-     * The gap is not a guard page: nothing is unmapped, so a deep enough
-     * overflow still walks into it quietly. It is dead space, which turns
-     * a silent corruption into a harmless scribble and buys room for the
-     * real guard page in M3, once page tables exist.
-     *
-     * Verified by scripts/check_kernel.py, which fails the build if any
-     * symbol other than the IST markers lies at or above __ist_stacks_start.
-     */
-    . = ALIGN(CONSTANT(MAXPAGESIZE));
-    __ist_guard_start = .;
-    . += CONSTANT(MAXPAGESIZE);
-    __ist_guard_end = .;
-
-    .ist_stacks (NOLOAD) : {
-        __ist_stacks_start = .;
-        KEEP(*(.ist_stacks))
-        __ist_stacks_end = .;
     } :data
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __bss_end = .;
+    __writable_end = .;
 
     __kernel_image_end = .;
+
+    /* ---- Where the IST stacks went ----------------------------------
+     *
+     * They used to live here, at the top of the image, with a page of dead
+     * space underneath -- M1 put them in .bss where an overflow silently
+     * overwrote .data and the Limine responses, and M2 moved them out with
+     * a gap below.
+     *
+     * The gap was never a guard page: nothing was unmapped, so a deep
+     * enough overflow walked straight through it. M3 has page tables, so
+     * the stacks now live in KSTACK (0xFFFF_C800_0000_0000) with a genuinely
+     * unmapped page below each one. An overflow faults.
+     *
+     * Nothing in the image reserves space for them any more; the frames
+     * come from the allocator and are mapped at run time.
+     * See kernel/src/memory/vm.rs and docs/address-space.md.
+     */
 
     /* Unwind tables are dead weight: panic = "abort", so nothing unwinds.
      * .note.* is discarded as well, which is why the build passes

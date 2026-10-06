@@ -10,6 +10,11 @@
 #   5 -> double fault (#DF) build/pythos-df.iso         exit 35 (handled on IST1)
 #   6 -> frame allocator    build/pythos-memtest.iso    exit 33
 #   7 -> double free        build/pythos-doublefree.iso exit 35
+#   8 -> virtual memory     build/pythos-vmtest.iso     exit 33
+#   9 -> stale TLB          build/pythos-staletlb.iso   exit 33 (advisory)
+#  10 -> guard page         build/pythos-guardpage.iso  exit 35
+#  11 -> NX enforcement     build/pythos-nx.iso         exit 35
+#  12 -> stack overflow     build/pythos-stackovf.iso   exit 35
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -62,3 +67,38 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: mem-double-free
+
+/PythOS (virtual memory tests)
+    comment: map/unmap/translate, error cases, reclaim survived. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vm-test
+
+/PythOS (stale TLB check)
+    comment: Unmap without invalidating. Advisory -- QEMU's TLB is not real
+    comment: hardware, so a missing fault is reported, not failed. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vm-stale-tlb
+
+/PythOS (guard page)
+    comment: Write below the IST stack; the guard page must fault. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vm-guard-page
+
+/PythOS (NX enforcement)
+    comment: Jump to a data page in PMAP; NX must fault. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vm-nx
+
+/PythOS (main stack overflow)
+    comment: Recurse off the bottom of the kernel's own stack. Unlike the
+    comment: guard page test, which writes at the guard directly, this
+    comment: arrives the way a real overflow would -- and escalates to #DF,
+    comment: because delivering the #PF would need the stack that just ran
+    comment: out. Handled on IST1. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vm-stack-overflow

@@ -32,10 +32,61 @@ ET_DYN = 3
 EM_X86_64 = 0x3E
 PT_LOAD = 1
 
+# Section header flags. Reference: ELF-64 spec, Figure 4-9.
+SHF_WRITE = 0x1
+SHF_EXECINSTR = 0x4
+
+# Section types. Reference: ELF-64 spec, Figure 4-8.
+SHT_SYMTAB = 2
+
+# One Elf64_Sym: name(4) info(1) other(1) shndx(2) value(8) size(8).
+SYM_SIZE = 24
+
 
 def fail(message: str) -> None:
     print(f"check_kernel: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def read_symbols(data, e_shoff, e_shnum, e_shentsize, section_name):
+    """Map symbol name -> value, from the first SYMTAB in the file.
+
+    Only the linker-defined markers are of interest here, and those are
+    absolute addresses with no relocation to apply, so a flat dictionary
+    is enough.
+
+    Reference: ELF-64 Object File Format, section 4 ("Symbol Table").
+    """
+    symbols = {}
+    if e_shoff == 0:
+        return symbols
+
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        _sh_name, sh_type, _sh_flags, _sh_addr, sh_offset, sh_size = struct.unpack_from(
+            "<IIQQQQ", data, off
+        )
+        if sh_type != SHT_SYMTAB:
+            continue
+
+        # sh_link names the string table holding this symtab's names.
+        sh_link = struct.unpack_from("<I", data, off + 40)[0]
+        str_off = struct.unpack_from("<Q", data, e_shoff + sh_link * e_shentsize + 24)[0]
+
+        for entry in range(sh_size // SYM_SIZE):
+            sym_off = sh_offset + entry * SYM_SIZE
+            st_name, _st_info, _st_other, _st_shndx, st_value, _st_size = (
+                struct.unpack_from("<IBBHQQ", data, sym_off)
+            )
+            if st_name == 0:
+                continue
+            end = data.index(b"\0", str_off + st_name)
+            name = data[str_off + st_name : end].decode("ascii", errors="replace")
+            symbols[name] = st_value
+
+        break
+
+    return symbols
 
 
 def main() -> int:
@@ -106,13 +157,16 @@ def main() -> int:
         return data[str_base + name_off : end].decode("ascii", errors="replace")
 
     sections = {}
+    section_flags = {}
     if e_shoff != 0:
         for i in range(e_shnum):
             off = e_shoff + i * e_shentsize
-            sh_name, _sh_type, _sh_flags, sh_addr, _sh_offset, sh_size = (
+            sh_name, _sh_type, sh_flags, sh_addr, _sh_offset, sh_size = (
                 struct.unpack_from("<IIQQQQ", data, off)
             )
-            sections[section_name(sh_name)] = (sh_addr, sh_size)
+            name = section_name(sh_name)
+            sections[name] = (sh_addr, sh_size)
+            section_flags[name] = sh_flags
 
     requests = sections.get(".limine_requests")
     if requests is None or requests[1] == 0:
@@ -121,33 +175,129 @@ def main() -> int:
             "every request (check KEEP() in linker.ld and the 'used' attribute)"
         )
 
-    # --- IST stack placement ---------------------------------------------
+    # --- Section permissions ---------------------------------------------
     #
-    # Stacks grow downwards, so an overflow runs off the bottom of the IST
-    # stack and scribbles over whatever is allocated below it. The linker
-    # script puts the IST stacks at the very top of the image with a page of
-    # dead space underneath; this check makes sure nothing drifts back in.
+    # M3 maps the image section by section, so the sections must exist and
+    # must be page aligned: permissions have page granularity, and two
+    # sections sharing a page would force the looser of the two onto both.
     #
-    # Not a guard page -- nothing is unmapped yet -- but it turns a silent
-    # corruption of live data into a harmless scribble. The real guard page
-    # arrives in M3.
-    ist = sections.get(".ist_stacks")
-    if ist is None or ist[1] == 0:
+    # The IST stacks used to be checked here. They are no longer in the
+    # image at all: M3 allocates them in KSTACK with a genuinely unmapped
+    # guard page below, which is verified at run time by the vm-guard-page
+    # scenario rather than statically. The static check could only ever
+    # confirm dead space, which was never real protection.
+    for name in (".text", ".rodata"):
+        section = sections.get(name)
+        if section is None:
+            fail(f"{name} is missing; vm::init maps the image by section")
+        addr, size = section
+        if addr % PAGE_SIZE != 0:
+            fail(
+                f"{name} starts at {addr:#x}, which is not page aligned; "
+                f"it would share a page with the previous section and have "
+                f"to take the looser permission of the two"
+            )
+        if size == 0:
+            fail(f"{name} is empty")
+
+    # .text must not be writable even in the ELF, or the W^X mapping would
+    # be contradicting the file it came from.
+    text_flags = section_flags.get(".text", 0)
+    if text_flags & SHF_WRITE:
+        fail(".text is marked writable in the ELF; W^X starts here")
+    if not text_flags & SHF_EXECINSTR:
+        fail(".text is not marked executable in the ELF")
+
+    # --- Every byte of the image falls in exactly one mapped range -------
+    #
+    # vm::init maps the image in three pieces -- [__text_start,
+    # __text_end), [__rodata_start, __rodata_end) and [__writable_start,
+    # __writable_end) -- and maps nothing else. A section that falls
+    # outside all three is simply absent from the new tables.
+    #
+    # This is not hypothetical. On the first run of M3 the linker script
+    # placed .limine_requests after __rodata_end but before
+    # __writable_start, leaving a one-page hole at 0xffffffff80015000. The
+    # run-time pre-switch check caught it, which is the right outcome but
+    # the late one: a missing page is a property of the linked file and
+    # should fail the build, not the boot.
+    symbols = read_symbols(data, e_shoff, e_shnum, e_shentsize, section_name)
+
+    required = (
+        "__kernel_image_start",
+        "__kernel_image_end",
+        "__text_start",
+        "__text_end",
+        "__rodata_start",
+        "__rodata_end",
+        "__writable_start",
+        "__writable_end",
+    )
+    missing = [name for name in required if name not in symbols]
+    if missing:
         fail(
-            ".ist_stacks is missing or empty; the IST stack was not placed "
-            "where linker.ld expects it (check #[link_section] in gdt.rs)"
+            "linker.ld does not define " + ", ".join(missing) +
+            "; vm::init needs them to map the image section by section"
         )
 
-    ist_start = ist[0]
-    bss = sections.get(".bss")
-    if bss is not None:
-        bss_end = bss[0] + bss[1]
-        gap = ist_start - bss_end
-        if gap < PAGE_SIZE:
+    ranges = [
+        ("text", symbols["__text_start"], symbols["__text_end"]),
+        ("rodata", symbols["__rodata_start"], symbols["__rodata_end"]),
+        ("writable", symbols["__writable_start"], symbols["__writable_end"]),
+    ]
+
+    for name, start, end in ranges:
+        if start % PAGE_SIZE or end % PAGE_SIZE:
             fail(
-                f"only {gap} bytes between the end of .bss ({bss_end:#x}) and "
-                f"the IST stacks ({ist_start:#x}); an IST overflow would land "
-                f"in live data. linker.ld should leave at least one page."
+                f"the {name} range {start:#x}..{end:#x} is not page aligned; "
+                f"permissions have page granularity"
+            )
+        if end < start:
+            fail(f"the {name} range {start:#x}..{end:#x} runs backwards")
+
+    # The three must not overlap, or a page would be mapped twice with
+    # different permissions and the last one would silently win.
+    ordered = sorted(ranges, key=lambda r: r[1])
+    for (a_name, _, a_end), (b_name, b_start, _) in zip(ordered, ordered[1:]):
+        if a_end > b_start:
+            fail(
+                f"the {a_name} and {b_name} ranges overlap at {b_start:#x}; "
+                f"one page would be mapped twice with different permissions"
+            )
+
+    # And together they must cover the whole image, with no gaps.
+    image_start = symbols["__kernel_image_start"]
+    image_end = symbols["__kernel_image_end"]
+
+    cursor = image_start
+    for name, start, end in ordered:
+        if start > cursor:
+            fail(
+                f"nothing maps {cursor:#x}..{start:#x} ({(start - cursor) // PAGE_SIZE} "
+                f"page(s)) before the {name} range. Anything the linker placed "
+                f"there would be absent from the kernel's own page tables, and "
+                f"the first access after the CR3 switch would fault. Check the "
+                f"order of sections and the __*_start/__*_end markers around "
+                f"them in linker.ld."
+            )
+        cursor = max(cursor, end)
+
+    if cursor < image_end:
+        fail(
+            f"nothing maps {cursor:#x}..{image_end:#x} at the end of the image; "
+            f"the writable range stops short of __kernel_image_end"
+        )
+
+    # Allocated sections, specifically, must land inside one of the ranges.
+    # The check above proves the ranges are contiguous; this proves the
+    # sections are inside them rather than off past the end.
+    for name, (addr, size) in sections.items():
+        if size == 0 or addr == 0:
+            continue  # non-allocated: debug info, symbol tables, comments
+        if not any(start <= addr and addr + size <= end for _, start, end in ranges):
+            fail(
+                f"section {name} at {addr:#x}..{addr + size:#x} is not inside "
+                f"any of the three mapped ranges; vm::init would not map it"
             )
 
     # --- Build-path leakage ---------------------------------------------

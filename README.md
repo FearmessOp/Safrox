@@ -3,10 +3,12 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M2 — Physical memory.** The kernel reads Limine's memory
-map and manages physical frames with a bitmap allocator that never hands out
-frame 0, the kernel image, or its own metadata — and that detects a double
-free instead of corrupting itself quietly.
+**Current milestone: M3 — Virtual memory.** The kernel builds its own page
+tables and switches to them: a physical window that is NX and covers only
+RAM, the kernel image mapped W^X section by section, kernel stacks behind
+genuinely unmapped guard pages, and TLB invalidation enforced by the type
+system. Limine's memory is then reclaimed — after the kernel has copied out
+everything it still reads *and* moved off the stack the bootloader gave it.
 
 ## Quick start
 
@@ -51,7 +53,12 @@ cloned into `third_party/` automatically.
 | `make run-df` | Corrupt RSP → #DF on IST1; **must** exit 35 |
 | `make run-memtest` | Frame allocator suite; **must** exit 33 |
 | `make run-doublefree` | Double free is detected; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all seven scenarios, runner self-test |
+| `make run-vmtest` | Virtual memory suite; **must** exit 33 |
+| `make run-staletlb` | Unmap without invalidating (advisory); **must** exit 33 |
+| `make run-guardpage` | Write below the IST stack → #PF; **must** exit 35 |
+| `make run-nx` | Execute from a data page → #PF; **must** exit 35 |
+| `make run-stackovf` | Overflow the main stack → #DF on IST1; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all twelve scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -59,25 +66,43 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M2 acceptance criteria
+## M3 acceptance criteria
 
-Seven scenarios, all booting the **same** `kernel.elf` through different
+Twelve scenarios, all booting the **same** `kernel.elf` through different
 Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
 
+Every boot now builds page tables, switches CR3, moves onto a kernel-owned
+stack and reclaims the bootloader's memory — before any scenario hook runs:
+
 ```
-PythOS 0.1.0-M1
-[boot] serial: COM1 115200 8N1 (self-test ok)
-[boot] bootloader: Limine 9.6.7
-[boot] higher-half base: 0xffffffff80000000 (phys 0xfc12000, slide 0xffffffff703ee000)
-[boot] cmdline: <none>
-[cpu] gdt: loaded (cs=0x0008, ds=0x0010, tss armed)
-[cpu] ist1: 0xffffffff8000b070 .. 0xffffffff8000f070 (16 KiB) for #DF
-[cpu] idt: 32 exception vectors installed, #DF on IST1
-[boot] M1 checks passed
-[boot] exiting QEMU (write 0x10 -> exit status 33)
+[cpu] nx: supported (efer.nxe set)
+[cpu] smep: unsupported, smap: unsupported, pge: enabled
+[vm] building kernel address space (pml4 at frame 84 @ 0x0000000000054000)
+[vm] pmap: 255 MiB of RAM at 0xffff800000000000, rw+nx+global
+[vm] image .text:     0xffffffff80000000..0xffffffff8000f000 (15 pages) READ | EXEC | GLOBAL
+[vm] image .rodata:   0xffffffff8000f000..0xffffffff80016000  (7 pages) READ | GLOBAL
+[vm] image .writable: 0xffffffff80016000..0xffffffff8002e000 (24 pages) READ | WRITE | GLOBAL
+[vm] kstack[0]: 0xffffc80000001000 .. 0xffffc80000005000 (16 KiB), guard page at 0xffffc80000000000 (ist1)
+[vm] kstack[1]: 0xffffc80000006000 .. 0xffffc8000000a000 (16 KiB), guard page at 0xffffc80000005000 (main)
+[vm] pre-switch check: 46 image pages mapped, stack reachable, .text is rx
+[vm] switching cr3 to frame 84 @ 0x0000000000054000 ...
+[vm] now running on our own page tables
+[vm] switching stack: 0xffff80000ff6edc0 -> 0xffffc80000009ff8 (off the bootloader's stack)
+[boot] now on the kernel's own stack
+[mem] poisoned 4504 KiB of reclaimable memory with 0xde; boot info still reads back correctly
+[mem] reclaimed 1126 frames (4504 KiB) from bootloader-reclaimable
+[boot] after reclaim: bootloader still reported as Limine 9.6.7 (1126 frames gained)
+[boot] M3 checks passed
 ```
+
+Three lines carry most of the weight. **`pre-switch check`** walks every
+page of the image in the *new* tables before CR3 moves; a missing page there
+is a triple fault a few instructions later. **`switching stack`** is the one
+the design originally missed — see below. **`poisoned ... still reads back
+correctly`** is the kernel re-reading its own copies after filling the
+bootloader's memory with `0xDE`.
 
 ### Breakpoint — `make run-int3`, exit 33
 
@@ -181,6 +206,113 @@ to two owners at once, so the allocator stops where the evidence is:
 [PANIC] double free detected: frame 84 @ 0x0000000000054000 is already free
 ```
 
+### Virtual memory — `make run-vmtest`, exit 33
+
+Eight checks against the live address space:
+
+```
+[vmtest] cpu: efer.nxe set, w^x is meaningful
+[vmtest] cr3: own tables; pmap at 0xffff800000000000 is rw+nx and round-trips
+[vmtest] stack: rsp 0xffffc80000009e10 in kstack[1] ..., phys 0x0000000000067e10,
+         guard page at 0xffffc80000005000 unmapped, not reclaimable
+[vmtest] map: 0xffffd80000000000 -> frame 1, wrote and read back 0x50474e4950414d56
+[vmtest] translate: 0xffffd80000000000 -> 0x0000000000001000 PageFlags(READ | WRITE)
+[vmtest] unmap: returned frame 1 as expected
+[vmtest] frames: leaf frame returned; 3 page-table frames remain allocated by design
+[vmtest] error: map over a live mapping -> AlreadyMapped
+[vmtest] error: unmap an absent page -> NotMapped
+[vmtest] error: map at non-canonical 0x0000800000000000 -> NotCanonical
+[vmtest] error: map with WRITE|EXEC -> InvalidFlags (w^x)
+[vmtest] error: all four cases returned errors, none panicked
+[vmtest] memory map: 16 regions, 1 not page aligned; whole-frame arithmetic stays inside every one
+[vmtest] reclaim: boot info survived (Limine 9.6.7, 16 map entries, cmdline "vm-test")
+```
+
+The error cases are the part that matters for M11: a user component will
+drive this API through a capability, and a bad request must return an error,
+not take the kernel down.
+
+The "3 page-table frames remain allocated" line is a deliberate design
+property, asserted exactly rather than tolerated
+([ADR 015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md)).
+
+### NX enforcement — `make run-nx`, exit 35
+
+A jump into a data page in PMAP. The error code's bit 4 is the proof: the
+CPU only sets it when `EFER.NXE` is enabled, so this one line shows both
+that PMAP is NX *and* that `cpu::init` did its job.
+
+```
+[vmtest] nx test: jumping to 0xffff800000001000 (a data page in PMAP, mapped NX)
+
+*** EXCEPTION: #PF page fault (vector 14) ***
+[trap] error_code=0x0000000000000011  rip=0xffff800000001000  cs=0x0008
+[trap] cr2=0xffff800000001000  (supervisor instruction fetch protection-violation)
+```
+
+Writing this test found a real defect: the M1 page-fault decoder only
+looked at three bits, so it reported `0x11` as "supervisor **read**". An NX
+violation was indistinguishable from an ordinary permission fault. The
+decoder now handles the instruction-fetch and reserved-bit flags too.
+
+### Guard page — `make run-guardpage`, exit 35
+
+A write just below the IST stack. In M1 and M2 this address was mapped dead
+space and the write simply succeeded; now the page is genuinely absent:
+
+```
+[vmtest] guard page test: writing to 0xffffc80000000000 (guard below the IST stack)
+
+*** EXCEPTION: #PF page fault (vector 14) ***
+[trap] cr2=0xffffc80000000ff8  (supervisor write not-present)
+```
+
+### Stack overflow — `make run-stackovf`, exit 35
+
+The same protection, reached the way a real overflow would: by recursing
+until RSP walks off the bottom of the main kernel stack.
+
+```
+[vmtest] depth 192, rsp 0xffffc80000006230
+
+*** EXCEPTION: #DF double fault (vector 8) ***
+[trap] rflags=0x0000000000000003  rsp=0xffffc80000006000  ss=0x0010
+[trap] IST1 stack: 0xffffc80000001000 .. 0xffffc80000005000, handler rsp=0xffffc80000004e80
+[trap] IST1: ok
+```
+
+**#DF, not #PF** — and that is correct, though it was not what this test
+first expected. RSP descends into the guard page, the CPU wants to deliver
+#PF, delivering it means pushing a five-qword frame onto the stack that
+just ran out, the push faults, and the fault escalates. IST1 catches it.
+
+This is the first time in the project that a *genuine* double fault — not
+one manufactured by corrupting RSP on purpose — has exercised the IST, and
+it is the clearest demonstration of why
+[ADR 005](docs/adr/005-double-fault-ist-stack.md) exists. Without the stack
+switch this would be a triple fault and a silent reset.
+
+### Stale TLB — `make run-staletlb`, exit 33, advisory
+
+A page is mapped, written through, unmapped **without** invalidating, and
+read again. On real hardware the stale entry may answer the read; on QEMU
+it may not. Either outcome passes, and the kernel says which happened:
+
+```
+[vmtest] unmapped it WITHOUT invalidating the TLB
+[vmtest] read after unmap returned 0x50474e4950414d56 -- QEMU did not fault;
+         this check is advisory
+[vmtest] a stale TLB entry survived here; on real hardware this is exactly the
+         bug TlbFlush exists to prevent
+```
+
+On this run the stale entry **did** survive — QEMU returned the old data
+rather than faulting. That is a live demonstration of the hazard
+[ADR 012](docs/adr/012-tlb-gecersizlestirme.md) is written against, and the
+reason `TlbFlush` is `#[must_use]` with a panicking `Drop`. It is recorded
+as advisory because the opposite outcome would also be legitimate; see
+*Known gaps*.
+
 ### Deliberate panic — `make run-panic`, exit 35
 
 ```
@@ -253,13 +385,20 @@ Cargo.toml              Crate, lints (warnings = deny), profiles
 rust-toolchain.toml     Pinned nightly + rust-src + x86_64-unknown-none
 build.rs                Re-link when the linker script changes
 boot/limine.conf.in     Boot config template; @DEFAULT_ENTRY@ picks the entry
-kernel/src/main.rs      Limine requests, kstart() entry point, fault hooks
-kernel/src/gdt.rs       GDT, TSS, IST1 stack for #DF
+kernel/src/main.rs      Limine requests, kstart() -> kmain(), fault hooks
+kernel/src/cpu.rs       CPUID, EFER.NXE, CR4.{PGE,SMEP,SMAP}, read back and verify
+kernel/src/gdt.rs       GDT, TSS, IST1 (bootstrap, then re-pointed by vm::init)
 kernel/src/idt.rs       IDT gate descriptors, all 32 exception vectors
 kernel/src/interrupts.rs  32 asm stubs, ExceptionFrame, common dispatcher
 kernel/src/faults.rs    Deliberate #BP / #PF / #DF triggers
-kernel/src/memory/      PhysAddr/PhysFrame, Limine memory map, frame allocator
+kernel/src/memory/mod.rs          PhysAddr/VirtAddr/PhysFrame, Limine memory map
+kernel/src/memory/frame_allocator.rs  Bitmap over all managed physical memory
+kernel/src/memory/layout.rs       Address-space constants, canonicality, stack slots
+kernel/src/memory/paging.rs       Entry/PageTable/PageFlags, map/unmap/translate, TlbFlush
+kernel/src/memory/vm.rs           Builds PMAP + W^X image + stacks, switches CR3 and RSP
+kernel/src/memory/bootinfo.rs     Copies Limine's responses out, then reclaims its memory
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
+kernel/src/vmtest.rs    Virtual memory acceptance tests and negative scenarios
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -329,13 +468,93 @@ triple-faulting and destroying the evidence.
 - [007 — Fiziksel çerçeve ayırıcı olarak bitmap](docs/adr/007-bitmap-frame-allocator.md)
 - [008 — BOOTLOADER_RECLAIMABLE bölgelerine M2'de dokunulmuyor](docs/adr/008-bootloader-reclaimable-dokunulmaz.md)
 
-M3 architect pass (karar alındı, kod M3'te):
+M3:
 
 - [009 — Adres uzayı yerleşimi ve user/kernel sınırı](docs/adr/009-adres-uzayi-yerlesimi.md)
 - [010 — HHDM'in kaderi: kendi fiziksel pencere eşlememiz](docs/adr/010-hhdm-kaderi.md)
 - [011 — Sayfa tablosu API'si: mekanizma, politika değil](docs/adr/011-sayfa-tablosu-api.md)
 - [012 — TLB geçersizleştirme disiplini](docs/adr/012-tlb-gecersizlestirme.md)
-- [013 — BOOTLOADER_RECLAIMABLE geri kazanımı: ön koşullar](docs/adr/013-reclaimable-geri-kazanim.md)
+- [013 — BOOTLOADER_RECLAIMABLE geri kazanımı: beş kapı](docs/adr/013-reclaimable-geri-kazanim.md)
+- [014 — CPU özellik bitleri: NXE, SMEP, SMAP, PGE](docs/adr/014-cpu-ozellik-bitleri.md)
+- [015 — `unmap` ara sayfa tablolarını serbest bırakmıyor](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md)
+
+ADR 010 ve 013, uygulama sırasında bulunanlarla güncellendi: 010'a EFER.NXE
+ön koşulu ve PMAP takma adının W^X'i nasıl deldiği, 013'e tasarımın
+kaçırdığı beşinci kapı eklendi.
+
+## What M3 cost: seven defects
+
+Each of these was found by running the thing, not by reading it. They are
+listed because the *shape* of each is more useful than the fix.
+
+| # | Defect | How it surfaced | What it says |
+|---|---|---|---|
+| 1 | `.limine_requests` fell outside all three mapped ranges — a one-page hole | `vm::verify_before_switch` refused to switch CR3 | The pre-switch check paid for itself on its first run. Without it: silent reset. |
+| 2 | Limine's stack is in `BOOTLOADER_RECLAIMABLE`; reclaim poisoned the live stack | `#GP` with `rip=0xdededededededede` | The poison pattern worked exactly as designed — and caught a gap in the *gate list*, not in the code. |
+| 3 | The frame bitmap was sized by the highest *usable* address, but reclaim donates frames above it | `release of out-of-range frame 65349` | An M2 invariant that M3 quietly invalidated. |
+| 4 | `RUST_SRCS := $(wildcard kernel/src/*.rs)` missed `kernel/src/memory/` | Edits appeared to have no effect; the ISO held a stale kernel | The worst kind: the build *succeeded*, and lied. |
+| 5 | The #PF decoder ignored error-code bits 3 and 4 | The NX test's error code read as "supervisor read" | A test that could not have told success from failure. |
+| 6 | `make build` was a silent no-op (`build/` is a directory, not `.PHONY`) | "Nothing to be done for 'build'" | Same class as #4: a command that looks like it worked. |
+| 7 | `memtest` asserted the free count had not moved since init | Panic at the first M3 boot | M2's assumption "nothing allocates after init" is false once `vm::init` exists. |
+
+Defects 1, 2 and 7 were caught by checks the project already had. Defects
+4 and 6 were caught by accident, and both were build-system lies — the
+category this project is least protected against. Defect 5 was caught by
+writing a test that demanded the kernel *explain* the fault rather than
+just produce one.
+
+## Known gaps
+
+Things this milestone deliberately did not finish, each with the evidence
+and the milestone it belongs to.
+
+**PMAP aliases the kernel image as writable.** No single page is both
+writable and executable, but `.text`'s physical frames are reachable
+read-write through the physical window. W^X therefore holds per virtual
+page, not per physical frame. Harmless while the kernel is the only writer;
+a privilege-escalation path once user code can request mappings. Closing it
+means mapping the image's physical range read-only in the window, which
+costs a few extra page tables. **Due before M8.** See
+[ADR 010](docs/adr/010-hhdm-kaderi.md).
+
+**SMEP and SMAP are enabled but untested.** `-cpu qemu64` does not report
+them, so the code path runs (detect → skip → warn) but the protection has
+never been exercised. Re-run with `-cpu host` or a model that advertises
+them. **Due in M8**, when there is finally a user page to protect.
+
+**SMAP will need `stac`/`clac`.** Once user mappings exist, deliberate
+kernel access to user memory faults unless `EFLAGS.AC` is set. This should
+be an RAII guard, not hand-written pairs: a `Drop` impl makes it impossible
+for an early `return` to leave AC set. **M8.** See
+[ADR 014](docs/adr/014-cpu-ozellik-bitleri.md).
+
+**The stale-TLB check is advisory, and on QEMU the stale entry survived.**
+The read after an uninvalidated unmap returned the old data instead of
+faulting. That is the hazard `TlbFlush` exists to prevent, demonstrated
+rather than argued — but QEMU's TLB is not real silicon and the opposite
+result would also be legitimate, so the scenario reports instead of
+asserting. **Re-run on real hardware** to see what the architecture
+actually does here.
+
+**`unmap` does not free intermediate page tables.** Three frames stay out
+per 512 GiB of address space ever touched. Freeing them safely needs a
+per-table reference count, and a count that is wrong in the unmapping
+direction is a use-after-free in the page walker. **M5**, with the
+capability object model. See
+[ADR 015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md).
+
+**The frame allocator still has no lock.** Single CPU, interrupts disabled,
+every entry point funnelled through one non-reentrant function. Documented
+in [ADR 007](docs/adr/007-bitmap-frame-allocator.md); becomes wrong the
+moment a second CPU starts.
+
+**`ACPI_RECLAIMABLE` is still untouched.** The tables have not been read
+yet and M6/M7 will need them. Unchanged from
+[ADR 008](docs/adr/008-bootloader-reclaimable-dokunulmaz.md).
+
+**No 5-level paging (LA57).** The address map assumes 48-bit virtual
+addresses. Enabling LA57 would move the kernel half's base. Deliberate;
+see [ADR 009](docs/adr/009-adres-uzayi-yerlesimi.md).
 
 ## Address space
 
@@ -347,8 +566,11 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: external interrupts
-(the PIC is still masked as Limine left it), user-mode segments and ring 3,
-physical and virtual memory management, the capability
-object model (Untyped, CNode, TCB, Endpoint, Notification, Frame, PageTable,
-IRQHandler), user space, and IPC.
+Deliberately absent, each belonging to a later milestone: a heap (`alloc`
+does not exist yet — M4), external interrupts (the PIC is still masked as
+Limine left it), threads and scheduling, user-mode segments and ring 3, the
+capability object model (Untyped, CNode, TCB, Endpoint, Notification,
+Frame, PageTable, IRQHandler), user space, and IPC.
+
+Everything *present* but incomplete is in **Known gaps** above, with the
+milestone that owes it.

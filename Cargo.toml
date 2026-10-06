@@ -21,6 +21,11 @@ bench = false
 # used; no allocation, no std.
 limine = "0.6"
 
+# Typed bit flags. Used for page-table entry flags and CPU feature bits,
+# where the alternative is hand-rolled constants and bitwise operations
+# that the compiler cannot check for sense.
+bitflags = { version = "2", default-features = false }
+
 # Warnings are denied here rather than through RUSTFLAGS. Cargo replaces,
 # rather than merges, `[target.*.rustflags]` when RUSTFLAGS is set in the
 # environment -- so denying warnings that way would silently drop the linker

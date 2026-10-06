@@ -41,6 +41,39 @@ kaldığını, W^X'in geçerli olduğunu *biliyoruz* — tahmin etmiyoruz.
 olacak ve kernel yarısını paylaşacak. Paylaşılan kernel eşlemelerinin
 bizim kurduğumuz, yapısını bildiğimiz tablolar olması şart.
 
+### Ön koşul: EFER.NXE
+
+Bu ADR'nin W^X ile ilgili her iddiası tek bir MSR bitine dayanıyor ve
+mimaride o bit varsayılan olarak **kapalı**.
+
+`IA32_EFER` (MSR `0xC000_0080`) bit 11, NXE. Temizken sayfa tablosu
+girdisinin 63. biti *ayrılmıştır* (reserved), "yürütülemez" değil. Yani
+NXE kapalıyken:
+
+- PMAP'i NX kurduğumuzu sandığımız eşlemeler aslında **ayrılmış bit set
+  edilmiş** eşlemelerdir,
+- ve onlara yapılan her erişim #PF üretir — reserved-bit hata koduyla,
+  ilk kullanımda.
+
+Bu "koruma çalışmıyor" değil, "hiçbir şey çalışmıyor" demek. Başarısızlık
+gürültülü, ki iyi; ama sebebi kuruluma uzak, ki kötü.
+
+Limine büyük olasılıkla NXE'yi zaten açıyor. "Büyük olasılıkla" üzerine
+W^X inşa edilmez. Bu yüzden `cpu::init` (bkz.
+[ADR 014](014-cpu-ozellik-bitleri.md)):
+
+1. CPUID `0x8000_0001` EDX[20] ile desteği sorar,
+2. NXE'yi kendisi set eder,
+3. MSR'ı **geri okur**,
+4. ve set olmamışsa `assert!` ile durur.
+
+Sıra da önemli: `cpu::init`, `vm::init`'ten önce çağrılır. Tersi olsaydı
+NX biti set eden ilk tablo kurulurken bitin anlamı hâlâ "ayrılmış"
+olurdu.
+
+Referans: Intel SDM Vol. 3A, 4.6 "Access Rights" ve 4.9.2 — "execute-disable
+... only if IA32_EFER.NXE = 1".
+
 ### PMAP, HHDM ile aynı adreste
 
 Kritik ayrıntı: kendi penceremizi **Limine'in HHDM'i ile aynı sanal adrese**
@@ -90,6 +123,51 @@ yeni tabloda da geçerli olmalı, yoksa bir sonraki komut getirme #PF üretir
 ve IDT'nin kendisi de eşlenmemişse triple fault olur. Bu yüzden adım 3,
 adım 5'ten önce ve kernel imajının tamamını kapsıyor.
 
+**Uygulamada bu adım bir kez başarısız oldu ve neden yazıldığını kanıtladı.**
+`.limine_requests` bölümü `__rodata_end` ile `__writable_start` arasına
+düşüyordu; üç aralığın hiçbiri onu kapsamıyordu, yani
+`0xffffffff80015000`'de bir sayfalık delik vardı. Geçiş öncesi kontrol
+(`vm::verify_before_switch`, imajın her sayfasını yürür) bunu yakaladı ve
+kernel CR3'e dokunmadan durdu. Kontrol olmasaydı belirti sessiz bir reset
+olacaktı. Düzeltme `__writable_start`'ı istek bölümünün önüne almaktı; aynı
+sınıftan bir hatanın derleme zamanında yakalanması için
+`scripts/check_kernel.py` artık üç aralığın imajı deliksiz kapladığını da
+denetliyor.
+
+### PMAP, kernel .text'i yazılabilir olarak takma adlıyor
+
+Bu bölümün kabul ettiği bir tutarsızlık var ve gizlemek yerine adını
+koyuyorum.
+
+PMAP tüm RAM'i yazılabilir eşliyor. Kernel imajı da RAM'de. Dolayısıyla
+`.text`'in fiziksel çerçeveleri **iki** sanal adresten erişilebilir:
+
+| Yol | İzin |
+|---|---|
+| `0xFFFF_FFFF_8000_xxxx` (imaj eşlemesi) | R-X |
+| `PMAP_BASE + phys` (pencere) | RW-NX |
+
+İkisi birden W^X'i sayfa başına korur — hiçbir *sayfa* aynı anda hem
+yazılabilir hem yürütülebilir değil. Ama *fiziksel çerçeve* düzeyinde
+koruma delik: PMAP üzerinden `.text`'e yazan kod, sonra imaj eşlemesinden
+yürütülecek baytları değiştirebilir.
+
+**Neden kabul ediyoruz.** M3'te PMAP'e yazan tek şey kernel'in kendisi, ve
+kernel'in kendi `.text`'ini bozmaması zaten her satırda varsaydığımız bir
+şey. Asıl tehdit modeli M8/M11'de, user kodu bir capability üzerinden
+eşleme yaptırabildiğinde başlıyor — ve o noktada bu delik gerçek bir
+yükseltme yolu olur.
+
+**İleride nasıl kapatılır.** PMAP kurulurken kernel imajının fiziksel
+aralığını ayırıp o aralığı pencerede salt okunur eşlemek. Bedeli: pencere
+artık tek bir büyük sayfa dizisi olmaktan çıkar, imajın etrafında 4 KiB
+granülerliğine inmek gerekir (imaj 2 MiB hizalı değil), yani birkaç ek
+tablo ve biraz daha TLB girdisi. Mekanizma zaten var — `map_window` sayfa
+boyutunu adrese göre zaten seçiyor; eksik olan yalnızca aralık dışlama.
+
+**Ne zaman.** M8'den önce, user space'in var olduğu ilk milestone'da.
+Bilinen eksiklere yazıldı.
+
 ## Elenen alternatifler
 
 **A: Limine'in HHDM'ini sürdürmek.** En az iş. Bedeli: reclaimable sonsuza
@@ -124,7 +202,12 @@ sayfa başına izin ayarı — PMAP'te buna ihtiyaç yok, hepsi aynı (RW+NX).
   değil.
 - PMAP NX ve yalnızca RAM içeriyor; MMIO ayrı aralıkta
   ([ADR 009](009-adres-uzayi-yerlesimi.md)).
-- Kernel imajı bölüm bölüm doğru izinlerle eşleniyor: W^X kazanıldı.
+- Kernel imajı bölüm bölüm doğru izinlerle eşleniyor: W^X kazanıldı —
+  sanal sayfa düzeyinde. PMAP takma adı fiziksel çerçeve düzeyinde bir
+  delik bırakıyor; bilinçli, belgeli, M8 öncesi kapatılacak.
+- W^X'in tamamı EFER.NXE'ye bağlı ve o bit varsayılmıyor: `cpu::init`
+  CPUID'den sorup set ediyor, geri okuyup doğruluyor, olmazsa duruyor
+  ([ADR 014](014-cpu-ozellik-bitleri.md)).
 - IST stack'lerinin altında gerçek guard page var; M1'den devreden ölü
   alan artık #PF üretiyor.
 - `BOOTLOADER_RECLAIMABLE` geri kazanılabilir hale geliyor
