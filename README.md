@@ -3,10 +3,10 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M1 — CPU structures.** The kernel installs its own GDT,
-TSS and IDT, catches all 32 CPU exceptions and reports them with full machine
-state, and handles a double fault on a dedicated IST stack so that a broken
-stack pointer cannot escalate into a silent machine reset.
+**Current milestone: M2 — Physical memory.** The kernel reads Limine's memory
+map and manages physical frames with a bitmap allocator that never hands out
+frame 0, the kernel image, or its own metadata — and that detects a double
+free instead of corrupting itself quietly.
 
 ## Quick start
 
@@ -49,7 +49,9 @@ cloned into `third_party/` automatically.
 | `make run-int3` | `int3` → #BP, handler *returns*; **must** exit 33 |
 | `make run-pf` | Unmapped write → #PF with CR2; **must** exit 35 |
 | `make run-df` | Corrupt RSP → #DF on IST1; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all five scenarios, runner self-test |
+| `make run-memtest` | Frame allocator suite; **must** exit 33 |
+| `make run-doublefree` | Double free is detected; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all seven scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -57,9 +59,9 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M1 acceptance criteria
+## M2 acceptance criteria
 
-Five scenarios, all booting the **same** `kernel.elf` through different
+Seven scenarios, all booting the **same** `kernel.elf` through different
 Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
@@ -133,6 +135,51 @@ against the IST1 range and says so ([ADR 005](docs/adr/005-double-fault-ist-stac
 Note the two stack pointers: `rsp=0x0000600000000000` in the frame is the
 broken one that caused the fault; `handler rsp=0xffffffff8000ef00` is inside
 IST1. Without the stack switch this would have been a triple fault.
+
+### Frame allocator — `make run-memtest`, exit 33
+
+The memory map is dumped in full, then four phases run against the real
+memory of the machine. The kernel checks its own invariants and reports the
+verdict; the runner asserts on that.
+
+```
+[mem] memory map: 16 entries
+[mem]   0x0000000000001000..0x0000000000052000        324 KiB  bootloader-reclaimable
+[mem]   0x0000000000052000..0x000000000009f000        308 KiB  usable
+[mem]   0x0000000000100000..0x000000000fbd5000     256852 KiB  usable
+[mem]   0x000000000fbdb000..0x000000000fc03000        160 KiB  executable-and-modules
+[mem] total 12803 MiB, usable 251 MiB (64317 frames of 4 KiB)
+[mem] bitmap: 7 KiB for 65361 frames, at phys 0x0000000000052000 (virt 0xffff800000052000)
+[mem] image frames verified in use: 64473..=64512
+[mem] allocator ready: 64315 free frames (251 MiB)
+[memtest] alloc: 10000 unique, aligned, in-range (frames 84..=10180, 39 MiB span)
+[memtest] alloc: none in the kernel image, none is frame 0
+[memtest] free: count restored (64315)
+[memtest] exhausted after 64315 frames; allocate() returned None cleanly
+[memtest] recovery: freed frame 65360 @ 0x000000000ff50000 and got it straight back
+```
+
+Note the bitmap's address: it lives in the memory it manages, not in a
+static array ([ADR 007](docs/adr/007-bitmap-frame-allocator.md)). The
+~4 MiB of `bootloader-reclaimable` is deliberately left alone — Limine's
+response structures, including the memory map being walked, are still in
+there ([ADR 008](docs/adr/008-bootloader-reclaimable-dokunulmaz.md)).
+
+### Double free — `make run-doublefree`, exit 35
+
+A frame is allocated, freed, then freed again. Accepting the second free
+quietly would put the same frame on the free list twice and later hand it
+to two owners at once, so the allocator stops where the evidence is:
+
+```
+[memtest] got frame 84 @ 0x0000000000054000
+[memtest] first free (legitimate) ...
+[memtest] second free of the same frame -- this must panic
+
+*** KERNEL PANIC ***
+[PANIC] at kernel/src/memory/frame_allocator.rs:522:17
+[PANIC] double free detected: frame 84 @ 0x0000000000054000 is already free
+```
 
 ### Deliberate panic — `make run-panic`, exit 35
 
@@ -211,6 +258,8 @@ kernel/src/gdt.rs       GDT, TSS, IST1 stack for #DF
 kernel/src/idt.rs       IDT gate descriptors, all 32 exception vectors
 kernel/src/interrupts.rs  32 asm stubs, ExceptionFrame, common dispatcher
 kernel/src/faults.rs    Deliberate #BP / #PF / #DF triggers
+kernel/src/memory/      PhysAddr/PhysFrame, Limine memory map, frame allocator
+kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -277,6 +326,8 @@ triple-faulting and destroying the evidence.
 - [004 — WSL Ubuntu build ortamı](docs/adr/004-wsl-build-ortami.md)
 - [005 — Double fault'u IST1 üzerinde ayrı bir stack'te karşılamak](docs/adr/005-double-fault-ist-stack.md)
 - [006 — Assembly stub'ları + tek ortak handler](docs/adr/006-exception-stub-ortak-handler.md)
+- [007 — Fiziksel çerçeve ayırıcı olarak bitmap](docs/adr/007-bitmap-frame-allocator.md)
+- [008 — BOOTLOADER_RECLAIMABLE bölgelerine M2'de dokunulmuyor](docs/adr/008-bootloader-reclaimable-dokunulmaz.md)
 
 ## Not yet built
 

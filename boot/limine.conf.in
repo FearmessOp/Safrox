@@ -3,11 +3,13 @@
 # The build generates one concrete limine.conf per ISO by substituting
 # @DEFAULT_ENTRY@ with the index of the entry that should boot:
 #
-#   1 -> normal boot       build/pythos.iso          exit 33
-#   2 -> panic test        build/pythos-panic.iso    exit 35
-#   3 -> breakpoint (#BP)  build/pythos-int3.iso     exit 33  (handler returns)
-#   4 -> page fault (#PF)  build/pythos-pf.iso       exit 35
-#   5 -> double fault (#DF) build/pythos-df.iso      exit 35  (handled on IST1)
+#   1 -> normal boot        build/pythos.iso            exit 33
+#   2 -> panic test         build/pythos-panic.iso      exit 35
+#   3 -> breakpoint (#BP)   build/pythos-int3.iso       exit 33 (handler returns)
+#   4 -> page fault (#PF)   build/pythos-pf.iso         exit 35
+#   5 -> double fault (#DF) build/pythos-df.iso         exit 35 (handled on IST1)
+#   6 -> frame allocator    build/pythos-memtest.iso    exit 33
+#   7 -> double free        build/pythos-doublefree.iso exit 35
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -48,3 +50,15 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: fault-df
+
+/PythOS (frame allocator tests)
+    comment: Bulk alloc/free, leak check and exhaustion/recovery. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: mem-test
+
+/PythOS (double free)
+    comment: Free the same frame twice; the allocator must panic. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: mem-double-free

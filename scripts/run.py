@@ -103,7 +103,7 @@ EXPECTATIONS = {
         required=[
             *COMMON_BOOT_LINES,
             *CPU_INIT_LINES,
-            re.compile(r"^\[boot\] M1 checks passed", re.M),
+            re.compile(r"^\[boot\] M2 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -121,7 +121,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M1 checks passed", re.M)],
+        forbidden=[re.compile(r"M2 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -138,7 +138,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M1 checks passed", re.M),
+            re.compile(r"^\[boot\] M2 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -157,7 +157,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M1 checks passed", re.M)],
+        forbidden=[re.compile(r"M2 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -176,8 +176,67 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M1 checks passed", re.M),
+            re.compile(r"M2 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
+        ],
+    ),
+    # --- M2: physical memory --------------------------------------------
+    "memtest": Expectation(
+        name="frame allocator",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            # The memory map was read and summarised.
+            re.compile(r"^\[mem\] memory map: \d+ entries", re.M),
+            re.compile(r"^\[mem\]   0x[0-9a-f]{16}\.\.0x[0-9a-f]{16}\s+\d+ KiB  usable", re.M),
+            re.compile(r"^\[mem\] total \d+ MiB, usable \d+ MiB \(\d+ frames of 4 KiB\)", re.M),
+            # The bitmap lives in the memory it manages, not in a static.
+            re.compile(r"^\[mem\] bitmap: \d+ KiB for \d+ frames, at phys 0x[0-9a-f]+", re.M),
+            re.compile(r"^\[mem\] allocator ready: \d+ free frames", re.M),
+            # The kernel's own verdict on each phase.
+            re.compile(r"^\[mem\] image frames verified in use: \d+\.\.=\d+", re.M),
+            re.compile(r"^\[memtest\] alloc: 10000 unique, aligned, in-range", re.M),
+            re.compile(
+                r"^\[memtest\] alloc: none in the kernel image, none is frame 0", re.M
+            ),
+            re.compile(r"^\[memtest\] free: count restored \(\d+\)", re.M),
+            re.compile(
+                r"^\[memtest\] exhausted after \d+ frames; allocate\(\) returned None cleanly",
+                re.M,
+            ),
+            re.compile(r"^\[memtest\] recovery: freed .* and got it straight back", re.M),
+            re.compile(r"^\[memtest\] all frame allocator tests passed", re.M),
+            re.compile(r"^\[boot\] M2 checks passed", re.M),
+        ],
+        forbidden=[
+            # Every invariant the kernel checks is an assert, so a violation
+            # shows up as a panic. Forbidding it here means a weakened
+            # in-kernel check cannot quietly turn into a pass.
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "doublefree": Expectation(
+        name="double free",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            re.compile(r"^\[memtest\] first free \(legitimate\)", re.M),
+            re.compile(r"^\[memtest\] second free of the same frame -- this must panic", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            # The panic must name the condition and the frame, so the log
+            # says which frame was freed twice.
+            re.compile(
+                r"^\[PANIC\] double free detected: frame \d+ @ 0x[0-9a-f]{16} is already free",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M2 checks passed", re.M),
+            # If this appeared, the allocator accepted the second free.
+            re.compile(r"the allocator accepted a double free", re.M),
         ],
     ),
 }

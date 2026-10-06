@@ -75,6 +75,20 @@ struct IstStack([u8; IST_STACK_SIZE]);
 /// asynchronously (it pushes an exception frame onto it), so Rust's
 /// aliasing model cannot describe it. Access from Rust is confined to
 /// `ist1_range()` and the one-time address computation in `init()`.
+///
+/// `#[link_section]` puts this in `.ist_stacks`, which the linker script
+/// places at the very top of the image with a page of dead space below it.
+/// Stacks grow downwards, so an overflow runs off the *bottom*: left in the
+/// ordinary `.bss`, it would quietly overwrite whatever happened to be
+/// allocated underneath -- which was `.data` and the Limine response
+/// structures we still read.
+///
+/// The section is deliberately not called `.bss.something`: the linker
+/// assigns each input section to the *first* output section that matches,
+/// so `*(.bss.*)` would have claimed it before its own section was reached.
+/// `#[used]` keeps the symbol alive so the section is not dropped.
+#[used]
+#[link_section = ".ist_stacks"]
 static mut IST1_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 
 /// Inclusive-exclusive address range of the IST1 stack: `(lowest, one-past-highest)`.

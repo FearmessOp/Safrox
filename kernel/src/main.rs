@@ -14,9 +14,15 @@
 //!      state, and #DF is handled on a dedicated IST stack so that a broken
 //!      stack pointer cannot escalate to a silent triple fault.
 //!
-//! Deliberately absent: memory management, external interrupts (the PIC is
-//! still masked as Limine left it), user space. Those belong to later
-//! milestones.
+//! Added by M2:
+//!   8. Limine's memory map is read and reported.
+//!   9. A bitmap frame allocator over the usable regions, which never hands
+//!      out frame 0, the kernel image, or its own metadata, and which
+//!      detects a double free rather than corrupting itself quietly.
+//!
+//! Deliberately absent: virtual memory (we still run on the bootloader's
+//! page tables), external interrupts (the PIC is masked as Limine left it),
+//! user space, and any heap -- there is no `alloc` before M4.
 
 #![no_std]
 #![no_main]
@@ -26,13 +32,15 @@ mod gdt;
 mod idt;
 mod interrupts;
 mod io;
+mod memory;
+mod memtest;
 mod panic;
 mod qemu;
 mod serial;
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
-    StackSizeRequest,
+    MemmapRequest, StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -40,7 +48,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M1");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M2");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -97,6 +105,12 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
+/// The machine's memory map: which physical ranges exist and what each is
+/// for. Without it the kernel has no idea which memory it may touch.
+#[used]
+#[link_section = ".limine_requests"]
+static MEMMAP: MemmapRequest = MemmapRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]
@@ -288,6 +302,24 @@ pub extern "C" fn kstart() -> ! {
         gdt::DOUBLE_FAULT_IST_INDEX
     );
 
+    // ---- Physical memory (M2) ------------------------------------------
+    //
+    // After the IDT, so that a fault while walking the memory map produces
+    // a report rather than a triple fault.
+
+    // SAFETY: First and only call, on the single-threaded boot path. The
+    // HHDM offset and the kernel slide come from the responses validated
+    // above, so they describe this boot. Nothing has allocated a frame yet,
+    // which is what lets the allocator claim storage for its own bitmap out
+    // of the memory it is about to manage.
+    unsafe {
+        memory::init(
+            &MEMMAP,
+            hhdm.offset,
+            virtual_base.wrapping_sub(physical_base),
+        );
+    }
+
     // ---- Fault-injection hooks -----------------------------------------
     //
     // Each of these is reached through a token on the kernel command line,
@@ -320,7 +352,20 @@ pub extern "C" fn kstart() -> ! {
         faults::trigger_double_fault();
     }
 
-    println!("[boot] M1 checks passed");
+    // The frame allocator tests run against the real memory map of the
+    // machine we booted on, and the kernel checks its own invariants --
+    // see kernel/src/memtest.rs.
+    if cmdline.contains("mem-double-free") {
+        println!("[boot] cmdline requested the double-free test");
+        memtest::run_double_free();
+    }
+
+    if cmdline.contains("mem-test") {
+        println!("[boot] cmdline requested the frame allocator tests");
+        memtest::run();
+    }
+
+    println!("[boot] M2 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

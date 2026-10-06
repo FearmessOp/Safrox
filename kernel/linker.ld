@@ -82,9 +82,48 @@ SECTIONS
 
     .bss : {
         __bss_start = .;
+        /* Ordinary zero-initialised data.
+         *
+         * The IST stacks are deliberately NOT named `.bss.something`: input
+         * sections go to the first output section that matches, so
+         * `*(.bss.*)` here would swallow them before their own section
+         * below ever got a chance. Giving them an unrelated name
+         * (`.ist_stacks`) makes the separation structural instead of
+         * depending on wildcard ordering. */
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
+    } :data
+
+    /* ---- Interrupt stacks -------------------------------------------
+     *
+     * The IST stacks live at the very top of the image, after every other
+     * symbol, with a page of dead space underneath.
+     *
+     * x86 stacks grow downwards, so an overflow runs off the *bottom* of
+     * the stack. Placed anywhere else, that overflow would silently
+     * overwrite whatever sits below -- which, before this was fixed, was
+     * .data and the Limine request/response structures we are still
+     * reading. The corruption would show up much later, somewhere
+     * unrelated.
+     *
+     * The gap is not a guard page: nothing is unmapped, so a deep enough
+     * overflow still walks into it quietly. It is dead space, which turns
+     * a silent corruption into a harmless scribble and buys room for the
+     * real guard page in M3, once page tables exist.
+     *
+     * Verified by scripts/check_kernel.py, which fails the build if any
+     * symbol other than the IST markers lies at or above __ist_stacks_start.
+     */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __ist_guard_start = .;
+    . += CONSTANT(MAXPAGESIZE);
+    __ist_guard_end = .;
+
+    .ist_stacks (NOLOAD) : {
+        __ist_stacks_start = .;
+        KEEP(*(.ist_stacks))
+        __ist_stacks_end = .;
     } :data
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

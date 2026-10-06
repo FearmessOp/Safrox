@@ -121,6 +121,35 @@ def main() -> int:
             "every request (check KEEP() in linker.ld and the 'used' attribute)"
         )
 
+    # --- IST stack placement ---------------------------------------------
+    #
+    # Stacks grow downwards, so an overflow runs off the bottom of the IST
+    # stack and scribbles over whatever is allocated below it. The linker
+    # script puts the IST stacks at the very top of the image with a page of
+    # dead space underneath; this check makes sure nothing drifts back in.
+    #
+    # Not a guard page -- nothing is unmapped yet -- but it turns a silent
+    # corruption of live data into a harmless scribble. The real guard page
+    # arrives in M3.
+    ist = sections.get(".ist_stacks")
+    if ist is None or ist[1] == 0:
+        fail(
+            ".ist_stacks is missing or empty; the IST stack was not placed "
+            "where linker.ld expects it (check #[link_section] in gdt.rs)"
+        )
+
+    ist_start = ist[0]
+    bss = sections.get(".bss")
+    if bss is not None:
+        bss_end = bss[0] + bss[1]
+        gap = ist_start - bss_end
+        if gap < PAGE_SIZE:
+            fail(
+                f"only {gap} bytes between the end of .bss ({bss_end:#x}) and "
+                f"the IST stacks ({ist_start:#x}); an IST overflow would land "
+                f"in live data. linker.ld should leave at least one page."
+            )
+
     # --- Build-path leakage ---------------------------------------------
     #
     # -ffile-prefix-map should have rewritten every source path to a

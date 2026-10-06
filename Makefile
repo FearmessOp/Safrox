@@ -36,8 +36,12 @@ ISO_PANIC   := $(BUILD_DIR)/pythos-panic.iso
 ISO_INT3    := $(BUILD_DIR)/pythos-int3.iso
 ISO_PF      := $(BUILD_DIR)/pythos-pf.iso
 ISO_DF      := $(BUILD_DIR)/pythos-df.iso
+# M2 frame allocator images.
+ISO_MEMTEST := $(BUILD_DIR)/pythos-memtest.iso
+ISO_DFREE   := $(BUILD_DIR)/pythos-doublefree.iso
 
-ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF)
+ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
+               $(ISO_MEMTEST) $(ISO_DFREE)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -68,6 +72,7 @@ QEMU_FLAGS := \
 	-display none
 
 .PHONY: all kernel isos run run-panic run-int3 run-pf run-df \
+        run-memtest run-doublefree \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -147,6 +152,12 @@ $(ISO_PF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 $(ISO_DF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 	$(call build_iso,$@,5)
 
+$(ISO_MEMTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,6)
+
+$(ISO_DFREE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,7)
+
 # ---- Run & test --------------------------------------------------------
 
 run: $(ISO)
@@ -166,6 +177,13 @@ run-pf: $(ISO_PF)
 run-df: $(ISO_DF)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DF) --expect df -- $(QEMU_FLAGS)
 
+# M2 frame allocator scenarios.
+run-memtest: $(ISO_MEMTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_MEMTEST) --expect memtest -- $(QEMU_FLAGS)
+
+run-doublefree: $(ISO_DFREE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DFREE) --expect doublefree -- $(QEMU_FLAGS)
+
 # The full acceptance suite, in order:
 #
 #   fmt        formatting is consistent
@@ -179,16 +197,18 @@ run-df: $(ISO_DF)
 #   run-int3   #BP is caught, reported, and *returned from*: exits 33
 #   run-pf     #PF is caught with the right error code and CR2: exits 35
 #   run-df     #DF is caught on the IST1 stack, kernel confirms it: exits 35
+#   run-memtest     bulk alloc/free with no leak, clean exhaustion: exits 33
+#   run-doublefree  a double free is detected and panics: exits 35
 #   self-test  the runner itself is proven to validate: handed the panic ISO
 #              while expecting success, it must FAIL. Without this, a runner
 #              that accepted everything would look identical to a working one.
 #
 # Every scenario additionally fails if the kernel banner appears twice,
 # which would mean the machine triple-faulted and rebooted.
-test: fmt clippy run run-panic run-int3 run-pf run-df
+test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M1: all acceptance tests passed"
+	@echo "M2: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"
