@@ -329,6 +329,22 @@ triple-faulting and destroying the evidence.
 - [007 — Fiziksel çerçeve ayırıcı olarak bitmap](docs/adr/007-bitmap-frame-allocator.md)
 - [008 — BOOTLOADER_RECLAIMABLE bölgelerine M2'de dokunulmuyor](docs/adr/008-bootloader-reclaimable-dokunulmaz.md)
 
+M3 architect pass (karar alındı, kod M3'te):
+
+- [009 — Adres uzayı yerleşimi ve user/kernel sınırı](docs/adr/009-adres-uzayi-yerlesimi.md)
+- [010 — HHDM'in kaderi: kendi fiziksel pencere eşlememiz](docs/adr/010-hhdm-kaderi.md)
+- [011 — Sayfa tablosu API'si: mekanizma, politika değil](docs/adr/011-sayfa-tablosu-api.md)
+- [012 — TLB geçersizleştirme disiplini](docs/adr/012-tlb-gecersizlestirme.md)
+- [013 — BOOTLOADER_RECLAIMABLE geri kazanımı: ön koşullar](docs/adr/013-reclaimable-geri-kazanim.md)
+
+## Address space
+
+The virtual address layout is fixed as of the M3 architect pass — in
+particular the **user/kernel boundary at `0xFFFF_8000_0000_0000`, which will
+not move when user space arrives in M8**. The full map, with an owner and a
+milestone for every range, is in
+[docs/address-space.md](docs/address-space.md).
+
 ## Not yet built
 
 Deliberately absent, each belonging to a later milestone: external interrupts
