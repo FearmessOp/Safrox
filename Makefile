@@ -49,12 +49,18 @@ ISO_STACKOVF := $(BUILD_DIR)/pythos-stackovf.iso
 ISO_HEAPTEST  := $(BUILD_DIR)/pythos-heaptest.iso
 ISO_HEAPOOM   := $(BUILD_DIR)/pythos-heapoom.iso
 ISO_HEAPGUARD := $(BUILD_DIR)/pythos-heapguard.iso
+ISO_CAPTEST := $(BUILD_DIR)/pythos-captest.iso
+ISO_CAPREVOKE := $(BUILD_DIR)/pythos-caprevoke.iso
+ISO_CAPINTALLOC := $(BUILD_DIR)/pythos-capintalloc.iso
+ISO_CAPRETIRED := $(BUILD_DIR)/pythos-capretired.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
                $(ISO_VMTEST) $(ISO_STALETLB) $(ISO_GUARD) $(ISO_NX) \
                $(ISO_STACKOVF) \
-               $(ISO_HEAPTEST) $(ISO_HEAPOOM) $(ISO_HEAPGUARD)
+               $(ISO_HEAPTEST) $(ISO_HEAPOOM) $(ISO_HEAPGUARD) \
+               $(ISO_CAPTEST) $(ISO_CAPREVOKE) $(ISO_CAPINTALLOC) \
+               $(ISO_CAPRETIRED)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -223,6 +229,18 @@ $(ISO_HEAPOOM): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 $(ISO_HEAPGUARD): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 	$(call build_iso,$@,15)
 
+$(ISO_CAPTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,16)
+
+$(ISO_CAPREVOKE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,17)
+
+$(ISO_CAPINTALLOC): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,18)
+
+$(ISO_CAPRETIRED): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,19)
+
 # ---- Run & test --------------------------------------------------------
 
 run: $(ISO)
@@ -275,6 +293,20 @@ run-heapoom: $(ISO_HEAPOOM)
 run-heapguard: $(ISO_HEAPGUARD)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_HEAPGUARD) --expect heapguard -- $(QEMU_FLAGS)
 
+# M5 capability scenarios. captest and caprevoke exit 33; the two
+# tripwires exit 35, because each one is a rule being enforced.
+run-captest: $(ISO_CAPTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_CAPTEST) --expect captest -- $(QEMU_FLAGS)
+
+run-caprevoke: $(ISO_CAPREVOKE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_CAPREVOKE) --expect caprevoke -- $(QEMU_FLAGS)
+
+run-capintalloc: $(ISO_CAPINTALLOC)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_CAPINTALLOC) --expect capintalloc -- $(QEMU_FLAGS)
+
+run-capretired: $(ISO_CAPRETIRED)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_CAPRETIRED) --expect capretired -- $(QEMU_FLAGS)
+
 # The full acceptance suite, in order:
 #
 #   fmt        formatting is consistent
@@ -306,10 +338,11 @@ run-heapguard: $(ISO_HEAPGUARD)
 # which would mean the machine triple-faulted and rebooted.
 test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree \
       run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
-      run-heaptest run-heapoom run-heapguard
+      run-heaptest run-heapoom run-heapguard \
+      run-captest run-caprevoke run-capintalloc run-capretired
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M4: all acceptance tests passed"
+	@echo "M5: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"

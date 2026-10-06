@@ -11,7 +11,7 @@
 //! free list, and where the bitmap itself lives.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use limine::memmap;
 
@@ -210,6 +210,92 @@ unsafe impl Sync for AllocatorCell {}
 /// call that slips in before initialisation panics with a clear message
 /// instead of dereferencing a null bitmap.
 static INITIALISED: AtomicBool = AtomicBool::new(false);
+
+/// Set once boot has handed the machine's memory to the capability
+/// system. After that the allocator is retired (ADR 022).
+///
+/// From this point the only way to obtain memory is to retype an
+/// Untyped, which means every allocation is charged to some component's
+/// budget. An `allocate()` call after retirement is a kernel bug -- a
+/// path that was supposed to go through a capability and does not -- so
+/// it panics rather than quietly working.
+static RETIRED: AtomicBool = AtomicBool::new(false);
+
+/// Nesting depth of interrupt handlers, for the allocation tripwire.
+///
+/// M2's safety argument for `unsafe impl Sync` had three legs: one CPU,
+/// interrupts disabled, and a single non-reentrant entry point. M6 will
+/// enable interrupts and knock out the second. Rather than add a lock
+/// that protects nothing on a single CPU, the rule becomes explicit:
+/// **interrupt handlers do not allocate**, and this counter catches a
+/// violation at the moment it happens instead of leaving a corrupted
+/// bitmap to be discovered later.
+///
+/// Not an `AtomicU32` because it is only ever touched from one CPU with
+/// interrupts disabled at the point of change; `AtomicUsize` is used for
+/// the same reason the other statics here are -- it is the cheapest way
+/// to have a mutable static without `unsafe`.
+static INTERRUPT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that an interrupt handler has been entered.
+///
+/// Paired with [`exit_interrupt`]. Called from the exception dispatcher.
+pub fn enter_interrupt() {
+    INTERRUPT_DEPTH.fetch_add(1, Ordering::Acquire);
+}
+
+/// Record that an interrupt handler has returned.
+pub fn exit_interrupt() {
+    let previous = INTERRUPT_DEPTH.fetch_sub(1, Ordering::Release);
+    debug_assert!(previous > 0, "interrupt depth underflow");
+}
+
+/// Whether execution is currently inside an interrupt handler.
+pub fn in_interrupt() -> bool {
+    INTERRUPT_DEPTH.load(Ordering::Acquire) != 0
+}
+
+/// Retire the allocator. Boot calls this after the root Untypeds exist.
+///
+/// # Safety
+///
+/// Every frame the kernel will ever need must already have been taken,
+/// and the capability system must own the rest.
+pub unsafe fn retire() {
+    assert!(
+        INITIALISED.load(Ordering::Acquire),
+        "retiring a frame allocator that was never initialised"
+    );
+    assert!(
+        !RETIRED.swap(true, Ordering::AcqRel),
+        "the frame allocator was retired twice"
+    );
+}
+
+/// Whether the allocator has been retired.
+pub fn is_retired() -> bool {
+    RETIRED.load(Ordering::Acquire)
+}
+
+/// The two checks every allocation path runs.
+///
+/// Separated out so that the message names which rule was broken; "the
+/// allocator panicked" is much less useful than "something allocated
+/// from an interrupt handler".
+fn check_allocation_allowed() {
+    assert!(
+        !in_interrupt(),
+        "frame allocation from inside an interrupt handler. Handlers must \
+         not allocate: there is no sensible behaviour when memory runs out \
+         in an interrupt, and the allocator is not reentrant. See ADR 022."
+    );
+    assert!(
+        !RETIRED.load(Ordering::Acquire),
+        "frame allocation after the allocator was retired. From the end of \
+         boot, memory comes only from retyping an Untyped, so that every \
+         allocation is charged to a budget. See ADR 022."
+    );
+}
 
 /// Run `f` with exclusive access to the allocator.
 ///
@@ -471,6 +557,12 @@ pub unsafe fn init(entries: &[&memmap::Entry]) {
 /// memory is an ordinary condition that a caller may be able to handle, not
 /// a kernel bug. Nothing in a kernel path may assume allocation succeeds.
 pub fn allocate() -> Option<PhysFrame> {
+    // Two rules, both from ADR 022: handlers do not allocate, and the
+    // allocator is retired once the capability system owns memory.
+    // Checked before anything else so the panic names the rule rather
+    // than the symptom.
+    check_allocation_allowed();
+
     // SAFETY: Not called from inside `with`; see the module-level note on
     // single-CPU, interrupts-disabled operation.
     unsafe {
@@ -536,6 +628,34 @@ unsafe fn find_free(allocator: &FrameAllocator, from: u64, to: u64) -> Option<u6
     }
 
     None
+}
+/// Claim one specific frame, if it is free.
+///
+/// Returns whether the frame was taken. The ordinary `allocate()` picks
+/// a frame for the caller; this one is for boot code that must claim a
+/// *particular* physical address -- building the root Untypeds needs
+/// aligned, contiguous blocks, which "give me any frame" cannot express.
+///
+/// Boot-time only, like every other allocation path here (ADR 022).
+pub fn allocate_specific(frame: PhysFrame) -> bool {
+    check_allocation_allowed();
+
+    // SAFETY: Not called from inside `with`.
+    unsafe {
+        with(|allocator| {
+            if frame.0 >= allocator.frame_count {
+                return false;
+            }
+            // The bitmap covers frame_count bits, and the index is in
+            // range; the enclosing unsafe block carries the argument.
+            if allocator.is_used(frame.0) {
+                return false;
+            }
+            let changed = allocator.mark_used(frame.0);
+            debug_assert!(changed, "mark_used disagreed with is_used");
+            true
+        })
+    }
 }
 
 /// Return a frame to the allocator.

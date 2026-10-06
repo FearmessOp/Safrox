@@ -3,12 +3,16 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M4 — Kernel heap.** `Box`, `Vec`, `BTreeMap` and
-`String` work. The allocator is size-classed free lists over a 64 MiB
-region that grows on demand and has unmapped guard pages at both ends. Both
-`alloc` and `dealloc` are O(1) with no searching — not "usually fast",
-bounded — because M9 will allocate on the IPC path and a kernel path may
-not contain an unbounded loop.
+**Current milestone: M5 — Capabilities.** Every kernel resource is now an
+object named by a capability in a CNode slot. Untyped memory, `retype`,
+`copy`, `delete` and `revoke` all work; a CPtr resolves in a bounded
+number of steps with no loop; and at the end of boot the frame allocator
+is **retired**, so the only way to obtain memory is to retype an Untyped.
+
+The design is seL4's, with three departures named in the ADRs: one
+PageTable type instead of four ([017](docs/adr/017-nesne-kumesi.md)),
+no guards and exactly two levels ([018](docs/adr/018-cptr-ve-cspace.md)),
+and a bounded derivation depth ([019](docs/adr/019-derivation-tree.md)).
 
 ## Quick start
 
@@ -61,7 +65,11 @@ cloned into `third_party/` automatically.
 | `make run-heaptest` | Kernel heap suite; **must** exit 33 |
 | `make run-heapoom` | The heap runs out and says so; **must** exit 35 |
 | `make run-heapguard` | Write above the heap's limit → #PF; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all fifteen scenarios, runner self-test |
+| `make run-captest` | Capability suite; **must** exit 33 |
+| `make run-caprevoke` | Times a revoke over the widest, deepest tree; **must** exit 33 |
+| `make run-capintalloc` | Allocating from an interrupt is refused; **must** exit 35 |
+| `make run-capretired` | Allocating after retirement is refused; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all nineteen scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -69,9 +77,9 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M4 acceptance criteria
+## M5 acceptance criteria
 
-Fifteen scenarios, all booting the **same** `kernel.elf` through different
+Nineteen scenarios, all booting the **same** `kernel.elf` through different
 Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
@@ -403,6 +411,129 @@ A write to the first byte above the heap's maximum extent:
 
 There is a guard below the heap too, at `0xffffc00000000000`, for pointer
 underflow. Neither is ever mapped, so the protection does not depend on
+
+### Capability system — `make run-captest`, exit 33
+
+Fifteen checks. The object sizes and the alignment rule retype depends
+on; the rights lattice, all 256 pairs against an independent definition;
+retype across three size classes, and the demonstration that a retype
+which cannot fit changes *nothing*; copy narrowing rights, and both ways
+of trying to widen them; every distinct way a CPtr can fail; the depth
+cap; device Untyped; and the difference between `delete` and `revoke`.
+
+```
+[captest] rights algebra: all 256 pairs checked against an independent
+          definition; 81 subsets as predicted by 3^4
+[captest] retype: CNode(16) + Endpoint + Frame; watermark 16 -> 8192
+          (+8176 B for 4640 B of objects); the new CNode's 16 slots are all zero
+[captest] atomicity: 256 frames (1048576 B) refused by a 65520 B Untyped;
+          watermark still 16, all 248 destination slots still empty
+[captest] revoke: 8 descendants deleted in 8 visits; Untyped survives,
+          watermark 262176 -> 16, a new object reused 0x4400020
+          (was 0x4440020), old pointers return errors
+```
+
+Two of these deserve a note.
+
+**Atomicity** is checked by carving a deliberately small child Untyped —
+64 KiB — and asking it for 256 Frames. The scratch Untyped is 4 MiB and
+would have *succeeded*, which would have made the test vacuous. Both
+halves of the proof are required: the watermark unmoved and the
+destination slots empty. A retype that validated as it went would leave
+the first few slots filled and the watermark partly advanced, and either
+check alone could pass by luck.
+
+**Revoke returning memory** is observed, not inferred. The watermark
+dropping back could be a lie told by a counter; so the test records where
+the objects were, revokes, retypes again, and requires the new object to
+land at or below the old address.
+
+#### The CPtr invariant
+
+> A CPtr resolves to the same slot every time, or it returns an error.
+> It never resolves to a different slot.
+
+```
+[captest] cptr invariant: slot 0 was Endpoint gen 2, is now Notification
+          gen 3; the old pointer gives StaleCPtr and never the new object;
+          a wrong root generation is caught too
+```
+
+This check exists because the first draft of ADR 018 broke it, and the
+break is worth recording. The design had no generation counter and no
+rule about what a root slot may hold. If root slot 5 held an Endpoint
+then `CPtr = 5<<16` named it; if that slot was later refilled with a
+CNode, the *same* CPtr silently resolved to that CNode's slot 0 — a
+different object, no error, no warning.
+
+That is precisely the ambiguity the ADR had criticised seL4's guard
+field for, arrived at from the other direction. Two mechanisms now
+prevent it: a root slot may hold **only** a CNode, so the index fields
+never change meaning; and every slot counts how often it has been
+emptied, with both generations carried in the pointer and checked.
+
+The test deliberately refills the slot with a *different type* at a
+*different address*, and asserts the addresses differ — otherwise it
+could not tell "resolved to the old object" from "resolved to the new
+one" and would prove nothing.
+
+### Revoke cost — `make run-caprevoke`, exit 33
+
+Not pass/fail: a measurement, and an uncomfortable one.
+
+```
+[captest] tree: 256 capabilities from one Untyped, deepest level 8,
+          18 chain restarts
+[captest] revoke timing: 256 capabilities in 620592 TSC cycles
+          (2424 cycles each, 256 slots visited)
+[captest] extrapolated: 8400000 slots would be ~20361600000 cycles,
+          ~6787 ms at 3 GHz -- extrapolated from 256 samples under
+          emulation, not a measurement of the worst case
+```
+
+ADR 019 estimated the worst case at **56 ms** and nothing had ever
+checked it. The extrapolation says **6787 ms** — 120 times larger.
+
+Part of that gap is emulation: QEMU's TCG interpreter is an order of
+magnitude slow and its `rdtsc` is a virtual counter. Part of it is that
+the estimate undercounted — "20 instructions" ignored the two neighbour
+updates in `unlink` and the generation bump in `clear`. And part of it
+goes the *other* way: 256 slots fit in L1, where eight million would
+miss cache on every step, so the real figure could be worse still.
+
+The honest conclusion is that the worst case is not known, and is
+certainly larger than 56 ms. ADR 019 now says so, and the decision it
+justified — revoke runs to completion with interrupts on but no thread
+switch — has moved from "acceptable" to "must be revisited in M10".
+
+### Allocation from an interrupt — `make run-capintalloc`, exit 35
+
+```
+[captest] interrupt depth is 1; calling allocate() (must panic)
+*** KERNEL PANIC ***
+[PANIC] frame allocation from inside an interrupt handler. Handlers must
+        not allocate: there is no sensible behaviour when memory runs out
+        in an interrupt, and the allocator is not reentrant. See ADR 022.
+```
+
+M2's soundness argument for the frame allocator had three legs: one CPU,
+interrupts disabled, one non-reentrant entry point. M6 enables interrupts
+and removes the second. ADR 022 chose to make "handlers do not allocate"
+an enforced rule rather than add a lock that would protect nothing on a
+single CPU — this is the tripwire that makes a violation loud at the
+moment it happens, instead of leaving a corrupted bitmap to be found
+later.
+
+### Allocation after retirement — `make run-capretired`, exit 35
+
+```
+[captest] allocator is retired; calling allocate() (must panic)
+*** KERNEL PANIC ***
+[PANIC] frame allocation after the allocator was retired. From the end of
+        boot, memory comes only from retyping an Untyped, so that every
+        allocation is charged to a budget. See ADR 022.
+```
+
 how far the heap has grown.
 
 
@@ -490,10 +621,16 @@ kernel/src/memory/layout.rs       Address-space constants, canonicality, stack s
 kernel/src/memory/paging.rs       Entry/PageTable/PageFlags, map/unmap/translate, TlbFlush
 kernel/src/memory/vm.rs           Builds PMAP + W^X image + stacks, switches CR3 and RSP
 kernel/src/memory/bootinfo.rs     Copies Limine's responses out, then reclaims its memory
-kernel/src/memory/heap.rs         Size-classed free lists, #[global_allocator], grows on demand
+kernel/src/memory/heap.rs         Size-classed free lists, #[global_allocator], fixed reserve
+kernel/src/cap/mod.rs       CapType, Rights, CapError, object sizes, compile-time ceilings
+kernel/src/cap/cnode.rs     Slot (32 B), the derivation list, copy/mint/delete/revoke
+kernel/src/cap/cptr.rs      CPtr resolution: two levels, two generations, no loop
+kernel/src/cap/untyped.rs   retype: two phases, atomic, always zeroes
+kernel/src/cap/boot.rs      Root Untypeds, the init CSpace, allocator retirement
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
 kernel/src/vmtest.rs    Virtual memory acceptance tests and negative scenarios
 kernel/src/heaptest.rs  Kernel heap acceptance tests and negative scenarios
+kernel/src/captest.rs   Capability acceptance tests, the revoke measurement, two tripwires
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -585,7 +722,7 @@ ADR 016 da ölçümlerle güncellendi: yavaş yolun sıklığı tahmin edilenden
 yüksek çıktı ve parçalanma rakamları artık varsayım değil, kabul testinin
 raporladığı sayılar.
 
-M5 architect pass (karar alındı, kod M5'te):
+M5:
 
 - [017 — Nesne kümesi: sekiz tip](docs/adr/017-nesne-kumesi.md)
 - [018 — CPtr formatı: iki seviye, guard yok](docs/adr/018-cptr-ve-cspace.md)
@@ -594,6 +731,12 @@ M5 architect pass (karar alındı, kod M5'te):
 - [021 — Haklar: dört bit, monoton daralma](docs/adr/021-capability-haklari.md)
 - [022 — Kernel'in ayrıcalıklı kaynakları](docs/adr/022-kernelin-ayricalikli-kaynaklari.md)
 - [023 — Testler optimize edilip silinemez](docs/adr/023-test-disiplini.md)
+
+Dördü uygulama sırasında güncellendi. 018, kabul edilmeden önce bir
+tasarım hatası yüzünden yeniden yazıldı (aşağıya bakın). 019'un en kötü
+durum tahmini ölçüldü ve **120 kat yanlış** çıktı. 022'ye heap rezervinin
+sıralaması ve sayfa tablolarının maliyeti eklendi; 017'ye ölçülen
+boyutlar yazıldı.
 
 ## The object model
 
@@ -632,15 +775,97 @@ hoped for, and it is written down in
 those 56 ms — interrupts are serviced, threads are not switched. To be
 re-examined in M10 against a measured workload.
 
-### Open questions
+### Open questions — answered
 
-Six decisions want review before M5's implementation begins, listed with
-options and a recommendation in
-[docs/m5-acik-sorular.md](docs/m5-acik-sorular.md). The two that would be
-most expensive to change later: whether to add a generation counter to
-CPtrs now (one comparison per lookup, closes an ABA hole), and whether
-the IPC buffer lives inside the TCB or in a separate Frame (decides the
-maximum message size for M9).
+The six decisions listed in
+[docs/m5-acik-sorular.md](docs/m5-acik-sorular.md) were all settled
+before the implementation began:
+
+1. **Revoke cost.** Accept it and measure in M10. The measurement
+   arrived earlier than planned, and is worse than the estimate — see
+   `make run-caprevoke` above.
+2. **Generation counters in CPtrs.** Added. One comparison per level,
+   two levels, no loop. They turned out to be load-bearing rather than
+   belt-and-braces: without them ADR 018's "two levels" rule alone does
+   not give the invariant, because a leaf slot can still be reused.
+3. **Device memory.** A device Untyped, with the invariant that it may
+   only be retyped to a Frame, and that the Frame stays device-marked so
+   it can never be recycled into a kernel object.
+4. **Shared memory.** Not in M5. Written into ADR 020 as an explicit
+   precondition for M9, so the IPC design cannot quietly assume it.
+   M13 will have no filesystem and no network stack.
+5. **IPC buffer.** Inside the TCB. The TCB is 2048 bytes and IPC
+   messages are at most 1 KiB — a limit chosen here, visible in
+   ADR 017's table, rather than discovered in M9.
+6. **Syscall surface.** A single `invoke`.
+
+## What M5 cost: a design error, two regressions, and a wrong estimate
+
+### The design error, found before any code was written
+
+ADR 018's first draft let a CPtr resolve to a *different* slot. The
+mechanism is described under the CPtr invariant above. What is worth
+recording is the shape of the mistake: the ADR spent several paragraphs
+arguing that seL4's guard field makes a CPtr's meaning depend on the
+tree's shape, and then specified a scheme with exactly that property,
+reached from a different direction.
+
+The lesson generalises past this bug: **when a design is defended by
+pointing at a flaw in somebody else's, check whether the same flaw
+appears in your own in a different guise.** The criticism was correct
+and the design was still wrong.
+
+### Two regressions in M4's heap, both found by running it
+
+Neither was a coding error. Both were ADR 022's retirement rule meeting
+assumptions that predated it.
+
+**The heap had no budget.** ADR 022 retires the frame allocator at the
+end of boot, with the precondition that "every frame the kernel will
+ever need has already been taken". A heap that maps pages on demand can
+never satisfy that — there is always a frame it will need and has not
+taken. The first allocation after boot panicked.
+
+The fix is the budget the heap never had: a contiguous physical reserve,
+taken before the Untypeds and before the allocator retires. This is
+strictly better than what M4 had, because the heap's physical cost is
+now decided once and printed, rather than drifting upward as a side
+effect of allocation.
+
+Two details only appeared by running it. The reserve must be taken
+before `heap::init`, not after, because init maps the first page — a
+tripwire caught that on the first boot. And the reserve must pay for the
+**page tables** as well as the pages: sized at exactly `KHEAP_MAX_SIZE`,
+the heap ran out 34 frames short of its own 64 MiB limit, which is
+precisely what the tables cost. *A budget that covers the data but not
+the structure needed to reach it is not a budget.*
+
+**`memtest` and `vmtest` needed a live allocator.** They run after boot,
+and boot now hands every frame to the capability system. The fix was not
+to weaken the tests but to make the allocator's lifetime visible in
+`kmain`: scenarios that allocate directly run *before* `cap::boot::init`,
+scenarios that do not run after.
+
+`memtest::run()` also had to start diverging. Its last phase drains the
+allocator deliberately — harmless while it was the last thing to run,
+and not harmless once `cap::boot::init` followed it.
+
+One check was tempting to loosen and was not. `memtest` bounds the frames
+held by boot structures at 64, and the 16384-frame heap reserve blew
+straight through it. Raising the bound to 17000 would have hidden a real
+500-frame leak behind the reserve's bulk; subtracting the reserve by name
+leaves the original check exactly as sharp as it was.
+
+### The estimate that was 120 times wrong
+
+ADR 019's worst-case revoke figure — 56 ms — was computed during the
+architect pass and never checked against anything. Measured, it is at
+least 6787 ms, and the real number on hardware is unknown.
+
+The ADR's old summary line read "the number was computed, accepted, and
+written down". That was true and insufficient; what was missing was "and
+never verified". From M6 on, every estimate of this kind gets a scenario
+that measures it.
 
 ## What M4 cost: three defects, two of them in the tests
 

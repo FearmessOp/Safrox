@@ -127,3 +127,40 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: heap-guard
+
+/PythOS (capability system tests)
+    comment: Object sizes against ADR 017's ceilings, the rights lattice
+    comment: exhaustively, retype and its atomicity, copy and the refusal
+    comment: to widen rights, every CPtr failure mode, the CPtr invariant
+    comment: the first draft of ADR 018 broke, the depth cap, device
+    comment: Untyped, and delete against revoke. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: cap-test
+
+/PythOS (revoke cost measurement)
+    comment: Build the widest, deepest derivation tree the init CSpace can
+    comment: hold and time a revoke over it. Not pass/fail: ADR 019 put the
+    comment: worst case at ~56 ms and never checked it, so this reports a
+    comment: per-capability cost to write back into the ADR. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: cap-revoke-depth
+
+/PythOS (allocation from an interrupt)
+    comment: Allocate a frame from interrupt context. ADR 022 made "handlers
+    comment: do not allocate" an enforced rule rather than a lock that would
+    comment: protect nothing on one CPU; this is the tripwire firing. M6
+    comment: enables interrupts and will need it. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: cap-interrupt-alloc
+
+/PythOS (allocation after retirement)
+    comment: Call the frame allocator after boot retired it. From the end of
+    comment: boot memory comes only from retyping an Untyped, so a direct
+    comment: allocation is a path that was meant to be capability-mediated
+    comment: and is not. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: cap-retired-allocator

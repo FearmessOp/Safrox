@@ -232,6 +232,40 @@ fn heap_frame_source() -> Option<PhysFrame>
 bir `FrameSource` bağlanacak ve heap, kendi bütçesini bir capability'den
 alan sıradan bir tüketici olacak.
 
+### M5'te ne oldu: bütçe evet, capability hayır
+
+Yukarıdaki paragrafın yarısı gerçekleşti. Heap artık boot'ta ayrılan
+**sabit bir fiziksel rezervden** besleniyor ve `heap_frame_source` o
+rezerv üzerinde bir bump pointer. Yani bütçe var — ama bir
+capability'den gelmiyor.
+
+Neden gelmediği [ADR 022](022-kernelin-ayricalikli-kaynaklari.md) Bölüm
+B'de: heap'i bir Untyped'a bağlamak döngüsel bir bağımlılık kuruyor
+(heap büyürken retype, retype için slot, slot için CNode) ve "kimin
+hesabına" sorusuna iyi bir cevap yok. Rezerv, istisnayı *gizlemek*
+yerine sınırlı ve ölçülebilir kılıyor.
+
+Değişimin zorunlu olduğu nokta M4'te görünmüyordu: ADR 022 boot'un
+sonunda çerçeve ayırıcısını **emekli ediyor**, ve talep üzerine büyüyen
+bir heap bunun ön koşulunu ("kernel'in ihtiyaç duyacağı her çerçeve
+alınmış olmalı") hiçbir zaman sağlayamaz. Bu, M5'in ilk koşuşunda
+`run-heaptest`'in bulduğu şeydi.
+
+İki ayrıntı kayda değer:
+
+- **Ara tablolar da rezervden geliyor.** `paging::map`'e verilen
+  `FrameSource` artık `GlobalFrames` değil, aynı rezervi kullanan
+  `ReserveFrames`. Veriyi ödeyip ona erişmek için gereken yapıyı
+  ödemeyen bir bütçe, bütçe değil.
+- **Rezerv `KHEAP_MAX_SIZE`'dan büyük.** Tam olarak 64 çerçeve büyük:
+  32 PT + 1 PD + 1 PDPT, boşluk payıyla. Rezervi tam sınıra eşitlemek,
+  heap'in kendi ilan ettiği 64 MiB'e 34 çerçeve kala tükenmesine yol
+  açıyordu.
+
+Heap'in gerçekten bir capability tüketicisi olması hâlâ hedef; ne zaman
+olacağı ADR 022'nin "azaltılabilir" maddesine bağlı — kernel'in heap
+kullanımı sıfıra yaklaştıkça soru kendiliğinden kapanıyor.
+
 ## Elenen alternatifler
 
 **Hazır bir crate (`linked_list_allocator`, `buddy_system_allocator`).**

@@ -356,9 +356,11 @@ fn check_stress() -> usize {
     baseline
 }
 
-/// 4. The heap grows when asked for more than it has mapped.
+/// 4. The heap grows when asked for more than it has mapped, and the
+///    growth really costs physical memory.
 fn check_growth() {
     let before = heap::stats();
+    let reserve_before = heap::reserve_remaining();
 
     // Ask for more than is currently mapped, in one allocation. The heap
     // must map new pages rather than failing.
@@ -383,6 +385,8 @@ fn check_growth() {
     }
 
     let after = heap::stats();
+    let reserve_after = heap::reserve_remaining();
+
     assert!(
         after.mapped_pages > before.mapped_pages,
         "the heap did not grow: {} pages before and after a {} byte \
@@ -391,10 +395,36 @@ fn check_growth() {
         wanted
     );
 
+    // Each new page must have cost exactly one frame out of the reserve.
+    //
+    // Counting pages alone would not show this. From M5 the heap draws
+    // from a fixed physical budget taken before the frame allocator
+    // retired (ADR 022), and a bookkeeping error there -- mapping a page
+    // without charging for it, or charging twice -- would leave the page
+    // count looking perfectly healthy while the budget drained at the
+    // wrong rate.
+    let pages_gained = after.mapped_pages - before.mapped_pages;
+    let reserve_spent = reserve_before - reserve_after;
+    assert_eq!(
+        reserve_spent,
+        pages_gained * 4096,
+        "the heap mapped {} new pages but took {} bytes from its reserve; \
+         those should be the same memory",
+        pages_gained,
+        reserve_spent
+    );
+
     println!(
         "[heaptest] growth: {} bytes requested, heap grew from {} to {} \
-         pages, both ends writable",
-        wanted, before.mapped_pages, after.mapped_pages
+         pages, both ends writable; reserve {} MiB -> {} MiB ({} KiB spent \
+         for {} pages)",
+        wanted,
+        before.mapped_pages,
+        after.mapped_pages,
+        reserve_before / (1024 * 1024),
+        reserve_after / (1024 * 1024),
+        reserve_spent / 1024,
+        pages_gained
     );
 
     // SAFETY: From `alloc` with this layout, not yet freed.
@@ -452,6 +482,57 @@ fn check_returned_to_baseline(baseline: usize) {
     println!(
         "[heaptest] calls: {} alloc, {} dealloc, {} grow",
         stats.alloc_calls, stats.dealloc_calls, stats.grow_calls
+    );
+
+    // What the whole run cost in physical memory.
+    //
+    // The reserve pays for two things: the heap's own pages, and the page
+    // tables that address them. The first draft of this check asserted
+    // the two figures were equal and failed -- 12611584 bytes spent
+    // against 3071 pages (12578816 bytes), a gap of exactly eight frames.
+    // Those eight are the intermediate tables, and the assertion was
+    // simply wrong about what the reserve is for.
+    //
+    // So the check is the real relationship instead: the tables are a
+    // small, bounded overhead on top of the pages. One PT covers 512
+    // pages and one PD covers 512 PTs, so for a heap of this size the
+    // tables cannot be more than a few per cent -- and if they were, it
+    // would mean `map` had started allocating per-page.
+    let spent = heap::reserve_size() - heap::reserve_remaining();
+    let page_bytes = stats.mapped_pages * 4096;
+    let table_bytes = spent - page_bytes;
+    let table_frames = table_bytes / 4096;
+
+    assert!(
+        spent >= page_bytes,
+        "the heap has {} pages mapped but has spent only {} bytes of its \
+         reserve; a page was mapped without being charged for",
+        stats.mapped_pages,
+        spent
+    );
+
+    // Three levels at most, and each table serves 512 entries. Allow a
+    // generous ceiling, but one that a per-page allocation would blow
+    // straight through.
+    let table_ceiling = stats.mapped_pages / 100 + 16;
+    assert!(
+        table_frames <= table_ceiling,
+        "{} frames went on page tables for {} heap pages, above the \
+         ceiling of {}; something is allocating a table per page rather \
+         than per 512",
+        table_frames,
+        stats.mapped_pages,
+        table_ceiling
+    );
+
+    println!(
+        "[heaptest] reserve: {} KiB of {} MiB spent -- {} KiB of heap pages \
+         plus {} frames of page tables; the heap never returns a page \
+         (ADR 016)",
+        spent / 1024,
+        heap::reserve_size() / (1024 * 1024),
+        page_bytes / 1024,
+        table_frames
     );
 }
 

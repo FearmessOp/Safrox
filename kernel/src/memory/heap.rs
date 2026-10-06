@@ -29,8 +29,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::layout;
-use super::paging::{self, PageFlags};
-use super::vm::{self, GlobalFrames};
+use super::paging::{self, FrameSource, PageFlags};
+use super::vm;
 use super::{PhysFrame, VirtAddr, FRAME_SIZE};
 use crate::println;
 
@@ -186,20 +186,167 @@ unsafe fn with<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
 
 // ---- Growing -----------------------------------------------------------
 
+// ---- The heap's physical reserve ---------------------------------------
+//
+// M4 let the heap call `frame_allocator::allocate()` whenever it needed a
+// page, and ADR 016 recorded that as a conscious relaxation of "the kernel
+// does not allocate on its own behalf" -- the heap had no budget because
+// budgets are a capability concept and capabilities were still in M5.
+//
+// M5 arrived and broke it. ADR 022 retires the frame allocator once the
+// root Untypeds exist, and its precondition is that "every frame the
+// kernel will ever need has already been taken". The heap cannot satisfy
+// that: it takes frames *lazily*, so there is always a frame it will need
+// and has not taken. The first allocation after boot panicked with the
+// retirement message, and `run-heaptest` caught it.
+//
+// The fix is the budget the heap never had. Boot sets aside a contiguous
+// physical reserve before retiring the allocator, and the heap bump-
+// allocates frames out of it. Three things follow, all improvements on
+// what M4 had:
+//
+//   * The heap's physical cost is decided once, at boot, and printed --
+//     rather than drifting upwards as a side effect of allocation.
+//   * Exhausting the reserve is a distinct, named failure.
+//   * The frame allocator really can retire, because nothing allocates
+//     from it afterwards.
+//
+// The reserve is `KHEAP_MAX_SIZE`, which makes the 64 MiB limit real
+// rather than notional: previously the heap could be stopped short of its
+// own limit by a machine that ran out of RAM first, and the two failures
+// were hard to tell apart.
+
+/// The heap's physical reserve.
+///
+/// One struct rather than three statics: the three fields are only ever
+/// meaningful together, and a bump allocator whose base and length could
+/// drift apart would be a strange thing to have written.
+struct Reserve {
+    /// Base of the reserve, or zero before boot sets it.
+    base: u64,
+    /// Bytes in the reserve.
+    size: u64,
+    /// Bytes already handed out.
+    used: u64,
+}
+
+/// `static`-compatible storage, with no synchronisation of its own.
+struct ReserveCell(core::cell::UnsafeCell<Reserve>);
+
+// SAFETY: Written once by boot before the heap is initialised, and
+// afterwards touched only from inside `with`, which is non-reentrant and
+// runs on one CPU with interrupts disabled -- the same argument as the
+// heap itself.
+unsafe impl Sync for ReserveCell {}
+
+static RESERVE: ReserveCell = ReserveCell(core::cell::UnsafeCell::new(Reserve {
+    base: 0,
+    size: 0,
+    used: 0,
+}));
+
+/// Hand the heap its physical reserve.
+///
+/// Called once by `cap::boot`, after the heap is up and before the frame
+/// allocator retires.
+///
+/// # Safety
+///
+/// `base` must name `size` bytes of contiguous physical memory that the
+/// caller has claimed from the frame allocator and will not hand to
+/// anybody else. Both must be frame-aligned.
+pub unsafe fn set_reserve(base: super::PhysAddr, size: u64) {
+    assert!(
+        base.0.is_multiple_of(FRAME_SIZE) && size.is_multiple_of(FRAME_SIZE),
+        "the heap reserve must be frame-aligned: {} bytes at {}",
+        size,
+        base
+    );
+
+    // SAFETY: Single-threaded boot path, called once before heap::init,
+    // so nothing else can hold a reference to the reserve.
+    unsafe {
+        let reserve = &mut *RESERVE.0.get();
+        assert_eq!(
+            reserve.used, 0,
+            "the heap reserve is being replaced after the heap has already \
+             drawn {} bytes from it",
+            reserve.used
+        );
+        reserve.base = base.0;
+        reserve.size = size;
+    }
+
+    println!(
+        "[heap] reserve: {} MiB of contiguous physical memory at {}, taken \
+         before the frame allocator retired (ADR 022)",
+        size / (1024 * 1024),
+        base
+    );
+}
+
+/// Bytes of the reserve still unused, for the acceptance test.
+pub fn reserve_remaining() -> u64 {
+    // SAFETY: Not called from inside `heap_frame_source`; single CPU,
+    // interrupts disabled.
+    unsafe {
+        let reserve = &*RESERVE.0.get();
+        reserve.size - reserve.used
+    }
+}
+
+/// Total size of the reserve.
+pub fn reserve_size() -> u64 {
+    // SAFETY: As above.
+    unsafe { (*RESERVE.0.get()).size }
+}
+
+/// A [`FrameSource`] that draws from the heap's reserve.
+///
+/// `paging::map` allocates the intermediate page tables through whatever
+/// source it is handed. M4 passed `GlobalFrames`, which goes to the
+/// bitmap allocator -- and that is retired by the time the heap grows
+/// (ADR 022), so the first growth after boot panicked.
+///
+/// The leaf page and the tables that address it come from the same
+/// reserve. They have to: a budget that covers the data but not the
+/// structure needed to reach it is not a budget. The cost is ~0.2% --
+/// one table per 512 pages, three levels deep -- and the reserve is
+/// sized in whole pages anyway.
+struct ReserveFrames;
+
+impl FrameSource for ReserveFrames {
+    fn alloc_frame(&mut self) -> Option<PhysFrame> {
+        heap_frame_source()
+    }
+}
+
 /// The single point where the heap takes physical memory.
 ///
-/// **M5 REPLACES THIS.** When Untyped capabilities exist, the heap will be
-/// handed a `FrameSource` at init and this becomes
-/// `self.source.alloc_frame()`. The signature is deliberately the one
-/// `FrameSource::alloc_frame` uses, so the change stays local to this
-/// function.
-///
-/// Until then the heap draws from the global bitmap allocator, which is a
-/// conscious relaxation of "the kernel does not allocate on its own
-/// behalf": the heap has no budget of its own yet because budgets are a
-/// capability concept and capabilities arrive in M5. ADR 016 records this.
+/// A bump pointer over the reserve. No search and no free: the heap
+/// never returns a page once mapped, which is the behaviour M4 had, now
+/// with a stated bound instead of an open claim on the machine.
 fn heap_frame_source() -> Option<PhysFrame> {
-    super::frame_allocator::allocate()
+    // SAFETY: Reached only from `grow`, which runs inside `with`; one
+    // CPU, interrupts disabled, no other reference live.
+    unsafe {
+        let reserve = &mut *RESERVE.0.get();
+
+        assert!(
+            reserve.base != 0,
+            "the heap tried to grow before boot gave it a physical reserve; \
+             cap::boot::reserve_heap_budget must run before heap::init \
+             (ADR 022)"
+        );
+
+        if reserve.used + FRAME_SIZE > reserve.size {
+            return None;
+        }
+
+        let frame = PhysFrame((reserve.base + reserve.used) / FRAME_SIZE);
+        reserve.used += FRAME_SIZE;
+        Some(frame)
+    }
 }
 
 /// Why the heap could not grow.
@@ -207,7 +354,7 @@ fn heap_frame_source() -> Option<PhysFrame> {
 enum GrowError {
     /// The 64 MiB limit would be exceeded.
     AtLimit { requested: u64, limit: u64 },
-    /// The frame allocator is empty.
+    /// The physical reserve is used up.
     OutOfFrames { mapped_pages: u64 },
     /// `paging::map` refused. Should not happen -- the address range is
     /// ours and unmapped -- so the error is carried rather than swallowed.
@@ -234,7 +381,7 @@ unsafe fn grow(heap: &mut Heap, needed_end: u64) -> Result<u64, GrowError> {
     // SAFETY: Single-threaded boot path; no other borrow of the PML4 is
     // live. The heap's address range belongs to this module alone.
     let table = unsafe { vm::kernel_table() };
-    let mut source = GlobalFrames;
+    let mut source = ReserveFrames;
 
     while heap.mapped_end < target {
         let frame = heap_frame_source().ok_or(GrowError::OutOfFrames {
@@ -445,13 +592,17 @@ fn allocate_in(heap: &mut Heap, layout: Layout) -> *mut u8 {
             }
             Err(GrowError::OutOfFrames { mapped_pages }) => {
                 panic!(
-                    "out of physical memory while growing the heap for a {} \
-                     byte allocation (align {}, class {}); {} pages were \
-                     mapped and {} bytes are live",
+                    "the heap's physical reserve is exhausted while growing \
+                     for a {} byte allocation (align {}, class {}); {} pages \
+                     were mapped out of a {} KiB reserve and {} bytes are \
+                     live. The reserve is fixed at boot (ADR 022), so this \
+                     means the heap needs a larger one, not that the machine \
+                     is out of memory.",
                     layout.size(),
                     layout.align(),
                     class_size(index),
                     mapped_pages,
+                    reserve_size() / 1024,
                     heap.used_requested
                 );
             }

@@ -111,6 +111,49 @@ Pratikte çok daha küçük: M13'ün init sistemi birkaç yüz cap tutacak,
 yani revoke mikrosaniyeler sürecek. Ama *en kötü durum* budur ve bir
 bileşen onu kasten üretebilir.
 
+### Ölçüm (M5 uygulaması): tahmin 120 kat iyimserdi
+
+Yukarıdaki tablo mimari geçişte hesaplandı ve hiçbir şeye karşı
+doğrulanmadı. `cap-revoke-depth` senaryosu artık onu ölçüyor: init
+CSpace'in tutabildiği en geniş ve en derin ağacı kurar (256 cap, 8
+seviye), revoke eder, TSC ile sayar.
+
+| | Tahmin | Ölçüm |
+|---|---|---|
+| Cap başına maliyet | ~20 komut | **2424 TSC çevrimi** |
+| 8.4M slot için | ~168M komut | ~20.4 milyar çevrim |
+| 3 GHz'de | **~56 ms** | **~6787 ms** |
+
+**Yüz yirmi kat.** Bu farkın tamamı tasarım hatası değil; ayırmak
+gerekiyor:
+
+- **Emülasyon.** Ölçüm QEMU'nun TCG yorumlayıcısında yapıldı ve TCG
+  tipik olarak 10–50 kat yavaştır. Üstelik QEMU'da `rdtsc` gerçek bir
+  saat değil, sanal bir sayaçtır.
+- **Önbellek.** 256 slotluk bir ağaç 8 KiB'dir ve L1'e sığar. 8.4
+  milyon slot 268 MiB'dir; her adım bir önbellek ıskası olur. Yani
+  gerçek en kötü durumun cap başına maliyeti ölçülenden **daha
+  yüksek** olabilir, düşük değil.
+- **Tahminin kendisi.** "20 komut" sayısı okuma, silme ve ilerlemeyi
+  sayıyordu; `unlink`'in iki komşuyu güncellemesini, `clear`'ın nesil
+  sayacını ve sınır kontrollerini saymıyordu. Gerçek sayı muhtemelen
+  40–60 civarı.
+
+Dürüst sonuç: **en kötü durum 56 ms değil.** Gerçek donanımda
+ölçülmeden tek sayı söylemek doğru olmaz, ama 56 ms'in bir alt sınır
+olduğu ve gerçeğin en az birkaç yüz milisaniye olacağı açık.
+
+Bu, yukarıdaki (c) seçimini — "kesilebilir ama bölünemez" — zayıflatıyor
+değil, **daha pahalı hale getiriyor.** 56 ms boyunca thread çalışmaması
+kabul edilebilir görünüyordu; yarım saniye görünmüyor. M10'da bu karar
+yeniden ele alınacaktı; artık yeniden ele alınması **gerekiyor.**
+
+Dersi ayrıca kaydetmeye değer: *mimari geçişte hesaplanan bir sayı, bir
+ölçüm değildir.* ADR'nin "Sayı hesaplandı, kabul edildi, yazıldı"
+cümlesi doğruydu ama yeterli değildi; eksik olan "ve doğrulanmadı"
+idi. M6'dan itibaren bu tür her tahminin yanına onu ölçen bir senaryo
+konacak.
+
 ## "Sınırsız döngü yok" kuralıyla ne yapıyoruz
 
 Kural şu: *kernel yolunda sınırsız döngü yok.* Revoke'un döngüsü
@@ -208,12 +251,15 @@ bitene kadar dışarıda kalır. Revoke'un anlamını kaybeder.
 - Torun testi `depth` alanıyla; derinlik **en fazla 8**, 3 bite sığıyor.
 - Revoke = listede ileri tara, `depth > root.depth` olduğu sürece sil.
   Ağaç yürüyüşü yok.
-- **En kötü durum 56 ms** (256 MiB makine, 8.4M slot, 3 GHz). Sayı
-  hesaplandı, kabul edildi, yazıldı.
+- **En kötü durum tahmini 56 ms idi; ölçüm bunu 120 kat aştı**
+  (`cap-revoke-depth`: cap başına 2424 TSC çevrimi, emülasyon altında).
+  Farkın bir kısmı TCG, bir kısmı tahminin eksik komut sayması. Gerçek
+  sayı bilinmiyor ama 56 ms'ten büyük.
 - Revoke **kesmelere açık, thread değişimine kapalı**: cihaz verisi
   kaybolmaz, derivation ağacı değişemez. Bedeli: o süre boyunca başka
   thread çalışmaz.
-- **M10'da yeniden ele alınacak**, ölçülmüş bir latency ile.
+- **M10'da yeniden ele alınması artık isteğe bağlı değil**: ölçüm,
+  "kabul edilebilir latency" varsayımını geçersiz kıldı.
 - Bölünebilir revoke'a geçiş için `revoking` biti ve 8 adımlık ata
   kontrolü tasarlandı, uygulanmadı.
 - **Açık:** nesil sayacı ile O(1) revoke, CPtr çözümlemesini

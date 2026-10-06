@@ -141,7 +141,22 @@ fiziksel belleğe iki cap demek değil, iki ayrı 4 KiB demek.
 
 Yani **M11'e kadar paylaşımlı bellek yok.** Açıkça kabul ediyorum.
 Gerçek paylaşım M11'de Frame'e bir eşleme listesi eklemeyi gerektirecek
-ve bu, Frame nesnesinin boyutunu değiştirecek. Açık sorular, soru 4.
+ve bu, Frame nesnesinin boyutunu değiştirecek.
+
+> **M9 için açık ön koşul.** IPC tasarımı, paylaşımlı belleğin
+> olmadığını **varsayarak** yazılacak. Büyük veri transferi için
+> "iki bileşen aynı Frame'i eşlesin" seçeneği yok; her transfer ya
+> kayıtlarda ya TCB'nin 1 KiB'lık IPC tamponunda
+> ([ADR 017](017-nesne-kumesi.md)) taşınacak, ya da veri bir Frame
+> cap'inin **devredilmesiyle** (kopyalanmasıyla değil) geçecek.
+>
+> Bu, M13'ün hedefiyle tutarlı: init sistemi dosya sistemi ya da ağ
+> yığını içermeyecek — birkaç küçük servis ve bir seri sürücü. 1 KiB
+> mesaj yeterli.
+>
+> M9'u yazarken bu kısıt bir yere sıkıştırırsa, çözüm IPC'yi
+> karmaşıklaştırmak değil, Frame'e eşleme listesi eklemeyi M11'den
+> M9'a çekmek olmalı.
 
 ## 4. Bilgi sızıntısı: sıfırlama ne zaman
 
@@ -174,16 +189,18 @@ var.
 ## Hata durumları
 
 ```
-InvalidUntyped          cap Untyped değil
-InvalidObjectType       bilinmeyen tip
-InvalidSize             size_bits bu tip için geçersiz
-                        (sabit boyutlu tipler için size_bits=0 olmalı)
-NotEnoughMemory         count nesne untyped'ın kalanına sığmıyor
-                        (kalan bayt sayısı hata ile birlikte döner)
-SlotsNotEmpty           hedef slot'lardan biri dolu
-SlotsOutOfRange         dest_offset + count, CNode'un dışına taşıyor
-DerivationTooDeep       sonuç derinlik > 8 (ADR 019)
-TooManyObjects          count > 256
+InvalidUntyped            cap Untyped değil
+InvalidObjectType         bilinmeyen tip
+InvalidSize               size_bits bu tip için geçersiz
+                          (sabit boyutlu tipler için size_bits=0 olmalı)
+NotEnoughMemory           count nesne untyped'ın kalanına sığmıyor
+                          (kalan bayt sayısı hata ile birlikte döner)
+SlotsNotEmpty             hedef slot'lardan biri dolu
+SlotsOutOfRange           dest_offset + count, CNode'un dışına taşıyor
+DerivationTooDeep         sonuç derinlik > 8 (ADR 019)
+TooManyObjects            count > 256
+DeviceUntypedFrameOnly    device Untyped'dan Frame olmayan bir tip
+                          isteniyor (ADR 017)
 ```
 
 Hepsi faz 1'de yakalanıyor, yani hata dönen bir retype hiçbir şeye
@@ -228,5 +245,9 @@ bellek kullanabilirsin" diyebilmeli. İkisi de var.
 - Revoke, nesneleri tipine göre söküyor; Frame'in eşlemesi en zor
   kısım.
 - **M11'e kadar bir Frame en fazla bir yere eşlenebilir — yani
-  paylaşımlı bellek yok.** Açıkça kabul edildi. Soru 4.
+  paylaşımlı bellek yok.** M9'un IPC tasarımı için açık bir ön koşul
+  olarak yukarıda yazılı.
+- **Device Untyped yalnızca Frame'e retype edilebilir**
+  ([ADR 017](017-nesne-kumesi.md)). Faz 1'de denetleniyor,
+  `DeviceUntypedFrameOnly`.
 - Dokuz hata türü, hepsi faz 1'de.

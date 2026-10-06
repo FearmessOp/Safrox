@@ -133,6 +133,60 @@ bileşeni kernel'i heap tüketerek çökertebiliyorsa, bu zaten bir DoS
 açığı — Untyped'a bağlamak onu *gizler*, çözmez. Çözüm, kernel'in heap
 kullanımını sınırlı tutmak.
 
+### Uygulamada öğrenilenler (M5)
+
+Bu bölüm mimari geçişte yazıldı ve kararın özü doğru çıktı. Uygulama
+iki şeyi ekledi, ikisi de çalıştırılarak bulundu.
+
+**1. Sıralama: rezerv `heap::init`'ten önce verilmeli.**
+
+Rezervin "boot sırasında, kök Untyped'lardan önce" ayrılacağı yazılıydı.
+Eksik olan, `heap::init`'in de ilk sayfasını haritaladığı — yani heap'in
+rezervi init anında zaten kullandığı. İlk uygulama rezervi
+`cap::boot::init` içinde ayırdı, heap'ten *sonra*, ve kernel şununla
+durdu:
+
+```
+[PANIC] the heap tried to grow before boot gave it a physical reserve
+```
+
+Doğru sıra üç adım ve üçü de zorunlu:
+
+```
+vm::init + reclaim        -> allocator elindeki her şeye sahip
+reserve_heap_budget()     -> heap'in bütçesi ayrılır
+heap::init()              -> ilk sayfa, bütçeden
+cap::boot::init()         -> kalan her şey Untyped olur, allocator emekli
+```
+
+`heap_frame_source` içindeki tripwire ("rezerv verilmeden büyüme")
+bunu ilk koşuşta yakaladı. Tahmin edilmemiş bir sıralama hatasını
+yakalayan bir kontrol, yerini hak etmiş demektir.
+
+**2. Rezerv, sayfa tablolarını da ödemeli.**
+
+Bu kavramsal bir boşluktu. Rezerv başta tam olarak `KHEAP_MAX_SIZE`
+(64 MiB) kadar ayrıldı. Ama bir sayfayı haritalamak ara tablolar
+gerektirir ve `paging::map` onları da ayırıcıdan ister — emekli
+ayırıcıdan. İlk düzeltme tabloları da rezerve bağladı, ve bu sefer
+`heap-oom` şunu bildirdi:
+
+```
+16350 pages were mapped out of a 65536 KiB reserve
+```
+
+Heap kendi 64 MiB sınırına **34 çerçeve kala** tükendi. O 34 çerçeve
+tam olarak tabloların maliyetiydi: 32 PT + 1 PD + 1 PDPT.
+
+Ders, kuralın kendisinden daha genel: **bir bütçe, veriyi ödeyip ona
+erişmek için gereken yapıyı ödemiyorsa bütçe değildir.** Rezerv artık
+`KHEAP_MAX_SIZE + 64` çerçeve; fazlalık %0.4 ve heap'in ilan ettiği
+sınır gerçekten ulaşılabilir.
+
+Bunun bir sonucu da şu: heap'in sanal sınırı (`KHEAP_MAX_SIZE`) ile
+fiziksel rezervi artık iki ayrı sayı ve ikisi kasten farklı. `heaptest`
+ikisini birden basıyor.
+
 ### Dürüst kabul
 
 **Bu bir istisnadır ve modelin saflığını bozar.** Yazmaktan kaçınmıyorum:
@@ -146,9 +200,11 @@ kullanımını sınırlı tutmak.
 - **Sabit.** Rezerv boot'ta belirlenir ve büyümez. Bir user bileşeni
   onu tüketerek sistemi çökertemez, çünkü miktarı kendi davranışına
   bağlı değil.
-- **Ölçülen.** Boot çıktısı rezervin boyutunu ve kullanımını basacak.
+- **Ölçülen.** Boot çıktısı rezervin boyutunu basıyor, `heaptest` ise
+  bir koşuda ne kadarının harcandığını — sayfalar ve tablolar ayrı ayrı.
   M13'e gelindiğinde "kernel ne kadar heap kullanıyor" sorusunun sayısal
-  bir cevabı olacak.
+  bir cevabı olacak. M5'teki cevap: boot'ta 1 sayfa, `heaptest`'in
+  stresi altında 3071 sayfa + 8 tablo çerçevesi.
 - **Azaltılabilir.** Kernel'in heap kullanımı ne kadar azalırsa rezerv o
   kadar küçülür. İdeal son durum: heap hiç kullanılmıyor ve rezerv sıfır.
 

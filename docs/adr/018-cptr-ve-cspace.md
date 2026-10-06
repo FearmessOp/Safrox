@@ -1,186 +1,256 @@
-# ADR 018 — CPtr formatı: iki seviye, sabit derinlik, guard yok
+# ADR 018 — CPtr: iki seviye *zorunlu*, nesil sayaçlı
 
-Status: accepted (M5 architect pass)
+Status: accepted (M5 architect pass), **düzeltildi (M5 uygulama)**
 
-Kaynak: seL4 Reference Manual, bölüm 3 ("Capability Spaces"). Bu, seL4'ün
-en zor anlaşılan parçası ve ondan en çok ayrıldığımız yer.
+Kaynak: seL4 Reference Manual, bölüm 3 ("Capability Spaces").
+
+> **Düzeltme notu.** Bu ADR'nin ilk hâli, kaçınmak için yazıldığı hatayı
+> kendisi yapıyordu. Ayrıntı aşağıda, "Düzeltilen hata" başlığında. İlk
+> hâl hiç uygulanmadı; aşağıdaki tasarım M5'te yazılan.
 
 ## Bağlam
 
-Bir bileşen "şu Endpoint'e mesaj gönder" dediğinde, hangi Endpoint'i
-kastettiğini nasıl söyler? Cevap: bir **capability pointer** (CPtr) ile —
-kendi CSpace'indeki bir slot'un adresi.
+Bir bileşen "şu Endpoint'e mesaj gönder" dediğinde hangi Endpoint'i
+kastettiğini bir **capability pointer** (CPtr) ile söyler: kendi
+CSpace'indeki bir slot'un adresi.
 
-CSpace, CNode'lardan oluşan bir ağaç: bir CNode slot'u başka bir CNode'u
-gösterebilir. CPtr bu ağaçta bir yol tarif eder. Sorular:
+Üç soru:
 
 1. Ağaç ne kadar derin olabilir?
-2. Bir CPtr'ın bitleri nasıl bölünür — hangi bitler hangi seviyeye?
-3. Çözümleme (resolution) ne kadar sürer, ve en kötü durumu nedir?
+2. CPtr'ın bitleri seviyelere nasıl bölünür?
+3. Çözümlemenin en kötü durumu nedir?
 
-Üçüncüsü kritik: CPtr çözümleme **her syscall'ın ilk işi**. M9'da bir IPC
-çağrısı en az iki CPtr çözecek (hedef Endpoint, belki taşınan cap).
-Maliyeti sabit ve küçük olmalı.
+Üçüncüsü kritik: CPtr çözümleme her syscall'ın ilk işi. M9'da bir IPC
+çağrısı en az iki CPtr çözecek.
+
+Ve dördüncü bir soru, ilk hâlde sorulmamıştı:
+
+4. **Aynı CPtr her zaman aynı yeri mi gösterir?**
 
 ## seL4'ün yaptığı: guard'lı radix ağacı
 
-seL4'te her CNode'un iki parametresi var: **radix** (kaç bitlik indeks,
-yani 2^radix slot) ve **guard** (bu CNode'a girmeden önce CPtr'dan
-tüketilecek sabit bir bit deseni).
+Her CNode'un iki parametresi var: **radix** (2^radix slot) ve **guard**
+(girmeden önce CPtr'dan tüketilen sabit bit deseni). Çözümleme, CPtr'ın
+bitlerini guard/radix çiftleriyle tüketerek ilerler ve tüm bitler
+tükenince biter.
 
-Çözümleme şöyle: CPtr'ın en anlamlı bitlerinden başla, guard ile
-karşılaştır, uyuşmazsa hata; uyuşursa guard kadar bit tüket, sonra radix
-kadar bit al, o slot'a bak. Slot bir CNode ise aynısını tekrarla.
+Guard'ın amacı sığ ağaçlarda bit israfını önlemek. Bedeli: bir CPtr'ın
+anlamı ağacın şekline bağlı. Hata ayıklamak zor.
 
-Guard'ın amacı: **sığ ağaçlarda bit israfını önlemek.** 64 bitlik bir
-CPtr'ın tamamını tüketmek zorunludur (seL4'te çözümleme "tüm bitler
-tükendi" ile biter), ve guard olmadan sığ bir ağaç için CPtr'ın üst
-bitlerini sıfırla doldurmak gerekirdi — ki bu çalışır ama her CNode'un
-derinliği CPtr'ın yapısına gömülür.
+## Düzeltilen hata
 
-Bedeli: bir CPtr'ın ne anlama geldiği, **hangi CSpace'te çözüldüğüne
-bağlı**. Aynı 64-bit sayı iki bileşende iki farklı nesneyi gösterebilir —
-ki bu doğru ve istenen bir özellik — ama aynı zamanda ağacın şekli
-değişince aynı CPtr başka bir şeye çözülür. Hata ayıklamak zor, ve
-"yanlış CPtr" ile "yanlış şekilli ağaç" aynı belirtiyi verir.
+Bu ADR'nin ilk hâli şunu öneriyordu: CPtr'ın üst 16 biti kök CNode'u
+indeksler; o slot bir CNode ise alt 16 bit yaprağı indeksler, **değilse
+alt 16 bitin sıfır olması beklenir ve slot'un kendisi döner.**
 
-## Seçim: iki seviye, sabit derinlik, guard yok
+Bu tasarım tam olarak seL4'ün guard'ından kaçınmak için eleştirdiğim
+belirsizliği üretiyor:
 
 ```
-CPtr: 64 bit
-
- 63            32 31            16 15             0
-+----------------+----------------+----------------+
-|   sıfır (32)   |   L1 indeks    |   L0 indeks    |
-+----------------+----------------+----------------+
-                      16 bit           16 bit
+root[5] = Endpoint        ->  CPtr 5<<16 = 0x50000  Endpoint'i gösterir
+root[5] silindi
+root[5] = CNode (yeni)    ->  CPtr 0x50000 artık o CNode'un 0. slot'unu
+                              gösterir. BAŞKA BİR NESNE. Hata yok.
 ```
 
-- **L0 (yaprak CNode):** 2^16 = 65536 slot'a kadar. Pratikte çok daha
-  küçük; radix her CNode'da saklı.
-- **L1 (kök CNode):** 2^16 alt CNode'a kadar.
-- **Üst 32 bit sıfır olmalı.** Değilse `InvalidCPtr`. Boş bırakılmadı,
-  *rezerve edildi* — gerekçe aşağıda.
+Yani "aynı CPtr'ın hangi yarısının kullanıldığı ağacın şekline bağlı"
+diye eleştirdiğim şeyi aynen yapmışım. İlk hâlin gerekçe bölümü kendi
+tasarımını çürütüyordu ve bu fark edilmedi.
 
-Çözümleme:
+**Ders:** bir tasarımı başka bir tasarımın kusuruyla savunurken, aynı
+kusurun kendi tasarımda farklı bir kılıkta olup olmadığına bakmak
+gerekiyor. Burada kılık "L0 bazen kullanılır, bazen kullanılmaz" idi.
+
+## Seçim: iki seviye *zorunlu*, artı nesil sayacı
+
+İki değişiklik, ikisi de değişmezi bağımsız olarak koruyor.
+
+### Değişiklik 1 — Yaprak cap'ler her zaman bir alt-CNode'da
+
+**Kök CNode'un slot'ları yalnızca CNode cap'i taşıyabilir.** Başka bir
+tip koymaya çalışmak `RootSlotMustBeCNode` hatası.
+
+Böylece çözümleme her zaman iki adım: L1 ile kökten bir CNode seç, L0
+ile o CNode'da bir slot seç. Dallanma yok, "slot CNode mi" sorusu yok.
 
 ```
-resolve(cspace_root, cptr):
-    if cptr >> 32 != 0:  return InvalidCPtr
+CSpace:
+
+  root CNode                 L1 = 2
+  +--------+--------+--------+--------+
+  | CNode  | CNode  | CNode  | (boş)  |
+  +--------+--------+--------+--------+
+                        |
+                        v
+                   +--------+--------+--------+
+                   | EP     | Frame  | (boş)  |    L0 = 1
+                   +--------+--------+--------+
+                                ^
+                   CPtr = (2 << 16) | 1
+```
+
+Bedeli: en az iki CNode gerekiyor, ve tek bir cap tutmak isteyen bir
+bileşen bile bir alt-CNode ayırmak zorunda. Kabul edilebilir — bir CNode
+en küçük hâlinde 32 × 2 = 64 bayt.
+
+Kazancı: **CPtr'ın iki yarısının anlamı ağacın şeklinden bağımsız.**
+L1 her zaman kökte, L0 her zaman yaprakta.
+
+Alternatif düşünüldü: "tek seviye durumunda L0'ı anlamlı kıl", yani
+kökteki bir yaprak cap'i `(index << 16) | 0` yerine `index` ile
+adresle. O zaman L1=0 özel anlam kazanır ve kökün 0. slot'u
+adreslenemez hale gelir — bir özel durum daha. Zorunlu iki seviye daha
+az kural içeriyor.
+
+### Değişiklik 2 — Nesil sayacı
+
+Zorunlu iki seviye, *tip* değişiminden doğan belirsizliği kapatıyor.
+Kapatmadığı: bir slot silinip **aynı tipte** başka bir nesneyle
+doldurulursa eski CPtr yeni nesneyi gösterir. Klasik ABA.
+
+Her slot bir **nesil sayacı** taşıyor ve CPtr onu içeriyor:
+
+```
+ 63      56 55      48 47            32 31            16 15            0
++----------+----------+----------------+---------------+---------------+
+| L1 nesil | L0 nesil |  rezerve (16)  |   L1 indeks   |   L0 indeks   |
+|  8 bit   |  8 bit   |  sıfır olmalı  |    16 bit     |    16 bit     |
++----------+----------+----------------+---------------+---------------+
+```
+
+**Her slot için 8 bit nesil.** Slot boşaltıldığında (`delete`, ya da
+`revoke` ile silindiğinde) sayaç artar, 255'ten 0'a sarar.
+
+Çözümleme her iki seviyede de nesli karşılaştırıyor — bu yüzden "çift
+nesil kontrolü": ara CNode'un kendisi değişmişse de yakalanır.
+
+#### Neden 8 bit
+
+Sarma kaçınılmaz; soru ne kadar sürede sardığı. 8 bit, bir slot'un 256
+kez yeniden kullanılmasına izin veriyor. 256. kullanımda eski bir CPtr
+tekrar geçerli görünebilir.
+
+16 bit daha güvenli olurdu ama CPtr'da 32 bit nesil alanı demek, rezerve
+alanın tamamı gider. 8 bit seçildi çünkü:
+
+- Bir slot'un 256 kez döngüye girmesi, bir bileşenin o slot'u sürekli
+  yeniden kullanması demek — kendi slot'u, kendi hatası.
+- Asıl tehlikeli senaryo (A'nın B'ye bayat bir CPtr vermesi) birkaç
+  yeniden kullanımda yakalanıyor; 256'yı bulması için kasıtlı bir çaba
+  gerekir.
+- 16 bit rezerve kalıyor, ki üçüncü bir seviye ya da CSpace etiketi için
+  yer.
+
+Bu bir **takas ve sınırlı bir garanti**; "ABA imkânsız" değil, "ABA için
+256 yeniden kullanım gerekir" diyor. object-model.md'de böyle yazılı.
+
+### Çözümleme
+
+```
+resolve(root, cptr) -> Result<&Slot, CPtrError>:
+    if (cptr >> 32) & 0xFFFF != 0:        // rezerve alan
+        return InvalidCPtr
+
     l1_index = (cptr >> 16) & 0xFFFF
     l0_index =  cptr        & 0xFFFF
+    l1_gen   = (cptr >> 56) & 0xFF
+    l0_gen   = (cptr >> 48) & 0xFF
 
-    if l1_index >= cspace_root.slots:  return OutOfRange
-    slot = cspace_root[l1_index]
+    if l1_index >= root.slots:            return CPtrOutOfRange
+    inner = &root[l1_index]
 
-    if slot.type == CNode:
-        if l0_index >= slot.cnode.slots:  return OutOfRange
-        return &slot.cnode[l0_index]
-    else:
-        if l0_index != 0:  return InvalidCPtr   // bkz. "tek seviye"
-        return &slot
-}
+    if inner.generation != l1_gen:        return StaleCPtr
+    if inner.is_empty():                  return EmptySlot
+    if inner.type != CNode:               return RootSlotMustBeCNode
+
+    cnode = inner.as_cnode()
+    if l0_index >= cnode.slots:           return CPtrOutOfRange
+
+    leaf = &cnode[l0_index]
+    if leaf.generation != l0_gen:         return StaleCPtr
+
+    return leaf
 ```
 
-**En kötü durum: iki bellek erişimi, üç karşılaştırma, döngü yok.**
-Sayıyla: CPtr başına ≤ 20 komut. seL4'ün değişken derinlikli
-çözümlemesinde bu, ağacın derinliğine bağlı bir döngü.
+**En kötü durum: iki bellek erişimi, yedi karşılaştırma, döngü yok.**
+Tahmini ≤ 25 komut. İlk hâlin 20 komutundan beş fazla; nesil
+kontrollerinin bedeli bu.
 
-### Tek seviyeli kullanım
+### Değişmez
 
-Bir bileşenin tek bir CNode'u varsa (M13'e kadar beklenen durum),
-cap'lerini doğrudan kök CNode'a koyar ve L0 indeksini sıfır bırakır. O
-zaman CPtr = `index << 16` olur.
+> **Bir CPtr, çözümlendiği her seferde ya aynı slot'u gösterir ya bir
+> hata döndürür. Hiçbir koşulda başka bir slot'u göstermez.**
 
-Bu biraz tuhaf görünüyor — neden alt 16 bit değil? Çünkü alternatif,
-"slot CNode değilse L1 indeksini kullan" demek olurdu ve o zaman aynı
-CPtr'ın hangi yarısının kullanıldığı ağacın şekline bağlı olurdu. Tam
-olarak seL4'ün guard'ından kaçındığımız belirsizlik. Böylece kural tek:
-**L1 her zaman kökte indeksler, L0 her zaman yaprakta.**
+Üç mekanizma birlikte koruyor:
 
-### Üst 32 bit neden rezerve
+1. **Zorunlu iki seviye:** bitlerin anlamı ağacın şekline bağlı değil.
+2. **Nesil sayaçları:** slot yeniden kullanılırsa eski CPtr `StaleCPtr`.
+3. **Rezerve alan kontrolü:** üst bitlerde çöp olan bir CPtr reddedilir.
 
-Sıfır olmak zorunda ve bu zorunluluk denetleniyor. Üç olası gelecek
-kullanım:
-
-1. **Üçüncü bir seviye** (bit 32–47), eğer iki seviye yetmezse.
-2. **CSpace etiketi** — hangi CSpace'te çözüleceğini belirten bir alan,
-   bir bileşenin başka bir bileşenin CSpace'ine kontrollü erişimi için.
-3. **Nesil (generation) sayacı** — bir slot yeniden kullanıldığında eski
-   CPtr'ların otomatik geçersizleşmesi için.
-
-Üçünü de şimdi yapmıyoruz. Ama alanı sıfır olmaya *zorlamak*, ileride
-anlam yüklemeyi mümkün kılıyor: bugün sıfır olmayan bir CPtr hata
-veriyorsa, yarın anlam kazandığında eski kod kırılmaz.
+Kabul testi `cap-test` bunu doğruluyor (kontrol 10): bir slot silinip
+farklı tipte bir nesneyle dolduruluyor, eski CPtr hata veriyor.
 
 ## Ne kaybediyoruz
 
-**1. Derin CSpace'ler.** 2^32 slot adreslenebiliyor (65536 CNode × 65536
-slot), ama hiyerarşi iki seviyeyle sınırlı. seL4'te bir bileşen keyfi
-derinlikte alt-CSpace'ler kurabilir; burada kuramaz.
+**1. Derin CSpace'ler.** 2^32 slot adreslenebiliyor ama hiyerarşi tam
+iki seviye. seL4'te bir bileşen alt bileşenine CSpace'inin bir dalını
+verebilir ve o da dallanabilir; bizde alt bileşen düz kalır.
 
-Bunun gerçek maliyeti: **CSpace'i delege etmek zorlaşıyor.** seL4'te bir
-bileşen, alt bileşenine kendi CSpace'inin bir dalını verip "bu senin
-CSpace'in" diyebilir ve o alt bileşen kendi içinde yine dallanabilir.
-Bizde alt bileşen tek seviye derinliğinde kalır.
+M13'e kadar sorun değil: init + birkaç servis + bir seri sürücü. Üç
+kademeli bir bileşen hiyerarşisi bu kapıyı açmayı gerektirir — rezerve
+16 bit orada duruyor.
 
-M13'e kadar sorun değil: init bileşeni + birkaç sürücü + birkaç
-uygulama, her biri kendi düz CNode'uyla. Üç kademeli bir bileşen
-hiyerarşisi kuran bir sistem yazmak istersek bu kapı kapalı olacak ve
-üçüncü seviyeyi (rezerve bitlerde) açmak gerekecek.
+**2. Minimum iki CNode.** Tek cap tutan bir bileşen bile kök + yaprak
+istiyor. 64 bayt.
 
-**2. Değişken bit bölüşümü.** seL4'te 10 slot'luk bir CNode 4 bit, 1000
-slot'luk bir CNode 10 bit tüketir. Bizde ikisi de 16 bit yerinde durur,
-yani küçük CNode'larda CPtr uzayı israf oluyor. 2^32 adreslenebilir
-slot'un yanında bu israf önemsiz.
+**3. 256 yeniden kullanımda nesil sarması.** Yukarıda.
 
-**3. seL4 uygulamalarının doğrudan taşınabilirliği.** CPtr hesaplayan bir
-seL4 kodu bizde çalışmaz. Zaten hedef değildi.
+**4. seL4 kodunun taşınabilirliği.** Zaten hedef değildi.
 
 ## Elenen alternatifler
 
-**seL4'ün guard'lı radix ağacı, aynen.** En esnek, ve doğru çalıştığı
-kanıtlanmış. İki nedenle alınmadı: çözümleme bir döngü içeriyor (derinlik
-bağımlı, yani en kötü durumu CSpace'in şekline bağlı), ve guard semantiği
-hata ayıklamayı zorlaştırıyor. Bu projede birincisi daha ağır bastı —
-"kernel yolunda sınırsız döngü yok" kuralı CPtr çözümlemesini de kapsıyor.
-*Not:* seL4'te derinlik pratikte CPtr'ın bit sayısıyla sınırlı (en fazla
-64 adım), yani teknik olarak sınırsız değil. Ama 64 adımlık bir en kötü
-durum ile 2 adımlık bir en kötü durum arasındaki fark, bir IPC yolunda
-ölçülebilir.
+**seL4'ün guard'lı radix ağacı.** En esnek, kanıtlanmış. Çözümleme bir
+döngü içeriyor — derinliğe bağlı, yani en kötü durumu CSpace'in şekline
+bağlı. "Kernel yolunda sınırsız döngü yok" kuralı CPtr çözümlemesini de
+kapsıyor. *Not:* seL4'te derinlik CPtr'ın bit sayısıyla sınırlı (≤64
+adım), yani teknik olarak sınırsız değil; ama 64 ile 2 arasındaki fark
+IPC yolunda ölçülebilir.
 
-**Tek seviye, düz dizi.** CPtr doğrudan bir slot indeksi. En basit ve en
-hızlı: bir karşılaştırma, bir indeksleme. Reddedildi çünkü CSpace
-delegasyonunu *tamamen* imkânsız kılıyor — bir bileşen diğerine bir cap
-grubu veremez, yalnızca tek tek cap'ler verebilir. İki seviye, M13'ün
-ihtiyacı olan minimum hiyerarşi.
+**Tek seviye, düz dizi.** Bir karşılaştırma, bir indeksleme. CSpace
+delegasyonunu tamamen imkânsız kılıyor.
 
-**Değişken derinlik ama guard yok.** Çözümleme "slot CNode olduğu sürece
-devam et" olurdu. Döngü yine var, ve derinliğin nerede biteceği CPtr'da
-yazmadığı için bir döngü sınırı koymak gerekir — yani sabit derinliğin
-dezavantajını alıp avantajını almamak.
+**İlk hâl: opsiyonel ikinci seviye.** Yukarıda çürütüldü.
 
-**CPtr'ı 32 bit yapmak.** Yarım register, ve 2^32 slot zaten fazlasıyla
-yeterli. Reddedildi: syscall argümanları zaten 64 bit register'larda
-geliyor, 32 bit kullanmak bir şey kazandırmıyor ve rezerve alanı
-kaybettiriyor.
+**Tek-seviyede L0'ı anlamlı kılmak.** L1=0'ı özel durum yapar, kökün 0.
+slot'unu adreslenemez kılar. Zorunlu iki seviye daha az kural.
 
-**Nesil sayacını şimdi eklemek.** Bir slot yeniden kullanıldığında eski
-CPtr'lar sessizce yeni nesneyi gösterir — bu, capability sistemlerinde
-bilinen bir tuzak (ABA problemi). Nesil sayacı çözer. Şimdi eklenmedi
-çünkü slot başına ek alan ve her çözümlemede bir karşılaştırma daha
-demek; ve M13'e kadar slot geri dönüşümü nadir. Rezerve bitler bu
-ihtimali açık tutuyor. **Bu bir risk ve açık sorular listesinde, soru 2.**
+**Nesil sayacını atlamak ("protokol sorunu").** İlk hâlin duruşu ve
+reddedildi: güvenlik hedefi olan bir sistemde kernel, yanlış nesneye
+erişimi yapısal olarak imkânsız kılmalı — bileşenlerin dikkatine
+bırakmamalı. Maliyeti slot başına 1 bayt ve çözümlemede iki
+karşılaştırma.
+
+**Nesil sayacını 16 bit yapmak.** Daha güvenli, rezerve alanın tamamını
+yer. 8 bit + 16 bit rezerve seçildi.
+
+**Ataların nesillerini de yürümek (soru 1'deki öneri).** O, derivation
+ağacı boyunca 8 okuma demekti — ayrı bir mekanizma, revoke'u
+ucuzlatmak için. Buradaki nesil kontrolü CSpace ağacında ve sabit iki
+okuma; karıştırılmamalı.
 
 ## Sonuç
 
-- CPtr 64 bit: 32 bit rezerve (sıfır olmalı, denetleniyor) + 16 bit L1 +
-  16 bit L0.
-- Sabit iki seviye. Çözümleme **döngüsüz**, en kötü durum iki bellek
-  erişimi ve üç karşılaştırma, ≤ 20 komut.
-- Guard yok. seL4'ten ayrıldığımız ikinci ve en büyük nokta.
-- Tek seviyeli kullanımda L0 = 0; kural ağacın şekline bağlı değil.
-- **Kapattığımız kapı:** ikiden derin CSpace hiyerarşisi, yani çok
-  kademeli bileşen delegasyonu. Rezerve bitlerle ileride açılabilir.
-- **Risk:** slot yeniden kullanımında ABA. Nesil sayacı için yer var,
-  uygulanmadı. Soru 2.
+- CPtr 64 bit: 8 L1-nesil + 8 L0-nesil + 16 rezerve (sıfır) + 16 L1 +
+  16 L0.
+- **Tam iki seviye, zorunlu.** Kök CNode yalnızca CNode cap'i taşır.
+- Çözümleme **döngüsüz**: iki bellek erişimi, yedi karşılaştırma,
+  ≤ 25 komut.
+- Guard yok. seL4'ten ayrıldığımız en büyük nokta.
+- **Değişmez:** bir CPtr ya aynı slot'u gösterir ya hata verir; asla
+  başka bir slot'u göstermez. Üç mekanizma koruyor, kabul testi
+  doğruluyor.
+- Nesil 8 bit: 256 yeniden kullanımdan sonra sarar. Sınırlı bir
+  garanti, ve sınırı yazılı.
+- **Kapattığımız kapı:** ikiden derin hiyerarşi. 16 rezerve bit orada.
+- **Düzeltilen hata:** ilk hâl, kaçındığını iddia ettiği belirsizliği
+  üretiyordu.

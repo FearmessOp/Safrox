@@ -51,6 +51,8 @@
 // use it. See kernel/src/memory/heap.rs.
 extern crate alloc;
 
+mod cap;
+mod captest;
 mod cpu;
 mod faults;
 mod gdt;
@@ -75,7 +77,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M4");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M5");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -458,6 +460,24 @@ extern "C" fn kmain() -> ! {
     // longer exists.
     let features = cpu::features();
 
+    // ---- The heap's physical budget (M5) --------------------------------
+    //
+    // Before heap::init, not after. From M5 the heap draws its pages from
+    // a reserve taken here rather than calling the frame allocator on
+    // demand, because ADR 022 retires that allocator at the end of boot
+    // and a lazily-growing heap can never satisfy its precondition.
+    //
+    // Putting this after heap::init looked right and was not: init maps
+    // the first page, which would draw from a reserve that did not exist
+    // yet. The tripwire in heap_frame_source caught it on the first run.
+    //
+    // SAFETY: First and only call, after vm::init and reclaim so the
+    // allocator holds everything it is going to hold, and before
+    // heap::init.
+    unsafe {
+        cap::boot::reserve_heap_budget();
+    }
+
     // ---- Kernel heap (M4) ----------------------------------------------
     //
     // After reclaim, so the frames the bootloader gave back are available
@@ -465,41 +485,33 @@ extern "C" fn kmain() -> ! {
     // through the kernel's own tables.
     //
     // SAFETY: First and only call, single-threaded, interrupts disabled,
-    // with the page tables and the frame allocator both up.
+    // with the page tables and the reserve both in place.
     unsafe {
         memory::heap::init();
     }
 
-    // ---- Fault-injection hooks -----------------------------------------
+    // ---- Scenarios that need the frame allocator alive -----------------
     //
-    // Each of these is reached through a token on the kernel command line,
-    // so the exception paths are exercised on the binary we ship rather
-    // than on a special build.
+    // The frame allocator's life ends a few lines below, when
+    // `cap::boot::init` hands every remaining frame to the capability
+    // system and retires it (ADR 022). Anything that allocates directly
+    // -- the M2 allocator tests, and every M3 scenario, since mapping a
+    // page needs frames for the intermediate tables -- has to run before
+    // that point.
+    //
+    // This split is not bookkeeping; it is the allocator's lifetime made
+    // visible. The alternative, discovered by running it, is that
+    // `mem-test` panics with "65338 frames are held by the kernel's own
+    // structures" -- which was true, and was the capability system
+    // holding them.
+    //
+    // Each scenario diverges (exits QEMU), so none of them returns here.
 
     // Negative-path hook inherited from M0: a plain panic, no exception
-    // involved.
+    // involved. First, because it needs nothing at all.
     if cmdline.contains("panic-test") {
         println!("[boot] cmdline requested a panic; triggering now");
         panic!("deliberate panic requested via cmdline (token=panic-test)");
-    }
-
-    // #BP is a trap, so this one returns and the kernel carries on to exit
-    // successfully. That is the whole point: it proves the dispatcher's
-    // `iretq` path works, not just that an exception was caught.
-    if cmdline.contains("fault-int3") {
-        println!("[boot] cmdline requested a breakpoint exception");
-        faults::trigger_breakpoint();
-        println!("[boot] execution continued past the breakpoint");
-    }
-
-    if cmdline.contains("fault-pf") {
-        println!("[boot] cmdline requested a page fault");
-        faults::trigger_page_fault();
-    }
-
-    if cmdline.contains("fault-df") {
-        println!("[boot] cmdline requested a double fault");
-        faults::trigger_double_fault();
     }
 
     // The frame allocator tests run against the real memory map of the
@@ -515,7 +527,8 @@ extern "C" fn kmain() -> ! {
         memtest::run();
     }
 
-    // M3 virtual memory scenarios.
+    // M3 virtual memory scenarios. Every one of these maps or unmaps,
+    // and mapping allocates the intermediate tables.
     if cmdline.contains("vm-stale-tlb") {
         println!("[boot] cmdline requested the stale-TLB check");
         vmtest::run_stale_tlb();
@@ -541,7 +554,48 @@ extern "C" fn kmain() -> ! {
         vmtest::run_stack_overflow();
     }
 
-    // M4 heap scenarios.
+    // ---- Capability system (M5) ----------------------------------------
+    //
+    // This retires the frame allocator. After it, the only source of
+    // memory is retyping an Untyped (ADR 022).
+
+    cap::report_sizes();
+
+    let memmap_entries = memory::bootinfo::get().memory_map();
+    // SAFETY: First and only call, after the heap is up and after every
+    // scenario that needs the frame allocator, on the single-threaded
+    // boot path with interrupts disabled.
+    unsafe {
+        cap::boot::init_from_regions(memmap_entries);
+    }
+
+    // ---- Scenarios that run on a capability-only kernel ----------------
+    //
+    // Everything below sees a retired frame allocator. The heap still
+    // works, because it has its own reserve.
+
+    // #BP is a trap, so this one returns and the kernel carries on to exit
+    // successfully. That is the whole point: it proves the dispatcher's
+    // `iretq` path works, not just that an exception was caught.
+    if cmdline.contains("fault-int3") {
+        println!("[boot] cmdline requested a breakpoint exception");
+        faults::trigger_breakpoint();
+        println!("[boot] execution continued past the breakpoint");
+    }
+
+    if cmdline.contains("fault-pf") {
+        println!("[boot] cmdline requested a page fault");
+        faults::trigger_page_fault();
+    }
+
+    if cmdline.contains("fault-df") {
+        println!("[boot] cmdline requested a double fault");
+        faults::trigger_double_fault();
+    }
+
+    // M4 heap scenarios. These run after retirement on purpose: the heap
+    // draws from its own reserve, so it must keep working once the frame
+    // allocator is gone, and running them here is what shows it does.
     if cmdline.contains("heap-oom") {
         println!("[boot] cmdline requested the heap exhaustion test");
         heaptest::run_oom();
@@ -557,7 +611,34 @@ extern "C" fn kmain() -> ! {
         heaptest::run();
     }
 
-    println!("[boot] M4 checks passed");
+    // M5 capability scenarios.
+    //
+    // `cap-test` is checked last. It is a substring of nothing here, but
+    // the three other tokens all begin "cap-", and `contains` does not
+    // care about word boundaries; ordering the specific ones first means
+    // a future token like "cap-test-extra" cannot silently run the wrong
+    // scenario.
+    if cmdline.contains("cap-revoke-depth") {
+        println!("[boot] cmdline requested the revoke cost measurement");
+        captest::run_revoke_depth();
+    }
+
+    if cmdline.contains("cap-interrupt-alloc") {
+        println!("[boot] cmdline requested the interrupt-allocation tripwire");
+        captest::run_interrupt_alloc();
+    }
+
+    if cmdline.contains("cap-retired-allocator") {
+        println!("[boot] cmdline requested the retired-allocator tripwire");
+        captest::run_retired_allocator();
+    }
+
+    if cmdline.contains("cap-test") {
+        println!("[boot] cmdline requested the capability tests");
+        captest::run();
+    }
+
+    println!("[boot] M5 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

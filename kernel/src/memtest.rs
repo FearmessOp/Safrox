@@ -79,11 +79,17 @@ impl<T> SyncCell<T> {
     }
 }
 
-/// Run the full frame allocator test suite.
+/// Run the full frame allocator test suite, then exit.
 ///
-/// Returns normally if every phase passed; panics otherwise, which the
-/// runner sees as host status 35.
-pub fn run() {
+/// Diverges rather than returning. The last phase drains the allocator
+/// to prove it reports exhaustion cleanly, and it leaves it drained --
+/// which was harmless while this was the last thing to run, and stopped
+/// being so in M5, when `cap::boot::init` began running afterwards and
+/// panicked with "could not find 2 contiguous frames for a CNode".
+///
+/// Exiting here says what was already true: a scenario that deliberately
+/// exhausts a global resource cannot hand the machine back.
+pub fn run() -> ! {
     println!("[memtest] starting frame allocator tests");
 
     let initial_free = frames::free_count();
@@ -117,8 +123,22 @@ pub fn run() {
     // boot code allocating per-frame rather than per-table.
     const MAX_BOOT_STRUCTURES: u64 = 64;
 
+    // M5 added a second, much larger consumer: the heap's physical
+    // reserve, taken whole before the frame allocator retires (ADR 022).
+    // That is 16384 frames, which swamped the bound above and made this
+    // check fail with "16407 frames are held by the kernel's own
+    // structures" -- true, and not a leak.
+    //
+    // Subtracting it rather than raising the bound is the point. Raising
+    // the bound to 17000 would hide a genuine per-frame leak of 500
+    // frames behind the reserve's bulk; subtracting the exact,
+    // independently-known figure leaves the original check exactly as
+    // sharp as it was. The reserve is a deliberate, measured allocation,
+    // so it can be accounted for by name.
+    let reserve_frames = crate::memory::heap::reserve_size() / FRAME_SIZE;
+
     let donated = frames::initial_free_count();
-    let held_by_kernel = donated.saturating_sub(initial_free);
+    let held_in_total = donated.saturating_sub(initial_free);
 
     assert!(
         initial_free <= donated,
@@ -128,18 +148,30 @@ pub fn run() {
         donated
     );
     assert!(
+        held_in_total >= reserve_frames,
+        "the kernel holds {} frames but the heap reserve alone is {}; the \
+         reserve was not taken from this allocator",
+        held_in_total,
+        reserve_frames
+    );
+
+    let held_by_kernel = held_in_total - reserve_frames;
+    assert!(
         held_by_kernel <= MAX_BOOT_STRUCTURES,
-        "{} frames are held by the kernel's own structures, which is more \
-         than the {} a page-table build and two stacks should need; \
-         something allocated per-frame during boot",
+        "{} frames are held by the kernel's own structures (excluding the \
+         {} frame heap reserve), which is more than the {} a page-table \
+         build and two stacks should need; something allocated per-frame \
+         during boot",
         held_by_kernel,
+        reserve_frames,
         MAX_BOOT_STRUCTURES
     );
 
     println!(
         "[memtest] {} frames held by boot structures (page tables and {} \
-         kernel stacks), within the bound of {}",
-        held_by_kernel, 2, MAX_BOOT_STRUCTURES
+         kernel stacks), within the bound of {}; the heap's {} frame \
+         reserve is counted separately",
+        held_by_kernel, 2, MAX_BOOT_STRUCTURES, reserve_frames
     );
 
     bulk_allocate(initial_free);
@@ -147,6 +179,13 @@ pub fn run() {
     exhaust_and_recover();
 
     println!("[memtest] all frame allocator tests passed");
+    println!(
+        "[boot] exiting QEMU (write {:#04x} -> exit status {})",
+        crate::qemu::EXIT_SUCCESS,
+        crate::qemu::HOST_STATUS_SUCCESS
+    );
+
+    crate::qemu::exit(crate::qemu::EXIT_SUCCESS)
 }
 
 /// Phase 1: allocate [`BULK_COUNT`] frames and check every invariant that

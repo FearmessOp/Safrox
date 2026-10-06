@@ -1,6 +1,7 @@
 # ADR 017 — Nesne kümesi: sekiz tip, ve neden dokuzuncu yok
 
-Status: accepted (M5 architect pass)
+Status: accepted (M5 architect pass), **ölçümlerle güncellendi (M5
+uygulama)**
 
 Kaynak: seL4 Reference Manual (v13), bölüm 2 ve 4. Nereden ödünç
 aldığımız ve nerede ayrıldığımız her bölümde ayrı yazılı.
@@ -26,22 +27,47 @@ hangilerini aldığımız, hangilerini neden almadığımız var.
 
 ## Seçim: sekiz tip
 
-| # | Nesne | Boyut | Hizalama | Ne zaman gerekli |
-|---|---|---|---|---|
-| 1 | `Untyped` | değişken, 2^k | 2^k | M5 — her şeyin kaynağı |
-| 2 | `CNode` | 32 B × 2^radix | nesne boyutu | M5 — cap'leri tutar |
-| 3 | `TCB` | 1024 B | 1024 B | M7 — thread |
-| 4 | `Endpoint` | 32 B | 32 B | M9 — senkron IPC |
-| 5 | `Notification` | 48 B | 64 B | M9 — asenkron sinyal |
-| 6 | `Frame` | 4096 B | 4096 B | M11 — user belleği |
-| 7 | `PageTable` | 4096 B | 4096 B | M11 — user VSpace |
-| 8 | `IRQHandler` | 32 B | 32 B | M12 — cihaz kesmesi |
+| # | Nesne | Tavan | Ölçülen | Hizalama | Ne zaman gerekli |
+|---|---|---|---|---|---|
+| 1 | `Untyped` | değişken, 2^k | — | 2^k | M5 — her şeyin kaynağı |
+| 2 | `CNode` | 32 B × 2^radix | 32 B/slot | nesne boyutu | M5 — cap'leri tutar |
+| 3 | `TCB` | 2048 B | **2048 B** | 2048 B | M7 — thread |
+| 4 | `Endpoint` | 32 B | **32 B** | 32 B | M9 — senkron IPC |
+| 5 | `Notification` | 64 B | **64 B** | 64 B | M9 — asenkron sinyal |
+| 6 | `Frame` | 4096 B | 4096 B | 4096 B | M11 — user belleği |
+| 7 | `PageTable` | 4096 B | 4096 B | 4096 B | M11 — user VSpace |
+| 8 | `IRQHandler` | 32 B | **32 B** | 32 B | M12 — cihaz kesmesi |
 
-Boyutlar şimdilik **tavan**; gerçek `size_of` M5 uygulamasında ölçülecek
-ve bu tabloya yazılacak. Hizalama kuralı her tip için aynı: **nesne
-boyutunun bir sonraki ikinin kuvveti kadar**, ki bir Untyped'dan retype
-edilirken hizalama aritmetiği tek bir kaydırma olsun
+**Ölçüm notu (M5).** Ölçülen sütunu `cap-test` senaryosundan geliyor ve
+şu an tavanların tamamına eşit — çünkü nesneler henüz alanları olmayan
+yer tutucular, boyutları `cap/mod.rs`'deki sabitlerden geliyor. Gerçek
+sınama M7 (TCB), M9 (Endpoint, Notification) ve M12'de (IRQHandler)
+olacak: alanlar eklendikçe `size_of` tavana yaklaşacak, ve
+`cap/mod.rs`'deki `const` iddiaları aşıldığı anda derlemeyi
+durduracak. Bugünkü eşitlik "doğrulandı" değil, "henüz test edilmedi"
+anlamına geliyor.
+
+İki tavan mimari geçişten bu yana değişti ve ikisi de burada
+güncellendi: TCB 1024 → 2048 bayt (IPC tamponu içeri alındı, açık
+soru 5), Notification 48 → 64 bayt (hizalama kuralı gereği zaten 64'e
+yuvarlanıyordu; tavanı gerçeğe çekmek daha dürüst).
+
+Tavanlar mimari geçişte tahmin edildi. Tavanı aşan bir değer derleme
+hatası (`const _: ()` ile zorlanıyor). Hizalama kuralı her tip için
+aynı: **nesne boyutunun bir sonraki ikinin kuvveti kadar**, ki bir
+Untyped'dan retype edilirken hizalama aritmetiği tek bir kaydırma olsun
 ([ADR 020](020-retype-semantigi.md)).
+
+**TCB 1024 bayt ve IPC tamponu içeride.** Mimari geçişte açık
+bırakılmıştı (soru 5); karar: tampon TCB'nin içinde, sabit 1 KiB.
+Alternatif (seL4 gibi ayrı bir Frame) her IPC'de kernel'in o Frame'e
+erişmesini gerektiriyor — PMAP üzerinden fiziksel çözüm ya da kalıcı
+bir kernel eşlemesi, ikisi de sıcak yolda. Dolayısıyla TCB'nin gerçek
+boyutu **2048 bayt**: 1024 bağlam + 1024 tampon.
+
+Sonucu: **IPC mesajları en fazla 1 KiB.** M13'ün init sistemi dosya
+sistemi ya da ağ yığını içermeyecek, birkaç küçük servis ve bir seri
+sürücü olacak; 1 KiB yeterli.
 
 ### Neden her biri var
 
@@ -157,12 +183,32 @@ hiçbiri mevcut sekizin kombinasyonuyla yapılamayacak bir şey sağlamıyor.
 | M12 | Cihaz sürücüsü | IRQHandler + Frame (MMIO) + Notification |
 | M13 | Init sistemi | Hepsi |
 
-M12'de bir boşluk var: **MMIO'yu kim temsil ediyor?** Bir cihazın
-register penceresi bir Frame mi, yoksa ayrı bir tip mi? Şimdilik cevap
-"bir Frame, ama `NO_CACHE` ile eşlenen" — fakat o zaman Frame'in hangi
-fiziksel adresi gösterdiği önemli hale geliyor ve bir bileşenin rastgele
-bir fiziksel adresi Frame'e dönüştürememesi gerekiyor. Açık sorular
-listesinde, soru 3.
+### MMIO: device Untyped, dokuzuncu tip değil
+
+M12'de bir cihaz sürücüsü register penceresine erişecek. Çözüm yeni bir
+nesne tipi değil: **Untyped'a bir `device` bayrağı.**
+
+Boot sırasında kernel, memory map'teki RAM-olmayan bölgeler için
+**device Untyped**'lar üretir. Normal Untyped'dan tek farkı:
+
+> **Değişmez: bir device Untyped yalnızca `Frame`'e retype edilebilir.**
+> TCB, CNode, Endpoint, Notification, PageTable ya da IRQHandler
+> denemesi `DeviceUntypedFrameOnly` döner.
+
+Gerekçe tek cümleyle: **kernel nesneleri kernel'in okuyup yazdığı
+yapılardır, bir cihaz register penceresi öyle davranmaz.** Bir
+Endpoint'in kuyruk işaretçisini bir cihazın durum register'ının üzerine
+yazmak hem nesneyi bozar hem cihaza rastgele komut gönderir; belirtisi
+donanıma bağlı ve teşhisi imkânsıza yakın.
+
+Bir bileşen rastgele bir fiziksel adresi Frame'e çeviremez: Frame
+yalnızca retype ile doğar, retype bir Untyped gerektirir, Untyped'ları
+yalnızca boot kodu üretir.
+
+Device Frame'leri M12'de `NO_CACHE` ile eşlenecek — bu bir eşleme
+bayrağı, nesne özelliği değil.
+
+`cap-test` kontrol 12 bunu doğruluyor.
 
 ## Elenen alternatifler
 
@@ -189,8 +235,11 @@ karmaşıklaştırır ve hizalama garantisini kaybettirir. Sabit boyut,
   birinci nokta.
 - PCID, bütçeli zamanlama, devredilebilir Reply ve sanallaştırma kapsam
   dışı — her birinin kapattığı kapı yukarıda adlandırıldı.
-- Boyutlar tavan olarak verildi; M5 uygulaması gerçek `size_of`
-  değerlerini ölçüp bu tabloyu güncelleyecek ve farkı raporlayacak.
+- Boyutlar tavan olarak verildi; `cap-test` gerçek `size_of` değerlerini
+  basıyor ve tavanı aşmak derleme hatası.
 - Hizalama kuralı tek: nesne boyutunun bir sonraki ikinin kuvveti.
-- **Açık:** MMIO'nun Frame olarak temsili ve rastgele fiziksel adresin
-  Frame'e çevrilememesi. Soru 3.
+- **TCB 2048 bayt**: 1024 bağlam + 1024 IPC tamponu. IPC mesajları
+  ≤ 1 KiB.
+- **MMIO = device Untyped**, dokuzuncu tip değil. Değişmez: device
+  Untyped yalnızca Frame'e retype edilebilir, ve `cap-test` bunu
+  doğruluyor.

@@ -156,6 +156,58 @@ HEAP_INIT_LINES = [
         r"O\(1\) with no search",
         re.M,
     ),
+    # M5: the heap draws from a reserve taken before the frame allocator
+    # retired, not from the allocator itself. Required on every boot --
+    # without it the first allocation after boot panics, which is exactly
+    # what happened the first time M5 ran.
+    re.compile(
+        r"^\[heap\] reserve: 64 MiB of contiguous physical memory at "
+        r"0x[0-9a-f]{16}, taken before the frame allocator retired",
+        re.M,
+    ),
+    # 64 MiB and not a byte less: the reserve covers the heap's whole
+    # limit plus the page tables that address it. Sized at exactly the
+    # limit, the heap ran out of reserve 34 frames short of its own 64
+    # MiB -- which is what the tables cost -- and `heap-oom` reported
+    # the wrong exhaustion.
+]
+
+# M5 brings the capability system up on every boot, and -- critically --
+# retires the frame allocator as it does. Required everywhere, because
+# every scenario after this point runs on a kernel whose only source of
+# memory is a capability.
+CAP_INIT_LINES = [
+    # The measured object sizes. ADR 017's table is a set of ceilings; the
+    # build enforces them, and these lines are what makes the real figures
+    # visible rather than merely bounded.
+    re.compile(r"^\[cap\] slot 32 B; Untyped 2\^4\.\.2\^47; CNode 32 B/slot", re.M),
+    re.compile(
+        r"^\[cap\] TCB 2048 B \(1024 context \+ 1024 ipc\), Endpoint 32 B, "
+        r"Notification 64 B",
+        re.M,
+    ),
+    re.compile(r"^\[cap\] limits: retype count <= 256, derivation depth <= 8", re.M),
+    # The CSpace has the shape ADR 018 requires: a root of CNodes, two
+    # levels, no more.
+    re.compile(
+        r"^\[cap\] init cspace: root radix 4 at 0x[0-9a-f]{16}, untyped cnode "
+        r"radix 8, object cnode radix 8",
+        re.M,
+    ),
+    re.compile(r"^\[cap\] \d+ root untypeds covering \d+ MiB", re.M),
+    # Every frame the allocator had is now either kernel memory or Untyped
+    # memory. Requiring "0 after" rather than a vague "fewer" is the point:
+    # a frame left behind would be memory nobody can account for.
+    re.compile(
+        r"^\[cap\] frame allocator: \d+ free before, 0 after; \d+ frames became "
+        r"untyped memory",
+        re.M,
+    ),
+    re.compile(
+        r"^\[cap\] frame allocator retired; allocation now goes through retype "
+        r"only",
+        re.M,
+    ),
 ]
 
 # The poison pattern, as it appears when something follows a pointer into
@@ -175,7 +227,8 @@ EXPECTATIONS = {
             *CPU_INIT_LINES,
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
-            re.compile(r"^\[boot\] M4 checks passed", re.M),
+            *CAP_INIT_LINES,
+            re.compile(r"^\[boot\] M5 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -194,7 +247,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M4 checks passed", re.M)],
+        forbidden=[re.compile(r"M5 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -211,7 +264,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M4 checks passed", re.M),
+            re.compile(r"^\[boot\] M5 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -230,7 +283,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M4 checks passed", re.M)],
+        forbidden=[re.compile(r"M5 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -249,7 +302,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -274,9 +327,14 @@ EXPECTATIONS = {
             # all, which M3 made false -- vm::init allocates. Narrowed
             # rather than dropped: an unbounded drift here is a leak during
             # boot, and nothing else would catch it.
+            # M5 added the heap's physical reserve, which is 16384 frames
+            # and would have swamped this bound. It is subtracted by name
+            # rather than folded into a larger bound, so the check on
+            # per-frame boot allocation stays exactly as sharp as it was.
             re.compile(
                 r"^\[memtest\] \d+ frames held by boot structures .* within "
-                r"the bound of \d+",
+                r"the bound of \d+; the heap's \d+ frame reserve is counted "
+                r"separately",
                 re.M,
             ),
             re.compile(r"^\[memtest\] alloc: 10000 unique, aligned, in-range", re.M),
@@ -290,7 +348,6 @@ EXPECTATIONS = {
             ),
             re.compile(r"^\[memtest\] recovery: freed .* and got it straight back", re.M),
             re.compile(r"^\[memtest\] all frame allocator tests passed", re.M),
-            re.compile(r"^\[boot\] M4 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant the kernel checks is an assert, so a violation
@@ -298,6 +355,13 @@ EXPECTATIONS = {
             # in-kernel check cannot quietly turn into a pass.
             re.compile(r"KERNEL PANIC", re.M),
             re.compile(r"EXCEPTION", re.M),
+            # This scenario exits as soon as its own checks pass, before
+            # the capability system comes up. It has to: the last phase
+            # deliberately drains the frame allocator, and cap::boot needs
+            # frames -- it panicked with "could not find 2 contiguous
+            # frames for a CNode" when this ran to completion. Requiring
+            # the line's *absence* keeps the two facts tied together.
+            re.compile(r"M5 checks passed", re.M),
         ],
     ),
     "doublefree": Expectation(
@@ -317,7 +381,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -365,7 +429,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M4 checks passed", re.M),
+            re.compile(r"^\[boot\] M5 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -410,7 +474,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -439,7 +503,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -495,7 +559,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
@@ -511,6 +575,7 @@ EXPECTATIONS = {
             *CPU_INIT_LINES,
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
             re.compile(r"^\[heaptest\] initial: base 0xffffc00000001000", re.M),
             # The four collections, each exercising a different pattern:
             # one fixed allocation, two that reallocate as they grow, and
@@ -543,10 +608,15 @@ EXPECTATIONS = {
                 re.M,
             ),
             # The heap grows on demand, and both ends of the new region are
-            # really writable -- not merely accounted for.
+            # really writable -- not merely accounted for. From M5 the
+            # growth must also be paid for out of the heap's reserve, and
+            # the two figures must agree: a page mapped without being
+            # charged would leave the budget draining at the wrong rate
+            # while the page count looked perfectly healthy.
             re.compile(
                 r"^\[heaptest\] growth: \d+ bytes requested, heap grew from \d+ "
-                r"to \d+ pages, both ends writable",
+                r"to \d+ pages, both ends writable; reserve \d+ MiB -> \d+ MiB "
+                r"\(\d+ KiB spent for \d+ pages\)",
                 re.M,
             ),
             # Back to the starting byte count. The pages stay mapped, and
@@ -563,8 +633,18 @@ EXPECTATIONS = {
                 r"^\[heaptest\] free lists: \d+ blocks across \d+ of 17 classes",
                 re.M,
             ),
+            # What the run cost in physical memory, split between the
+            # heap's pages and the page tables that address them. Both
+            # come from the same reserve: a budget that covered the data
+            # but not the structure needed to reach it would not be one.
+            re.compile(
+                r"^\[heaptest\] reserve: \d+ KiB of \d+ MiB spent -- \d+ KiB "
+                r"of heap pages plus \d+ frames of page tables; the heap "
+                r"never returns a page",
+                re.M,
+            ),
             re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
-            re.compile(r"^\[boot\] M4 checks passed", re.M),
+            re.compile(r"^\[boot\] M5 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -577,6 +657,7 @@ EXPECTATIONS = {
         required=[
             *COMMON_BOOT_LINES,
             *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
             re.compile(r"^\[heaptest\] exhausting the heap", re.M),
             # The heap must actually grow on the way. Without this the
             # test would pass even if every allocation were optimised
@@ -597,7 +678,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             # A null return instead of a panic: out of memory must be loud.
             re.compile(r"returned null instead of panicking", re.M),
             # The heap handing out more than its limit would mean the bound
@@ -611,6 +692,7 @@ EXPECTATIONS = {
         required=[
             *COMMON_BOOT_LINES,
             *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
             re.compile(
                 r"^\[heaptest\] guard page test: writing to 0xffffc00004001000",
                 re.M,
@@ -625,8 +707,210 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"M5 checks passed", re.M),
             re.compile(r"the heap's upper guard page did not fault", re.M),
+        ],
+    ),
+    # --- M5: capabilities ------------------------------------------------
+    "captest": Expectation(
+        name="capability system",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            # 1. Object sizes, measured and printed, plus the alignment
+            #    rule retype's placement arithmetic depends on.
+            re.compile(
+                r"^\[captest\] sizes: slot 32 B, TCB 2048 B \(1024 ipc\), "
+                r"Endpoint 32 B, Notification 64 B",
+                re.M,
+            ),
+            re.compile(
+                r"^\[captest\] sizes: every alignment is a power of two >= size",
+                re.M,
+            ),
+            # 1b. The rights lattice, exhaustively. 81 of 256 pairs are
+            #     subsets -- 3^4, one choice of three per independent bit.
+            #     Requiring the figure rather than "some" means a check
+            #     that silently stopped testing would fail here.
+            re.compile(
+                r"^\[captest\] rights algebra: all 256 pairs checked against "
+                r"an independent definition; 81 subsets as predicted by 3\^4",
+                re.M,
+            ),
+            # 2. The root Untypeds, and the sum agreeing with what boot
+            #    counted separately.
+            re.compile(
+                r"^\[captest\] root untypeds: \d+ covering \d+ MiB, sizes \d+ "
+                r"KiB \.\. \d+ KiB, all power-of-two and self-aligned",
+                re.M,
+            ),
+            # 3. Three size classes retyped from one Untyped, and the new
+            #    CNode demonstrably zeroed.
+            re.compile(
+                r"^\[captest\] retype: CNode\(16\) \+ Endpoint \+ Frame; "
+                r"watermark \d+ -> \d+ \(\+\d+ B for \d+ B of objects\); the "
+                r"new CNode's 16 slots are all zero",
+                re.M,
+            ),
+            # 4. Atomicity: the watermark unmoved *and* the destination
+            #    slots untouched. Either alone could pass by luck.
+            re.compile(
+                r"^\[captest\] atomicity: 256 frames \(\d+ B\) refused by a "
+                r"\d+ B Untyped; watermark still \d+, all \d+ destination "
+                r"slots still empty",
+                re.M,
+            ),
+            # 5-6. Narrowing works and widening does not, through either
+            #      door -- copy or mint.
+            re.compile(
+                r"^\[captest\] copy: Endpoint R\|W\|G\|Gr -> W, same object",
+                re.M,
+            ),
+            re.compile(
+                r"^\[captest\] rights: W-only cap asked for R\|W -> "
+                r"RightsEscalation; asked to mint -> InsufficientRights\(GRANT\); "
+                r"destination untouched",
+                re.M,
+            ),
+            # 7-9. Every way a CPtr can fail gives its own error, so a
+            #      caller can tell a typo from a stale pointer.
+            re.compile(
+                r"^\[captest\] cptr: a valid pointer resolves; reserved-bits, "
+                r"out-of-range, wrong-type, empty-slot and stale-generation "
+                r"each give their own error",
+                re.M,
+            ),
+            # 10. The invariant the first draft of ADR 018 broke.
+            re.compile(
+                r"^\[captest\] cptr invariant: slot 0 was Endpoint gen \d+, is "
+                r"now Notification gen \d+; the old pointer gives StaleCPtr and "
+                r"never the new object; a wrong root generation is caught too",
+                re.M,
+            ),
+            # 11. Depth 8 reachable, depth 9 refused, nothing written.
+            re.compile(
+                r"^\[captest\] depth: chain reached 8 in \d+ copies; the next "
+                r"gave DerivationTooDeep and wrote nothing",
+                re.M,
+            ),
+            # 12. Device memory may only become a Frame -- every other
+            #     type checked individually.
+            re.compile(
+                r"^\[captest\] device untyped: Frame allowed and stays "
+                r"device-marked; all 7 other types refused with "
+                r"DeviceUntypedFrameOnly",
+                re.M,
+            ),
+            # 13. The distinction between delete and revoke, demonstrated
+            #     rather than asserted.
+            re.compile(
+                r"^\[captest\] delete vs revoke: delete removed 1 of 3 and the "
+                r"grandchild survived as a live R capability; revoke then "
+                r"removed that descendant and left the origin",
+                re.M,
+            ),
+            # 14. Revoke returns the memory, and the proof is that a new
+            #     object lands back where the old ones were.
+            re.compile(
+                r"^\[captest\] revoke: 8 descendants deleted in \d+ visits; "
+                r"Untyped survives, watermark \d+ -> \d+, a new object reused "
+                r"0x[0-9a-f]+ \(was 0x[0-9a-f]+\), old pointers return errors",
+                re.M,
+            ),
+            re.compile(r"^\[captest\] all capability tests passed", re.M),
+            re.compile(r"^\[boot\] M5 checks passed", re.M),
+        ],
+        forbidden=[
+            # Every invariant above is an assert, so a violation is a
+            # panic. Forbidding panics means a weakened in-kernel check
+            # cannot quietly become a pass.
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "caprevoke": Expectation(
+        name="revoke cost (measurement)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            # The tree must be both as wide as the CSpace allows and as
+            # deep as the cap permits. A shallower tree would be measuring
+            # something easier than the case ADR 019 estimated.
+            re.compile(
+                r"^\[captest\] tree: 256 capabilities from one Untyped, "
+                r"deepest level 8, \d+ chain restarts",
+                re.M,
+            ),
+            re.compile(
+                r"^\[captest\] revoke timing: 256 capabilities in \d+ TSC "
+                r"cycles \(\d+ cycles each, \d+ slots visited\)",
+                re.M,
+            ),
+            # The extrapolation must carry its caveats in the line itself.
+            # A bare millisecond figure from 256 samples under emulation
+            # would read as a measurement, and it is not one.
+            re.compile(
+                r"^\[captest\] extrapolated: 8400000 slots would be ~\d+ "
+                r"cycles, ~\d+ ms at 3 GHz -- extrapolated from 256 samples "
+                r"under emulation, not a measurement of the worst case",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "capintalloc": Expectation(
+        name="allocation from an interrupt",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            re.compile(
+                r"^\[captest\] interrupt depth is 1; calling allocate\(\) "
+                r"\(must panic\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            # The message must name the rule, not merely report a failure.
+            # "The allocator panicked" would be far less useful than
+            # "something allocated from an interrupt handler".
+            re.compile(
+                r"^\[PANIC\] frame allocation from inside an interrupt handler",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"the ADR 022 tripwire is not working", re.M),
+        ],
+    ),
+    "capretired": Expectation(
+        name="allocation after retirement",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            re.compile(
+                r"^\[captest\] allocator is retired; calling allocate\(\) "
+                r"\(must panic\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] frame allocation after the allocator was retired",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"the ADR 022 retirement check is not working", re.M),
         ],
     ),
 }

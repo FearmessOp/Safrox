@@ -45,17 +45,26 @@ ona bir Untyped cap'i geçirip sistemin bellek bütçesini bozabilirdi.
 yapılabilir ama o mesaj cap taşıyamaz. Taşımaya kalkarsa kernel cap
 alanlarını **sessizce boş bırakır** — hata vermez.
 
-Sessizlik bilinçli ve tartışmalı. Gerekçe: gönderen, alıcının ne
-beklediğini bilmek zorunda değil; mesajın geçerli bir mesaj olması
-yeterli. Alıcı cap bekliyorsa ve gelmemişse, bunu kendi protokolünde
-fark eder. Hata döndürmek, gönderene alıcının protokolü hakkında bilgi
-sızdırırdı.
+İki gerekçe, ikisi de mütevazı:
 
-*Alternatif düşünüldü:* `GRANT` yokken cap taşımaya kalkmak
-`InsufficientRights` dönsün. Bu, hata ayıklamayı kolaylaştırır. Ama IPC
-sıcak yolunda bir kontrol daha, ve "mesajım gitti mi" sorusunun cevabını
-gönderenin haklarına bağlıyor. seL4 de sessizce düşürür; aynısını
-yapıyoruz.
+1. **IPC sıcak yolunda bir kontrol daha istemiyoruz.** Cap alanlarının
+   dolu olup olmadığına bakıp hakla karşılaştırmak, her mesajda bir dal.
+   Düşürme zaten yapılması gereken işin bir parçası.
+2. **seL4 de böyle yapıyor.** Kanıtlanmış bir sistemle uyumsuz
+   davranmak için bir sebep gerekir; burada yok.
+
+*Alternatif:* `InsufficientRights` dönmek. Hata ayıklamayı
+kolaylaştırırdı. Yukarıdaki iki gerekçe ağır bastı — ama bunlar "kesin"
+değil, "yeterli" gerekçeler, ve M9'da IPC yazılırken yeniden
+bakılabilir.
+
+> **Düzeltme notu (M5 uygulama).** Bu bölümün ilk hâli şunu iddia
+> ediyordu: *"hata döndürmek, gönderene alıcının protokolü hakkında
+> bilgi sızdırırdı."* Yanlış. Gönderen kendi haklarını zaten biliyor;
+> `GRANT`'i olmadığını kernel'e sormasına gerek yok, kendi cap'ine
+> bakar. Sızan bir bilgi yok. Karar aynı kalıyor ama gerekçe
+> değiştirildi — zayıf bir gerekçe, sonradan yanlış bir yerde
+> savunulur.
 
 ### GRANTREPLY: neden dördüncü bir bit
 
@@ -189,7 +198,9 @@ kimlik doğrulamayı yok eder.
   yürüyüşü yok.
 - Yerinde daraltma yok. Yetki geri almanın yolu `revoke`.
 - `GRANT` olmadan IPC cap taşıyamaz; cap alanları **sessizce boş kalır**,
-  hata dönmez. Gerekçe: gönderene alıcının protokolünü sızdırmamak.
+  hata dönmez. Gerekçe: sıcak yolda bir dal daha istemiyoruz, ve seL4
+  ile uyum. (İlk yazılan "bilgi sızıntısı" gerekçesi yanlıştı ve
+  düzeltildi.)
 - `GRANTREPLY`, cevap hakkını tam GRANT vermeden taşıtıyor.
 - `mint` badge takar; badge bir kez takılır, değişmez, `GRANT` gerektirir.
 - Anlamsız hak kombinasyonları hata değil, etkisiz.
