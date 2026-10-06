@@ -448,6 +448,81 @@ dropping back could be a lie told by a counter; so the test records where
 the objects were, revokes, retypes again, and requires the new object to
 land at or below the old address.
 
+#### The occupied-slot refusal, and how it was found to be untested
+
+```
+[captest] occupied slot: retype, copy and mint all refuse with SlotNotEmpty;
+          the Endpoint occupant keeps its object, rights, depth and
+          generation, and still resolves
+[captest] partial overlap: a 4-object retype over slots 0..4 with slot 2
+          occupied wrote nothing, not even the 2 slots before the obstacle;
+          watermark still 131232
+```
+
+The first version of this suite did not test the emptiness check at all.
+Turning it into a no-op — deleting the `return Err(SlotNotEmpty)` and
+leaving the `if` — left all nineteen scenarios passing. The atomicity
+check above exercises only the `NotEnoughMemory` path, so nothing
+distinguished the guard from its own absence.
+
+Each operation is now checked for three things, and the third is the one
+that matters: the error, the unmoved watermark, and **the occupant still
+being the capability it was** — same object, rights, depth and
+generation, and still resolving through a CPtr. Asserting only that an
+error came back would not notice an implementation that wrote first and
+complained afterwards.
+
+The overlap check puts the obstacle in the **middle** of the range. "Refuse
+if the first slot is taken" is easy to satisfy by accident: an
+implementation that validated each slot immediately before writing it
+would pass that, and would still corrupt the slots preceding a later
+obstacle.
+
+Both checks were verified by mutation: each was watched failing against a
+deliberately broken kernel before being kept.
+
+#### The error paths nothing else reached
+
+Finding one untested guard raised the obvious question: how many others?
+Listing `CapError`'s fourteen variants against the ones `captest`
+mentions answered it — three were never produced by anything.
+
+```
+[captest] remaining errors: RootSlotMustBeCNode fires for a non-CNode root
+          slot; TooManyObjects at 257 but not at 256; InvalidArgument for
+          count 0, a sized Endpoint and a radix-0 CNode
+```
+
+`RootSlotMustBeCNode` was the serious one. It is the *only* enforcement
+of ADR 018's two-level rule, and that rule is half of the CPtr
+invariant — the half that does not depend on generation counters. With
+the check removed, a pointer through a root slot holding an Endpoint
+read the Endpoint's bytes as an array of slots and returned a "Null
+capability". The test now says so in those words.
+
+`TooManyObjects` is checked from both sides: 257 objects refused, 256
+*not* refused for that reason. A test that only exercised the failing
+side would pass against an implementation that refused everything.
+
+This produced a strengthening of ADR 023's rule K5. "At least one test
+per milestone verified by breaking it" is a numeric threshold; what is
+actually wanted is that *every* guard be distinguishable from its own
+absence:
+
+> If a function has N ways of returning `Err`, the acceptance test must
+> trigger all N. An error path that is never taken cannot be
+> distinguished from one that does not exist.
+
+The variant listing is a cheap way to check it, and it is what found
+these three.
+
+One last thing the new checks taught, at the cost of a failing run: the
+first version took the *last* root slot for its impostor, seeded it,
+deleted it, and so advanced its generation — which turned
+`check_cptr_errors`'s expected `EmptySlot` into a `StaleCPtr`. Two
+checks had been sharing a slot without saying so. The slot choice is
+now asserted rather than assumed.
+
 #### The CPtr invariant
 
 > A CPtr resolves to the same slot every time, or it returns an error.

@@ -23,6 +23,8 @@ pub fn run() {
     check_root_untypeds();
     check_retype();
     check_retype_atomicity();
+    check_slot_not_empty();
+    check_remaining_errors();
     check_copy_narrowing();
     check_rights_escalation();
     check_cptr_errors();
@@ -562,6 +564,447 @@ fn check_retype_atomicity() {
         "[captest] atomicity: {} frames ({} B) refused by a {} B Untyped; \
          watermark still {}, all {} destination slots still empty",
         count, needed, remaining, watermark_after, inspected
+    );
+}
+// ---- 4c. The error paths nothing else reaches --------------------------
+
+/// Trigger the `CapError` variants no other check produces.
+///
+/// ADR 023's rule, applied to itself: if a function has N ways of
+/// returning `Err`, the suite must reach all N. An error path that is
+/// never taken cannot be distinguished from one that does not exist --
+/// which is exactly how `SlotNotEmpty` went untested until a mutation
+/// found it.
+///
+/// Listing `CapError`'s variants against the ones `captest` mentions
+/// showed three gaps. The most serious is `RootSlotMustBeCNode`: it is
+/// the *only* enforcement of ADR 018's two-level rule, and the rule is
+/// half of the CPtr invariant.
+fn check_remaining_errors() {
+    clear_objects();
+    let space = boot::init_cspace();
+    let cnode = object_cnode();
+    let parent = scratch_slot();
+
+    // --- RootSlotMustBeCNode --------------------------------------------
+    //
+    // A root slot holding something other than a CNode. This cannot
+    // happen through any ordinary operation -- boot is the only thing
+    // that writes the root, and it writes CNodes -- so the test builds
+    // the situation directly with `seed_root`, which is the same door
+    // boot uses.
+    //
+    // Without this check, a CPtr's two index fields would mean
+    // different things depending on what the root slot happened to
+    // hold, which is the ambiguity ADR 018 exists to remove.
+
+    // A spare root slot. Not the last one: `check_cptr_errors` uses
+    // that to produce `EmptySlot`, and seeding and deleting here would
+    // advance its generation and turn that check's `EmptySlot` into a
+    // `StaleCPtr`. Which it did, on the first run -- the two checks
+    // were sharing a slot without saying so.
+    let spare = space.root_slots() - 2;
+    // SAFETY: Index in range; boot filled only slots 0 and 1.
+    let root_slot = unsafe { space.root_slot(spare) };
+    assert!(
+        root_slot.is_empty(),
+        "root slot {} was expected to be unused by boot",
+        spare
+    );
+    assert!(
+        spare > boot::ROOT_SLOT_OBJECTS && spare != space.root_slots() - 1,
+        "the spare root slot {} collides with one another check depends on",
+        spare
+    );
+
+    // An Endpoint to put there. It needs an object address, and any
+    // valid one will do -- the check under test looks at the type.
+    // SAFETY: Live Untyped and CNode; slot 0 empty after clearing.
+    unsafe { untyped::retype(parent, CapType::Endpoint, 0, 1, &cnode, 0) }
+        .expect("retype the impostor");
+    // SAFETY: Index in range.
+    let impostor = unsafe { cnode.slot(0) }.object();
+
+    // SAFETY: The slot is live and empty, and this test owns the root
+    // CNode's spare slots. Undone immediately below.
+    unsafe {
+        cnode::seed_root(
+            root_slot,
+            impostor,
+            CapType::Endpoint,
+            Rights::ALL,
+            0,
+            false,
+        )
+    }
+    .expect("could not seed the impostor into a root slot");
+
+    let through_impostor = CPtr::new(spare as u16, root_slot.generation(), 0, 0);
+    // SAFETY: Live CSpace.
+    match unsafe { cptr::resolve(&space, through_impostor) } {
+        Err(CapError::RootSlotMustBeCNode) => {}
+        Ok(resolved) => panic!(
+            "a CPtr through a root slot holding an Endpoint resolved to a \
+             {}; ADR 018's two-level rule is not enforced",
+            resolved.cap_type()
+        ),
+        other => panic!("expected RootSlotMustBeCNode, got {:?}", other),
+    }
+
+    // Put the root back as it was. Leaving an Endpoint in the root would
+    // break every later check that walks the CSpace.
+    // SAFETY: The slot is live and this test placed what is in it.
+    unsafe { cnode::delete(root_slot) }.expect("could not remove the impostor");
+    assert!(root_slot.is_empty(), "the root slot was not restored");
+
+    // --- TooManyObjects --------------------------------------------------
+    //
+    // The bound exists so that one retype cannot occupy the CPU for an
+    // unbounded time (ADR 020). Asking for exactly one more than the
+    // limit proves the comparison is `>` and not `>=`, which an
+    // off-by-one would get wrong in a way no other test would see.
+    let over = crate::cap::RETYPE_MAX_COUNT + 1;
+    // SAFETY: Live Untyped and CNode; expected to fail.
+    match unsafe { untyped::retype(parent, CapType::Frame, 0, over, &cnode, 0) } {
+        Err(CapError::TooManyObjects { count }) => assert_eq!(count, over),
+        other => panic!(
+            "expected TooManyObjects for {} objects, got {:?}",
+            over, other
+        ),
+    }
+
+    // And exactly the limit must *not* be refused for this reason. A
+    // test that only checked the failing side would pass against an
+    // implementation that refused everything.
+    // SAFETY: Live Untyped and CNode. This may legitimately fail for
+    // lack of memory; what it must not do is report TooManyObjects.
+    let at_limit = unsafe {
+        untyped::retype(
+            parent,
+            CapType::Frame,
+            0,
+            crate::cap::RETYPE_MAX_COUNT,
+            &cnode,
+            0,
+        )
+    };
+    assert!(
+        !matches!(at_limit, Err(CapError::TooManyObjects { .. })),
+        "a retype of exactly RETYPE_MAX_COUNT was refused as TooManyObjects; \
+         the comparison is off by one"
+    );
+
+    // --- InvalidArgument -------------------------------------------------
+    //
+    // Three separate ways to be malformed, each a different branch in
+    // `retype`'s phase one.
+    clear_objects();
+
+    // (a) Zero objects. Not an error of degree but of kind: a retype
+    //     that creates nothing has no meaning, and silently succeeding
+    //     would leave the caller believing it had an object.
+    // SAFETY: Live Untyped and CNode; expected to fail.
+    match unsafe { untyped::retype(parent, CapType::Frame, 0, 0, &cnode, 0) } {
+        Err(CapError::InvalidArgument) => {}
+        other => panic!("expected InvalidArgument for count 0, got {:?}", other),
+    }
+
+    // (b) A size given for a fixed-size type. Accepting it would mean
+    //     the caller and the kernel disagree about how big the object
+    //     is, which is worse than refusing.
+    // SAFETY: Live Untyped and CNode; expected to fail.
+    match unsafe { untyped::retype(parent, CapType::Endpoint, 7, 1, &cnode, 0) } {
+        Err(CapError::InvalidArgument) => {}
+        other => panic!(
+            "expected InvalidArgument for a sized Endpoint, got {:?}",
+            other
+        ),
+    }
+
+    // (c) A CNode of radix 0. One slot is not a CNode in any useful
+    //     sense, and `object_layout` refuses it.
+    // SAFETY: Live Untyped and CNode; expected to fail.
+    match unsafe { untyped::retype(parent, CapType::CNode, 0, 1, &cnode, 0) } {
+        Err(CapError::InvalidArgument) => {}
+        other => panic!(
+            "expected InvalidArgument for a radix-0 CNode, got {:?}",
+            other
+        ),
+    }
+
+    // Nothing above wrote anything.
+    // SAFETY: Index in range.
+    let untouched = unsafe { cnode.slot(0) }.is_empty();
+    assert!(untouched, "a malformed retype still wrote a capability");
+
+    println!(
+        "[captest] remaining errors: RootSlotMustBeCNode fires for a \
+         non-CNode root slot; TooManyObjects at {} but not at {}; \
+         InvalidArgument for count 0, a sized Endpoint and a radix-0 CNode",
+        over,
+        crate::cap::RETYPE_MAX_COUNT
+    );
+}
+
+// ---- 4b. The occupied-slot refusal -------------------------------------
+
+/// A destination that is already occupied is refused, by every operation
+/// that writes a capability, and the occupant survives untouched.
+///
+/// This check exists because it was missing. `check_retype_atomicity`
+/// above exercises only the `NotEnoughMemory` path; deleting the
+/// emptiness check in `retype`'s phase one -- turning it into a no-op --
+/// left the whole suite passing. A guard that no test can distinguish
+/// from its own absence is not being tested.
+///
+/// Three things are asserted for each operation, and the third is the
+/// one that matters: the error, the watermark, and *the occupant still
+/// being the capability it was*. Checking only that an error came back
+/// would not notice an implementation that wrote first and complained
+/// afterwards.
+fn check_slot_not_empty() {
+    clear_objects();
+    let cnode = object_cnode();
+    let parent = scratch_slot();
+
+    // An Endpoint in slot 0 to be the occupant, and a Notification in
+    // slot 1 to copy from. Different types, so that a capability
+    // overwritten by the wrong one is visible rather than ambiguous.
+    // SAFETY: Live Untyped and CNode; slots empty after clearing.
+    unsafe {
+        untyped::retype(parent, CapType::Endpoint, 0, 1, &cnode, 0).expect("retype Endpoint");
+        untyped::retype(parent, CapType::Notification, 0, 1, &cnode, 1)
+            .expect("retype Notification");
+    }
+
+    // What the occupant is, recorded so it can be compared afterwards.
+    // SAFETY: Index in range.
+    let occupant = unsafe { cnode.slot(0) };
+    let occupant_object = occupant.object();
+    let occupant_type = occupant.cap_type();
+    let occupant_rights = occupant.rights();
+    let occupant_generation = occupant.generation();
+    let occupant_depth = occupant.depth();
+    assert_eq!(occupant_type, CapType::Endpoint, "test fixture changed");
+
+    // Everything about the occupant that must not move. Compared as a
+    // group rather than one field at a time, so that a partial
+    // overwrite -- type changed but object kept, say -- cannot slip
+    // through a check that only looked at one of them.
+    let assert_occupant_intact = |operation: &str| {
+        // SAFETY: Index in range.
+        let slot = unsafe { cnode.slot(0) };
+        assert!(
+            !slot.is_empty(),
+            "{} emptied the occupied destination slot",
+            operation
+        );
+        assert_eq!(
+            slot.cap_type(),
+            occupant_type,
+            "{} changed the occupant's type to {}",
+            operation,
+            slot.cap_type()
+        );
+        assert_eq!(
+            slot.object(),
+            occupant_object,
+            "{} changed the occupant's object to {}",
+            operation,
+            slot.object()
+        );
+        assert_eq!(
+            slot.rights(),
+            occupant_rights,
+            "{} changed the occupant's rights",
+            operation
+        );
+        assert_eq!(
+            slot.depth(),
+            occupant_depth,
+            "{} changed the occupant's depth",
+            operation
+        );
+        assert_eq!(
+            slot.generation(),
+            occupant_generation,
+            "{} advanced the occupant's generation, which would invalidate \
+             every live CPtr to it",
+            operation
+        );
+    };
+
+    // --- retype into an occupied slot -----------------------------------
+
+    // SAFETY: Live Untyped.
+    let watermark_before = unsafe { Untyped::from_slot(parent) }.unwrap().watermark();
+
+    // SAFETY: Live Untyped and CNode; slot 0 is occupied, so this must
+    // fail.
+    match unsafe { untyped::retype(parent, CapType::Frame, 0, 1, &cnode, 0) } {
+        Err(CapError::SlotNotEmpty) => {}
+        other => panic!(
+            "retype into an occupied slot returned {:?} instead of \
+             SlotNotEmpty",
+            other
+        ),
+    }
+    assert_occupant_intact("retype");
+
+    // SAFETY: Live Untyped.
+    let watermark_after = unsafe { Untyped::from_slot(parent) }.unwrap().watermark();
+    assert_eq!(
+        watermark_after, watermark_before,
+        "a retype refused for SlotNotEmpty still moved the watermark from \
+         {} to {}; the memory it would have used is now unreachable",
+        watermark_before, watermark_after
+    );
+
+    // The occupant is not merely unchanged in its fields -- it still
+    // resolves and still answers to its own type. That is what "usable"
+    // means for a capability.
+    let space = boot::init_cspace();
+    // SAFETY: Valid indices.
+    let cptr = unsafe { cptr::address_of(&space, boot::ROOT_SLOT_OBJECTS, 0) }
+        .expect("could not address the occupant");
+    // SAFETY: Live CSpace.
+    let resolved = unsafe { cptr::resolve_typed(&space, cptr, CapType::Endpoint) }
+        .expect("the occupant no longer resolves as an Endpoint");
+    assert_eq!(resolved.object(), occupant_object);
+
+    // --- copy into an occupied slot -------------------------------------
+
+    // SAFETY: Live slots; the source is the Notification in slot 1, the
+    // destination the occupied slot 0.
+    match unsafe { cnode::copy(cnode.slot(1), cnode.slot(0), Rights::READ) } {
+        Err(CapError::SlotNotEmpty) => {}
+        other => panic!(
+            "copy into an occupied slot returned {:?} instead of \
+             SlotNotEmpty",
+            other
+        ),
+    }
+    assert_occupant_intact("copy");
+
+    // --- mint into an occupied slot -------------------------------------
+
+    // The source needs GRANT, which a freshly retyped object has, so
+    // this reaches the emptiness check rather than stopping earlier on
+    // rights. A test that failed for the wrong reason would pass just
+    // as happily.
+    // SAFETY: Index in range.
+    let source_can_mint = unsafe { cnode.slot(1) }.rights().contains(Rights::GRANT);
+    assert!(
+        source_can_mint,
+        "the mint source lacks GRANT, so this check would stop at the \
+         rights test and never reach the emptiness test"
+    );
+    // SAFETY: Live slots, distinct.
+    match unsafe { cnode::mint(cnode.slot(1), cnode.slot(0), Rights::READ, 42) } {
+        Err(CapError::SlotNotEmpty) => {}
+        other => panic!(
+            "mint into an occupied slot returned {:?} instead of \
+             SlotNotEmpty",
+            other
+        ),
+    }
+    assert_occupant_intact("mint");
+
+    println!(
+        "[captest] occupied slot: retype, copy and mint all refuse with \
+         SlotNotEmpty; the {} occupant keeps its object, rights, depth and \
+         generation, and still resolves",
+        occupant_type
+    );
+
+    check_partial_overlap();
+}
+
+/// A multi-object retype whose destination range is *partly* occupied
+/// must write nothing at all.
+///
+/// Separated from the check above because it tests a different claim.
+/// "Refuse if the first slot is taken" is easy to get right by accident:
+/// an implementation that validated each slot immediately before writing
+/// it would pass that, and would still corrupt a range whose occupied
+/// slot comes later. So the occupant is placed in the *middle*.
+fn check_partial_overlap() {
+    clear_objects();
+    let cnode = object_cnode();
+    let parent = scratch_slot();
+
+    const COUNT: usize = 4;
+    const BASE: usize = 0;
+    const OCCUPIED: usize = BASE + 2;
+
+    // One Endpoint in the middle of the range a four-Frame retype would
+    // want.
+    // SAFETY: Live Untyped and CNode; slots empty after clearing.
+    unsafe { untyped::retype(parent, CapType::Endpoint, 0, 1, &cnode, OCCUPIED) }
+        .expect("retype the obstacle");
+
+    // SAFETY: Index in range.
+    let obstacle_object = unsafe { cnode.slot(OCCUPIED) }.object();
+
+    // SAFETY: Live Untyped.
+    let watermark_before = unsafe { Untyped::from_slot(parent) }.unwrap().watermark();
+
+    // SAFETY: Live Untyped and CNode; slot OCCUPIED is taken, so this
+    // must fail.
+    match unsafe { untyped::retype(parent, CapType::Frame, 0, COUNT, &cnode, BASE) } {
+        Err(CapError::SlotNotEmpty) => {}
+        other => panic!(
+            "a {}-object retype straddling an occupied slot returned {:?} \
+             instead of SlotNotEmpty",
+            COUNT, other
+        ),
+    }
+
+    // Nothing in the range was written -- not the slots before the
+    // obstacle, which an incremental implementation would have filled,
+    // and not the ones after.
+    for index in BASE..BASE + COUNT {
+        // SAFETY: Index in range.
+        let slot = unsafe { cnode.slot(index) };
+        if index == OCCUPIED {
+            assert_eq!(
+                slot.cap_type(),
+                CapType::Endpoint,
+                "the obstacle at slot {} was overwritten with a {}",
+                index,
+                slot.cap_type()
+            );
+            assert_eq!(slot.object(), obstacle_object, "the obstacle moved");
+        } else {
+            assert!(
+                slot.is_empty(),
+                "slot {} holds a {} after a retype that was refused; the \
+                 operation wrote before it finished validating",
+                index,
+                slot.cap_type()
+            );
+        }
+    }
+
+    // SAFETY: Live Untyped.
+    let watermark_after = unsafe { Untyped::from_slot(parent) }.unwrap().watermark();
+    assert_eq!(
+        watermark_after, watermark_before,
+        "a retype refused part-way through its range moved the watermark \
+         from {} to {}",
+        watermark_before, watermark_after
+    );
+
+    println!(
+        "[captest] partial overlap: a {}-object retype over slots {}..{} \
+         with slot {} occupied wrote nothing, not even the {} slots before \
+         the obstacle; watermark still {}",
+        COUNT,
+        BASE,
+        BASE + COUNT,
+        OCCUPIED,
+        OCCUPIED - BASE,
+        watermark_after
     );
 }
 

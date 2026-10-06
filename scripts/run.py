@@ -764,6 +764,50 @@ EXPECTATIONS = {
                 r"slots still empty",
                 re.M,
             ),
+            # 4b. An occupied destination is refused by every operation
+            #     that writes a capability, and the occupant survives
+            #     intact.
+            #
+            #     This was missing from the first version of the suite.
+            #     Deleting retype's emptiness check -- turning it into a
+            #     no-op -- left all nineteen scenarios passing, which
+            #     means the check was not being tested at all. The
+            #     atomicity line above exercises only the
+            #     NotEnoughMemory path.
+            re.compile(
+                r"^\[captest\] occupied slot: retype, copy and mint all "
+                r"refuse with SlotNotEmpty; the Endpoint occupant keeps its "
+                r"object, rights, depth and generation, and still resolves",
+                re.M,
+            ),
+            #     The obstacle goes in the *middle* of the range.
+            #     "Refuse if the first slot is taken" is easy to satisfy
+            #     by accident: an implementation that validated each
+            #     slot immediately before writing it would pass that and
+            #     still corrupt the slots preceding a later obstacle.
+            re.compile(
+                r"^\[captest\] partial overlap: a 4-object retype over slots "
+                r"0\.\.4 with slot 2 occupied wrote nothing, not even the 2 "
+                r"slots before the obstacle; watermark still \d+",
+                re.M,
+            ),
+            # 4c. The error paths nothing else reaches.
+            #
+            #     Listing CapError's variants against the ones captest
+            #     mentions showed three were never produced. The most
+            #     serious is RootSlotMustBeCNode: it is the *only*
+            #     enforcement of ADR 018's two-level rule, and that rule
+            #     is half of the CPtr invariant. With it removed, a
+            #     pointer through an Endpoint-holding root slot read the
+            #     Endpoint's bytes as a slot array and returned a "Null
+            #     capability".
+            re.compile(
+                r"^\[captest\] remaining errors: RootSlotMustBeCNode fires "
+                r"for a non-CNode root slot; TooManyObjects at 257 but not "
+                r"at 256; InvalidArgument for count 0, a sized Endpoint and "
+                r"a radix-0 CNode",
+                re.M,
+            ),
             # 5-6. Narrowing works and widening does not, through either
             #      door -- copy or mint.
             re.compile(

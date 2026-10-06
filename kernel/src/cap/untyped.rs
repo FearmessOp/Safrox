@@ -263,6 +263,12 @@ pub unsafe fn retype(
     if dest_offset.saturating_add(count) > dest.len() {
         return Err(CapError::CPtrOutOfRange);
     }
+    // Every one of them, not just the first. An implementation that
+    // checked each slot immediately before writing it would corrupt a
+    // range whose occupied slot comes later, so the whole range is
+    // validated here, in phase one, before anything is written.
+    // `check_partial_overlap` in captest puts the obstacle in the
+    // middle for exactly this reason.
     for index in 0..count {
         // SAFETY: Range checked immediately above.
         let slot = unsafe { dest.slot(dest_offset + index) };

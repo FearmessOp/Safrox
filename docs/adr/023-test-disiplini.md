@@ -163,9 +163,42 @@ Geçmiş örnekler:
 - M3: `__writable_start` yanlış yere taşındı → `check_kernel.py` yakaladı.
 - M3: `invlpg` + `mfence` silindi → **hiçbir test kırılmadı**, ki bu da
   bir bulgu ([hardware-todo.md](../hardware-todo.md)).
+- M5: `retype`'ın boş-slot kontrolü no-op'a çevrildi → **on dokuz
+  senaryonun hepsi geçti.** Aşağıya bakın.
 
 Üçüncüsü kuralın değerini gösteriyor: bozma denemesi, testin *yetersiz*
 olduğunu da ortaya çıkarabilir.
+
+### K5'in M5'te kaçırdığı şey — ve kuralın güçlendirilmesi
+
+M5'in ilk teslimi K5'e uyuyordu: bir test bozularak doğrulanmıştı.
+Doğrulanmamış olan, `retype`'ın faz 1'indeki `SlotNotEmpty` kontrolüydü.
+`return Err(...)` silindiğinde hiçbir şey kırılmadı — çünkü mevcut
+atomiklik testi yalnızca `NotEnoughMemory` yolunu zorluyordu ve dolu bir
+slot'a hiç retype denenmiyordu.
+
+Bu, K5'in lafzına değil ruhuna aykırı. "Milestone başına en az bir test"
+sayısal bir eşik; asıl istenen, **her koruyucunun** kendi yokluğundan
+ayırt edilebilmesi. K5 şöyle genişletiliyor:
+
+> Bir fonksiyon `Err` döndüren N farklı yola sahipse, kabul testi o N
+> yolun her birini en az bir kez tetiklemelidir. Tetiklenmeyen bir hata
+> yolu, var olmayan bir hata yolundan ayırt edilemez.
+
+Pratik karşılığı ucuz: `CapError`'ın her varyantını `captest` içinde
+aratmak, hangi hatanın hiç üretilmediğini gösterir. M5'te bu
+`SlotNotEmpty`'yi ortaya çıkarırdı.
+
+İkinci bir ders de var, bu sefer testin *şekline* dair. Dolu slot
+kontrolü eklenirken ilk akla gelen "ilk slot'u doldur, retype iste"
+olurdu. Bu, slot'u yazmadan hemen önce denetleyen bir gerçeklemeyi de
+geçirirdi — ve öyle bir gerçekleme, engelden *önceki* slot'ları yazıp
+bozardı. Bu yüzden `check_partial_overlap` engeli aralığın **ortasına**
+koyuyor:
+
+> Bir toplu işlemin atomikliğini sınarken, engeli ilk öğeye değil
+> ortaya koyun. İlk öğe, artımlı bir gerçeklemenin de geçeceği tek
+> konumdur.
 
 ## Elenen alternatifler
 

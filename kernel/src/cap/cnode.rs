@@ -337,6 +337,10 @@ pub unsafe fn copy(src: &mut Slot, dest: &mut Slot, rights: Rights) -> Result<()
     if src.is_empty() {
         return Err(CapError::EmptySlot);
     }
+    // Overwriting an occupied slot would destroy a capability without
+    // unlinking it, leaving the derivation list pointing at a slot that
+    // no longer belongs to it. `mint` inherits this check by calling
+    // `copy`; `captest::check_slot_not_empty` exercises both.
     if !dest.is_empty() {
         return Err(CapError::SlotNotEmpty);
     }
