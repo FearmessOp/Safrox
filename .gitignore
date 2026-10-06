@@ -1,0 +1,11 @@
+# Cargo build output
+/target/
+
+# ISO images, the copied kernel ELF, captured serial logs
+/build/
+
+# Vendored bootloader; fetched automatically by `make`
+/third_party/
+
+# Cargo.lock is committed: the kernel is a binary, and a reproducible build
+# needs pinned dependency versions.

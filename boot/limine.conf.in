@@ -1,0 +1,27 @@
+# PythOS boot configuration template (Limine v9, `limine` protocol).
+#
+# The build generates one concrete limine.conf per ISO by substituting
+# @DEFAULT_ENTRY@:
+#   1 -> normal boot      (build/pythos.iso)
+#   2 -> panic test boot  (build/pythos-panic.iso)
+#
+# Both ISOs embed the exact same kernel.elf, so the negative test exercises
+# the shipping binary rather than a special build.
+#
+# timeout: 0 boots the default entry instantly and keeps menu chatter out of
+# the serial log, which the test runner parses.
+
+timeout: 0
+default_entry: @DEFAULT_ENTRY@
+verbose: no
+
+/PythOS (normal boot)
+    comment: Prints boot info, then exits QEMU with host status 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+
+/PythOS (panic test)
+    comment: Same kernel; cmdline triggers a deliberate panic (host status 35).
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: panic-test

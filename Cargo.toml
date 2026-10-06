@@ -1,0 +1,67 @@
+# trim-paths rewrites absolute build paths out of the binary. Still unstable,
+# and we are pinned to nightly anyway for -Z build-std.
+cargo-features = ["trim-paths"]
+
+[package]
+name = "pythos"
+version = "0.1.0"
+edition = "2021"
+description = "A capability-based microkernel for x86-64"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "pythos"
+path = "kernel/src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# Limine boot protocol bindings. Only the request/response structures are
+# used; no allocation, no std.
+limine = "0.6"
+
+# Warnings are denied here rather than through RUSTFLAGS. Cargo replaces,
+# rather than merges, `[target.*.rustflags]` when RUSTFLAGS is set in the
+# environment -- so denying warnings that way would silently drop the linker
+# script in .cargo/config.toml and produce a kernel linked at address 0 that
+# never boots. `[lints]` composes safely and needs no environment variable.
+[lints.rust]
+warnings = "deny"
+# Operations inside an `unsafe fn` do not get an implicit unsafe block; each
+# must be wrapped explicitly, which is what forces a `// SAFETY:` comment to
+# sit next to the operation it justifies.
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+# Every `unsafe` block must carry a `// SAFETY:` comment. Enforced by the
+# compiler rather than by review.
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+panic = "abort"
+# Overflow checks stay on: in a kernel a silent wrap is worse than a loud
+# panic, and our panic handler reports file:line over the serial port.
+overflow-checks = true
+debug = true
+# See the note on the release profile.
+trim-paths = "all"
+
+[profile.release]
+panic = "abort"
+# Keep overflow checks even in release. The kernel is the entire TCB; a
+# wrapped index here is a security bug, not a performance question.
+overflow-checks = true
+debug = true
+# One codegen unit lets the linker see the whole kernel at once, which keeps
+# the .limine_requests placement predictable.
+codegen-units = 1
+opt-level = 2
+lto = false
+# Rewrite absolute build paths (workspace, registry, toolchain) to stable
+# relative ones. `panic!()` embeds `file!()`, so without this the serial
+# panic output would name the builder's home directory and the acceptance
+# test would be asserting on it. Also makes the build reproducible.
+# scripts/check_kernel.py fails the build if an absolute path survives.
+trim-paths = "all"
