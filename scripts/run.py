@@ -61,6 +61,14 @@ def describe_status(status: int) -> str:
     return "unexpected status"
 
 
+# The kernel prints this exactly once per boot. Seeing it twice means the
+# machine reset and started over -- the signature of a triple fault, which
+# `-no-reboot` is supposed to turn into a clean exit instead. Every scenario
+# is checked for this, because "it eventually printed the right thing, after
+# rebooting" is not passing.
+BANNER = re.compile(r"^PythOS \S+", re.M)
+
+
 @dataclass
 class Expectation:
     """What a given test mode requires of a run."""
@@ -71,30 +79,106 @@ class Expectation:
     forbidden: list[re.Pattern[str]]
 
 
+# Lines every successful boot must carry, whatever the scenario: the kernel
+# identifies itself, Limine identifies itself, and the kernel reports where
+# it was loaded.
+COMMON_BOOT_LINES = [
+    re.compile(r"^PythOS \S+", re.M),  # name/version
+    re.compile(r"^\[boot\] bootloader: \S+ \S+", re.M),  # from Limine
+    re.compile(r"^\[boot\] higher-half base: 0xffffffff[0-9a-f]+", re.M),
+]
+
+# M1 brings up its own descriptor tables before any fault can be injected,
+# so these must appear in every scenario too.
+CPU_INIT_LINES = [
+    re.compile(r"^\[cpu\] gdt: loaded", re.M),
+    re.compile(r"^\[cpu\] idt: 32 exception vectors installed", re.M),
+]
+
 # Lines the acceptance test demands on the serial console.
 EXPECTATIONS = {
     "success": Expectation(
         name="normal boot",
         status=STATUS_SUCCESS,
         required=[
-            re.compile(r"^PythOS \S+", re.M),                       # name/version
-            re.compile(r"^\[boot\] bootloader: \S+ \S+", re.M),     # from Limine
-            re.compile(r"^\[boot\] higher-half base: 0xffffffff[0-9a-f]+", re.M),
-            re.compile(r"^\[boot\] M0 checks passed", re.M),
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            re.compile(r"^\[boot\] M1 checks passed", re.M),
         ],
-        forbidden=[re.compile(r"KERNEL PANIC", re.M)],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
     ),
     "panic": Expectation(
         name="panic test",
         status=STATUS_PANIC,
         required=[
+            *COMMON_BOOT_LINES,
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             # The panic must name a real source file and line, not just say
             # "something went wrong". Rust's PanicInfo gives file:line:column.
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M0 checks passed", re.M)],
+        forbidden=[re.compile(r"M1 checks passed", re.M)],
+    ),
+    # --- M1: exception scenarios ----------------------------------------
+    "int3": Expectation(
+        name="breakpoint (#BP)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            re.compile(r"^\*\*\* EXCEPTION: #BP breakpoint \(vector 3\) \*\*\*", re.M),
+            # RIP must be a real higher-half kernel address, not 0 or junk:
+            # this is what shows the frame was decoded correctly.
+            re.compile(r"^\[trap\] error_code=0x0{16}\s+rip=0xffffffff[0-9a-f]{8}", re.M),
+            re.compile(r"^\[trap\] #BP is a trap; resuming at rip=0xffffffff", re.M),
+            # The whole point: the handler returned and the kernel carried on.
+            re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
+            re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
+            re.compile(r"^\[boot\] M1 checks passed", re.M),
+        ],
+        forbidden=[re.compile(r"KERNEL PANIC", re.M)],
+    ),
+    "pf": Expectation(
+        name="page fault (#PF)",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            re.compile(r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\) \*\*\*", re.M),
+            # Error code 0x2 = not-present (bit 0 clear), write (bit 1 set),
+            # supervisor (bit 2 clear).
+            re.compile(r"^\[trap\] error_code=0x0{15}2\b", re.M),
+            # CR2 must hold the exact address the kernel tried to write.
+            re.compile(r"^\[trap\] cr2=0x0000600000000000\s+\(supervisor write not-present\)", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
+        ],
+        forbidden=[re.compile(r"M1 checks passed", re.M)],
+    ),
+    "df": Expectation(
+        name="double fault (#DF)",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            re.compile(r"^\[cpu\] ist1: 0xffffffff[0-9a-f]+ \.\. 0xffffffff", re.M),
+            re.compile(r"^\*\*\* EXCEPTION: #DF double fault \(vector 8\) \*\*\*", re.M),
+            # The kernel checks for itself that it is running on IST1 and
+            # says so. "ok" is the only accepted answer; the alternative
+            # branch prints "NOT ACTIVE", which `forbidden` also rejects.
+            # Anchored with \s*$ rather than $: the serial driver emits CRLF,
+            # so a bare $ would have to match before a stray \r.
+            re.compile(r"^\[trap\] IST1: ok\s*$", re.M),
+            re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M1 checks passed", re.M),
+            re.compile(r"IST1: NOT ACTIVE", re.M),
+        ],
     ),
 }
 
@@ -182,6 +266,30 @@ def main() -> int:
     print("-" * 68)
 
     failures: list[str] = []
+
+    # Triple-fault check, applied to every scenario.
+    #
+    # A triple fault resets the machine. With `-no-reboot` QEMU is supposed
+    # to terminate instead, but if that flag were ever dropped -- or if the
+    # firmware restarted us some other way -- the kernel would simply boot
+    # again and might then print everything the test expects. Counting the
+    # banner catches that: the kernel emits it exactly once per boot, so two
+    # occurrences mean we went round twice.
+    #
+    # This matters most for the #DF scenario: without a working IST, the
+    # double fault escalates to a triple fault, and a reboot loop is exactly
+    # what we would see.
+    boot_count = len(BANNER.findall(output))
+    if boot_count > 1:
+        failures.append(
+            f"kernel banner appeared {boot_count} times: the machine reset "
+            f"and re-booted (triple fault), it did not run once cleanly"
+        )
+    elif boot_count == 0:
+        failures.append(
+            "kernel banner never appeared: the kernel did not reach its "
+            "first serial write"
+        )
 
     if timed_out:
         failures.append(

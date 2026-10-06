@@ -3,9 +3,10 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M0 — Bootstrap.** The kernel boots, identifies itself and
-its boot environment on the serial console, reports panics with their source
-location, and terminates QEMU with a status the host test runner can decode.
+**Current milestone: M1 — CPU structures.** The kernel installs its own GDT,
+TSS and IDT, catches all 32 CPU exceptions and reports them with full machine
+state, and handles a double fault on a dedicated IST stack so that a broken
+stack pointer cannot escalate into a silent machine reset.
 
 ## Quick start
 
@@ -43,9 +44,12 @@ cloned into `third_party/` automatically.
 | --- | --- |
 | `make` / `make all` | Build the kernel and both ISO images |
 | `make kernel` | Build and statically verify the kernel ELF only |
-| `make run` | Boot the normal ISO; **must** exit with host status 33 |
-| `make run-panic` | Boot the panic ISO; **must** exit with host status 35 |
-| `make test` | Both of the above, plus the runner's own self-test |
+| `make run` | Normal boot; **must** exit 33 |
+| `make run-panic` | Deliberate panic; **must** exit 35 |
+| `make run-int3` | `int3` → #BP, handler *returns*; **must** exit 33 |
+| `make run-pf` | Unmapped write → #PF with CR2; **must** exit 35 |
+| `make run-df` | Corrupt RSP → #DF on IST1; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all five scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -53,34 +57,84 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M0 acceptance criteria
+## M1 acceptance criteria
 
-### Positive path — `make run`
+Five scenarios, all booting the **same** `kernel.elf` through different
+Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
-Boots `build/pythos.iso` and requires all of the following on COM1:
+### Normal boot — `make run`, exit 33
 
 ```
-PythOS 0.1.0-M0
+PythOS 0.1.0-M1
 [boot] serial: COM1 115200 8N1 (self-test ok)
 [boot] bootloader: Limine 9.6.7
-[boot] higher-half base: 0xffffffff80000000 (phys 0xfc2c000, slide 0xffffffff703d4000)
-[boot] hhdm offset: 0xffff800000000000
-[boot] stack: 64 KiB (granted)
-[boot] image: 0xffffffff80000000 .. 0xffffffff8000b000 (44 KiB)
-[boot] bss:   0xffffffff8000a008 .. 0xffffffff8000a00a
+[boot] higher-half base: 0xffffffff80000000 (phys 0xfc12000, slide 0xffffffff703ee000)
 [boot] cmdline: <none>
-[boot] M0 checks passed
+[cpu] gdt: loaded (cs=0x0008, ds=0x0010, tss armed)
+[cpu] ist1: 0xffffffff8000b070 .. 0xffffffff8000f070 (16 KiB) for #DF
+[cpu] idt: 32 exception vectors installed, #DF on IST1
+[boot] M1 checks passed
 [boot] exiting QEMU (write 0x10 -> exit status 33)
 ```
 
-The kernel then writes `0x10` to the `isa-debug-exit` port and QEMU exits with
-**host status 33**.
+### Breakpoint — `make run-int3`, exit 33
 
-### Negative path — `make run-panic`
+#BP is a *trap*: the CPU saves the address of the instruction *after*
+`int3`, so the handler can `iretq` and execution simply continues. This is
+the scenario that proves the dispatcher returns correctly, rather than
+merely surviving.
 
-Boots `build/pythos-panic.iso`: the *same kernel binary*, booted through a
-Limine entry carrying `cmdline: panic-test`. The kernel sees the token and
-panics deliberately ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)):
+```
+[fault] executing int3 ...
+
+*** EXCEPTION: #BP breakpoint (vector 3) ***
+[trap] error_code=0x0000000000000000  rip=0xffffffff8000239a  cs=0x0008
+[trap] rflags=0x0000000000000002  rsp=0xffff80000ff82f20  ss=0x0010
+[trap] #BP is a trap; resuming at rip=0xffffffff8000239a
+[fault] returned from int3 -- handler resumed execution
+[boot] execution continued past the breakpoint
+[boot] M1 checks passed
+```
+
+### Page fault — `make run-pf`, exit 35
+
+A write to a canonical but unmapped address. The error code decodes to
+write / not-present / supervisor, and CR2 holds exactly the address:
+
+```
+[fault] writing to unmapped canonical address 0x0000600000000000 ...
+
+*** EXCEPTION: #PF page fault (vector 14) ***
+[trap] error_code=0x0000000000000002  rip=0xffffffff80000fee  cs=0x0008
+[trap] cr2=0x0000600000000000  (supervisor write not-present)
+
+*** KERNEL PANIC ***
+[PANIC] unhandled exception: #PF page fault (vector 14)
+```
+
+### Double fault — `make run-df`, exit 35
+
+RSP is pointed at unmapped memory and an exception is raised. The CPU cannot
+push the frame, so the fault escalates to #DF — and #DF is delivered on the
+IST1 stack regardless of what RSP contained. The kernel checks its own RSP
+against the IST1 range and says so ([ADR 005](docs/adr/005-double-fault-ist-stack.md)):
+
+```
+[fault] corrupting rsp and faulting to force #DF ...
+
+*** EXCEPTION: #DF double fault (vector 8) ***
+[trap] error_code=0x0000000000000000  rip=0xffffffff8000104f  cs=0x0008
+[trap] rflags=0x0000000000000046  rsp=0x0000600000000000  ss=0x0010
+[trap] IST1 stack: 0xffffffff8000b070 .. 0xffffffff8000f070, handler rsp=0xffffffff8000ef00
+[trap] IST1: ok
+[trap] unrecoverable; signalling QEMU (write 0x11 -> exit status 35)
+```
+
+Note the two stack pointers: `rsp=0x0000600000000000` in the frame is the
+broken one that caused the fault; `handler rsp=0xffffffff8000ef00` is inside
+IST1. Without the stack switch this would have been a triple fault.
+
+### Deliberate panic — `make run-panic`, exit 35
 
 ```
 *** KERNEL PANIC ***
@@ -89,13 +143,19 @@ panics deliberately ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)):
 [PANIC] halting; signalling QEMU (write 0x11 -> exit status 35)
 ```
 
-The message carries **file:line:column**, the kernel writes `0x11`, and QEMU
-exits with **host status 35**. `-no-reboot` guarantees a fault can never put
-the VM into an endless reset loop.
+The message carries **file:line:column**. The path is project-relative, not
+absolute: `trim-paths = "all"` keeps the builder's home directory out of the
+binary, so the output is identical on every machine and the test is not
+asserting on someone's `$HOME`.
 
-The source path is project-relative, not absolute: `trim-paths = "all"` keeps
-the builder's home directory out of the binary, so the output is identical on
-every machine and the test is not asserting on someone's `$HOME`.
+### No resets, in any scenario
+
+`-no-reboot` turns a triple fault into a clean QEMU exit rather than a
+restart. To prove no scenario resets anyway, the runner counts the kernel
+banner: the kernel prints it exactly once per boot, so **two occurrences
+fail the test**. This is what gives the #DF scenario its teeth — a broken
+IST would reboot, and rebooting is the only way that run could still print
+everything else the test expects.
 
 ### The runner's own negative test
 
@@ -106,7 +166,7 @@ everything would be indistinguishable from a working one:
 ```
 [PASS] runner self-test: 'normal boot' expectations correctly rejected this run (3 violation(s)):
        - exit status 35 (guest wrote 0x11 (panic)); expected 33 (guest wrote 0x10 (success))
-       - missing expected serial line: /^\[boot\] M0 checks passed/
+       - missing expected serial line: /^\[boot\] M1 checks passed/
        - unexpected serial line present: /KERNEL PANIC/
 ```
 
@@ -146,7 +206,11 @@ Cargo.toml              Crate, lints (warnings = deny), profiles
 rust-toolchain.toml     Pinned nightly + rust-src + x86_64-unknown-none
 build.rs                Re-link when the linker script changes
 boot/limine.conf.in     Boot config template; @DEFAULT_ENTRY@ picks the entry
-kernel/src/main.rs      Limine requests, kstart() entry point
+kernel/src/main.rs      Limine requests, kstart() entry point, fault hooks
+kernel/src/gdt.rs       GDT, TSS, IST1 stack for #DF
+kernel/src/idt.rs       IDT gate descriptors, all 32 exception vectors
+kernel/src/interrupts.rs  32 asm stubs, ExceptionFrame, common dispatcher
+kernel/src/faults.rs    Deliberate #BP / #PF / #DF triggers
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -211,10 +275,13 @@ triple-faulting and destroying the evidence.
 - [002 — Tek kernel binary, iki ISO](docs/adr/002-tek-binary-iki-iso.md)
 - [003 — Link sonrası ELF denetimi](docs/adr/003-link-sonrasi-elf-denetimi.md)
 - [004 — WSL Ubuntu build ortamı](docs/adr/004-wsl-build-ortami.md)
+- [005 — Double fault'u IST1 üzerinde ayrı bir stack'te karşılamak](docs/adr/005-double-fault-ist-stack.md)
+- [006 — Assembly stub'ları + tek ortak handler](docs/adr/006-exception-stub-ortak-handler.md)
 
 ## Not yet built
 
-Deliberately absent from M0, each belonging to a later milestone: GDT/IDT and
-exception handling, physical and virtual memory management, the capability
+Deliberately absent, each belonging to a later milestone: external interrupts
+(the PIC is still masked as Limine left it), user-mode segments and ring 3,
+physical and virtual memory management, the capability
 object model (Untyped, CNode, TCB, Endpoint, Notification, Frame, PageTable,
 IRQHandler), user space, and IPC.

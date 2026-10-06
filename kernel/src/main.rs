@@ -1,18 +1,30 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! PythOS — M0 bootstrap.
+//! PythOS — M1: CPU structures.
 //!
-//! What this milestone establishes:
+//! Established by M0:
 //!   1. Limine boots us into 64-bit long mode in the higher half.
 //!   2. COM1 carries a log the host test runner can assert on.
 //!   3. A panic reports its source location and terminates the VM.
 //!   4. QEMU exits with a status the runner can decode (33 / 35).
 //!
-//! Deliberately absent: memory management, GDT/IDT, interrupts, user space.
-//! Those belong to later milestones.
+//! Added by M1:
+//!   5. Our own GDT and TSS, replacing the bootloader's.
+//!   6. Our own IDT with all 32 exception vectors populated.
+//!   7. Exceptions are reported on the serial console with full machine
+//!      state, and #DF is handled on a dedicated IST stack so that a broken
+//!      stack pointer cannot escalate to a silent triple fault.
+//!
+//! Deliberately absent: memory management, external interrupts (the PIC is
+//! still masked as Limine left it), user space. Those belong to later
+//! milestones.
 
 #![no_std]
 #![no_main]
 
+mod faults;
+mod gdt;
+mod idt;
+mod interrupts;
 mod io;
 mod panic;
 mod qemu;
@@ -28,7 +40,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M0");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M1");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -232,15 +244,83 @@ pub extern "C" fn kstart() -> ! {
         }
     );
 
-    // Negative-path hook. The panic ISO boots this very same binary with
-    // `panic-test` on the command line, so the failure path is exercised on
-    // the image we ship rather than on a special build.
+    // ---- CPU structures (M1) -------------------------------------------
+    //
+    // Order matters. The IDT's gates name a code selector from our GDT, and
+    // the double-fault gate's IST index is meaningless until the TSS is
+    // loaded, so the GDT must come first.
+    //
+    // Interrupts are still disabled at this point: Limine enters the kernel
+    // with IF clear and nothing above re-enables it. That is what makes it
+    // safe to replace the descriptor tables out from under the CPU.
+
+    // SAFETY: First and only call, on the single-threaded boot path with
+    // interrupts disabled (Limine guarantees IF is clear on entry and we
+    // never set it). Replacing the GDT invalidates the selectors cached
+    // from the bootloader's table, which is why `gdt::init` reloads CS, the
+    // data registers and the task register before returning.
+    unsafe {
+        gdt::init();
+    }
+    println!(
+        "[cpu] gdt: loaded (cs={:#06x}, ds={:#06x}, tss armed)",
+        gdt::KERNEL_CODE_SELECTOR,
+        gdt::KERNEL_DATA_SELECTOR
+    );
+
+    let (ist_low, ist_high) = gdt::ist1_range();
+    println!(
+        "[cpu] ist1: {:#018x} .. {:#018x} ({} KiB) for #DF",
+        ist_low,
+        ist_high,
+        (ist_high - ist_low) / 1024
+    );
+
+    // SAFETY: First and only call, immediately after `gdt::init`, still
+    // with interrupts disabled. Every gate references KERNEL_CODE_SELECTOR,
+    // which the GDT now provides, and the #DF gate's IST1 slot is armed.
+    unsafe {
+        idt::init();
+    }
+    println!(
+        "[cpu] idt: {} exception vectors installed, #DF on IST{}",
+        interrupts::EXCEPTION_COUNT,
+        gdt::DOUBLE_FAULT_IST_INDEX
+    );
+
+    // ---- Fault-injection hooks -----------------------------------------
+    //
+    // Each of these is reached through a token on the kernel command line,
+    // so the exception paths are exercised on the binary we ship rather
+    // than on a special build.
+
+    // Negative-path hook inherited from M0: a plain panic, no exception
+    // involved.
     if cmdline.contains("panic-test") {
         println!("[boot] cmdline requested a panic; triggering now");
         panic!("deliberate panic requested via cmdline (token=panic-test)");
     }
 
-    println!("[boot] M0 checks passed");
+    // #BP is a trap, so this one returns and the kernel carries on to exit
+    // successfully. That is the whole point: it proves the dispatcher's
+    // `iretq` path works, not just that an exception was caught.
+    if cmdline.contains("fault-int3") {
+        println!("[boot] cmdline requested a breakpoint exception");
+        faults::trigger_breakpoint();
+        println!("[boot] execution continued past the breakpoint");
+    }
+
+    if cmdline.contains("fault-pf") {
+        println!("[boot] cmdline requested a page fault");
+        faults::trigger_page_fault();
+    }
+
+    if cmdline.contains("fault-df") {
+        println!("[boot] cmdline requested a double fault");
+        faults::trigger_double_fault();
+    }
+
+    println!("[boot] M1 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

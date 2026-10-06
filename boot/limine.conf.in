@@ -1,12 +1,17 @@
 # PythOS boot configuration template (Limine v9, `limine` protocol).
 #
 # The build generates one concrete limine.conf per ISO by substituting
-# @DEFAULT_ENTRY@:
-#   1 -> normal boot      (build/pythos.iso)
-#   2 -> panic test boot  (build/pythos-panic.iso)
+# @DEFAULT_ENTRY@ with the index of the entry that should boot:
 #
-# Both ISOs embed the exact same kernel.elf, so the negative test exercises
-# the shipping binary rather than a special build.
+#   1 -> normal boot       build/pythos.iso          exit 33
+#   2 -> panic test        build/pythos-panic.iso    exit 35
+#   3 -> breakpoint (#BP)  build/pythos-int3.iso     exit 33  (handler returns)
+#   4 -> page fault (#PF)  build/pythos-pf.iso       exit 35
+#   5 -> double fault (#DF) build/pythos-df.iso      exit 35  (handled on IST1)
+#
+# Every ISO embeds the exact same kernel.elf. The fault paths are therefore
+# exercised on the shipping binary rather than on a special build, which is
+# the only way the tests say anything about what we actually ship.
 #
 # timeout: 0 boots the default entry instantly and keeps menu chatter out of
 # the serial log, which the test runner parses.
@@ -25,3 +30,21 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: panic-test
+
+/PythOS (breakpoint exception)
+    comment: int3 -> #BP. A trap, so the handler returns and we exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fault-int3
+
+/PythOS (page fault)
+    comment: Write to an unmapped canonical address -> #PF, CR2 reported, exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fault-pf
+
+/PythOS (double fault)
+    comment: Corrupt RSP then fault -> #DF handled on IST1, exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fault-df
