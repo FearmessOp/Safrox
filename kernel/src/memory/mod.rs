@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! Memory: address types, the Limine memory map, frames and page tables.
+//! Memory: address types, the Limine memory map, frames, page tables and
+//! the kernel heap.
 //!
 //! * [`frame_allocator`] — physical frames (M2)
 //! * [`layout`] — the virtual address space map (ADR 009)
@@ -7,9 +8,11 @@
 //! * [`vm`] — building and switching to our own tables (ADR 010)
 //! * [`bootinfo`] — copying out of bootloader memory and reclaiming it
 //!   (ADR 013)
+//! * [`heap`] — the `#[global_allocator]` behind `Box`/`Vec`/... (ADR 016)
 
 pub mod bootinfo;
 pub mod frame_allocator;
+pub mod heap;
 pub mod layout;
 pub mod paging;
 pub mod vm;

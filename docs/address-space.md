@@ -46,9 +46,20 @@ Referans: Intel SDM Vol. 1, 3.3.7.1 "Canonical Addressing"; Vol. 3A, 4.5
     Sahip: kernel                                       Dolacak: M3
 
 0xFFFF_C000_0000_0000 .. 0xFFFF_C7FF_FFFF_FFFF    8 TiB   KHEAP
-    Kernel heap. M4'te `alloc` buraya kurulacak.
-    M3'te eşlenmez; yalnızca aralık rezerve edilir.
-    Sahip: kernel                                       Dolacak: M4
+    Kernel heap. M4'te dolduruldu, ama 8 TiB'ın tamamı değil:
+
+        0xFFFF_C000_0000_0000   alt guard sayfası (eşlenmez)
+        0xFFFF_C000_0000_1000   heap başlangıcı
+        ...                     talep üzerine eşlenir, büyür
+        0xFFFF_C000_0400_1000   64 MiB sınırı
+        0xFFFF_C000_0400_1000   üst guard sayfası (eşlenmez)
+
+    64 MiB bir rezervasyon değil, bir TAVAN: sayfalar talep üzerine
+    eşleniyor ve heap hiç küçülmüyor. Sınır, kaçak bir ayırma döngüsünün
+    makinenin bütün çerçevelerini yutup alakasız bir yerde çökmesi yerine
+    okunabilir bir panic ile bitmesi için var.
+    Gerisi (8 TiB - 64 MiB) boş; sınır ileride yükseltilebilir.
+    Sahip: kernel                                       Doldu: M4
 
 0xFFFF_C800_0000_0000 .. 0xFFFF_CFFF_FFFF_FFFF    8 TiB   KSTACK
     Kernel stack'leri. Her stack'in altında eşlenmemiş bir guard page.
@@ -87,7 +98,11 @@ Koddaki karşılıkları (M3'te `kernel/src/memory/layout.rs`):
 | `KERNEL_MIN` | `0xFFFF_8000_0000_0000` | Kernel yarısının ilk adresi |
 | `PMAP_BASE` | `0xFFFF_8000_0000_0000` | Fiziksel pencere tabanı |
 | `PMAP_SIZE` | `64 TiB` | Pencere boyutu |
-| `KHEAP_BASE` | `0xFFFF_C000_0000_0000` | Kernel heap tabanı |
+| `KHEAP_BASE` | `0xFFFF_C000_0000_0000` | Heap alanının tabanı (alt guard) |
+| `KHEAP_START` | `0xFFFF_C000_0000_1000` | Heap'in ilk kullanılabilir baytı |
+| `KHEAP_MAX_SIZE` | `64 MiB` | Heap'in büyüyebileceği tavan |
+| `KHEAP_END` | `0xFFFF_C000_0400_1000` | Tavanın bir üstü |
+| `KHEAP_GUARD_TOP` | `0xFFFF_C000_0400_1000` | Üst guard sayfası |
 | `KSTACK_BASE` | `0xFFFF_C800_0000_0000` | Kernel stack alanı tabanı |
 | `KMMIO_BASE` | `0xFFFF_D000_0000_0000` | MMIO alanı tabanı |
 | `KIMAGE_BASE` | `0xFFFF_FFFF_8000_0000` | Kernel imajı tabanı (linker.ld) |
@@ -143,6 +158,14 @@ zorladığı yazıyor — zorlanmayan bir değişmez, değişmez değil dilektir
    aynı sonuca ulaşıyor. İkincisi #DF'e yükseliyor — #PF'i teslim etmek
    için gereken yığın da tükenmiş durumda — ve IST1 devreye giriyor, ki
    M1'in bu tasarımının ilk gerçek (imal edilmemiş) sınavı.
+
+6. **Heap'in iki ucunda da eşlenmemiş birer sayfa vardır** (M4). Alttaki
+   işaretçi alt taşmasını, üstteki sınırın aşılmasını yakalar. İkisi de
+   hiçbir zaman eşlenmiyor, yani koruma heap'in ne kadar büyüdüğünden
+   bağımsız.
+   *Zorlayan:* `heap-guard` senaryosu üst guard'a yazıp #PF alıyor
+   (CR2 = `0xffffc00004001000`); `heap::grow` `KHEAP_END`'i geçmeyi
+   reddediyor ve `heap-oom` senaryosu bunun tuttuğunu gösteriyor.
 
 ## 5 seviyeli sayfalama (LA57)
 

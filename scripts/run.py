@@ -102,6 +102,13 @@ VM_INIT_LINES = [
     # NX must be enabled before any table sets the NX bit, or every such
     # mapping faults on first use.
     re.compile(r"^\[cpu\] nx: supported \(efer\.nxe set\)", re.M),
+    # SMEP and SMAP, asserted rather than merely reported. M3 ran with
+    # `-cpu qemu64`, which advertises neither, so the detect-and-warn path
+    # executed and the protection was never actually on. The Makefile now
+    # asks for `+smep,+smap`; requiring the line here means a silent
+    # regression in the CPU model -- or in cpu::init -- fails the test
+    # instead of quietly dropping the protection again.
+    re.compile(r"^\[cpu\] smep: enabled, smap: enabled, pge: enabled", re.M),
     re.compile(r"^\[vm\] pmap: \d+ MiB of RAM at 0xffff800000000000, rw\+nx\+global", re.M),
     # W^X: .text executable and not writable, .rodata neither.
     re.compile(r"^\[vm\] image \.text: .*PageFlags\(READ \| EXEC \| GLOBAL\)", re.M),
@@ -128,6 +135,29 @@ VM_INIT_LINES = [
     re.compile(r"^\[boot\] after reclaim: bootloader still reported as \S+ \S+", re.M),
 ]
 
+# M4 brings the heap up on every boot, after reclaim. Required everywhere
+# for the same reason as VM_INIT_LINES: if the heap is not there, nothing
+# downstream that allocates means what it claims to.
+HEAP_INIT_LINES = [
+    re.compile(
+        r"^\[heap\] base 0xffffc00000001000\.\.0xffffc00004001000 \(limit 64 MiB\), "
+        r"\d+ page\(s\) mapped",
+        re.M,
+    ),
+    # Both guards, named. The lower one catches pointer underflow, the
+    # upper one an overrun past the limit; neither is ever mapped.
+    re.compile(
+        r"^\[heap\] guard pages: 0xffffc00000000000 \(below\), "
+        r"0xffffc00004001000 \(above\)",
+        re.M,
+    ),
+    re.compile(
+        r"^\[heap\] 17 size classes, 16 B \.\. 1024 KiB; alloc and dealloc are "
+        r"O\(1\) with no search",
+        re.M,
+    ),
+]
+
 # The poison pattern, as it appears when something follows a pointer into
 # reclaimed bootloader memory. Forbidden everywhere: 0xDE was chosen so that
 # a stale pointer produces a non-canonical address and an immediate fault
@@ -144,7 +174,8 @@ EXPECTATIONS = {
             *COMMON_BOOT_LINES,
             *CPU_INIT_LINES,
             *VM_INIT_LINES,
-            re.compile(r"^\[boot\] M3 checks passed", re.M),
+            *HEAP_INIT_LINES,
+            re.compile(r"^\[boot\] M4 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -163,7 +194,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M3 checks passed", re.M)],
+        forbidden=[re.compile(r"M4 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -180,7 +211,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M3 checks passed", re.M),
+            re.compile(r"^\[boot\] M4 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -199,7 +230,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M3 checks passed", re.M)],
+        forbidden=[re.compile(r"M4 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -218,7 +249,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"M4 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -259,7 +290,7 @@ EXPECTATIONS = {
             ),
             re.compile(r"^\[memtest\] recovery: freed .* and got it straight back", re.M),
             re.compile(r"^\[memtest\] all frame allocator tests passed", re.M),
-            re.compile(r"^\[boot\] M3 checks passed", re.M),
+            re.compile(r"^\[boot\] M4 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant the kernel checks is an assert, so a violation
@@ -286,7 +317,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"M4 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -334,7 +365,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M3 checks passed", re.M),
+            re.compile(r"^\[boot\] M4 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -379,7 +410,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"M4 checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -408,7 +439,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"M4 checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -464,11 +495,138 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M3 checks passed", re.M),
+            re.compile(r"M4 checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
             re.compile(r"IST1: NOT ACTIVE", re.M),
+        ],
+    ),
+    # --- M4: the kernel heap --------------------------------------------
+    "heaptest": Expectation(
+        name="kernel heap",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            re.compile(r"^\[heaptest\] initial: base 0xffffc00000001000", re.M),
+            # The four collections, each exercising a different pattern:
+            # one fixed allocation, two that reallocate as they grow, and
+            # one that allocates many small nodes and frees them out of
+            # order.
+            re.compile(
+                r"^\[heaptest\] collections: Box, Vec\(1000\), String\(400\), "
+                r"BTreeMap\(500\) all allocate and read back correctly",
+                re.M,
+            ),
+            # Ten thousand live allocations across every class.
+            re.compile(
+                r"^\[heaptest\] alloc: 10000 blocks, \d+ B \.\. \d+ KiB, every "
+                r"one aligned and inside the heap",
+                re.M,
+            ),
+            # The canary check is what proves no two blocks overlap. It
+            # runs after *all* the allocations, so an overlap written by a
+            # later block is still visible in an earlier one.
+            re.compile(
+                r"^\[heaptest\] canaries: all 10000 blocks intact; no two "
+                r"allocations overlap",
+                re.M,
+            ),
+            # Internal fragmentation, measured rather than asserted in the
+            # abstract. ADR 016 claims at most 2x for power-of-two classes.
+            re.compile(
+                r"^\[heaptest\] fragmentation: \d+ bytes requested, \d+ bytes "
+                r"reserved \(1\d\d% -- the size classes guarantee at most 200%\)",
+                re.M,
+            ),
+            # The heap grows on demand, and both ends of the new region are
+            # really writable -- not merely accounted for.
+            re.compile(
+                r"^\[heaptest\] growth: \d+ bytes requested, heap grew from \d+ "
+                r"to \d+ pages, both ends writable",
+                re.M,
+            ),
+            # Back to the starting byte count. The pages stay mapped, and
+            # that is reported rather than hidden.
+            re.compile(
+                r"^\[heaptest\] baseline: 0 bytes in use \(was 0\), \d+ pages "
+                r"still mapped",
+                re.M,
+            ),
+            # Where the freed memory went. A class with free blocks cannot
+            # lend them to another class -- the cost of not coalescing,
+            # made visible.
+            re.compile(
+                r"^\[heaptest\] free lists: \d+ blocks across \d+ of 17 classes",
+                re.M,
+            ),
+            re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
+            re.compile(r"^\[boot\] M4 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "heapoom": Expectation(
+        name="heap exhaustion",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *HEAP_INIT_LINES,
+            re.compile(r"^\[heaptest\] exhausting the heap", re.M),
+            # The heap must actually grow on the way. Without this the
+            # test would pass even if every allocation were optimised
+            # away -- which is precisely what happened the first time it
+            # was run, before the volatile writes were added.
+            re.compile(
+                r"^\[heaptest\] \d+ MiB allocated and leaked, \d{4,} pages mapped",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            # The message must name the size, the alignment and the class,
+            # so that a reader can tell what was being asked for.
+            re.compile(
+                r"^\[PANIC\] heap exhausted: allocating \d+ bytes \(align \d+, "
+                r"class \d+\) would take the heap to \d+ KiB, past its 65536 "
+                r"KiB limit\. \d+ bytes are live in \d+ allocations\.",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M4 checks passed", re.M),
+            # A null return instead of a panic: out of memory must be loud.
+            re.compile(r"returned null instead of panicking", re.M),
+            # The heap handing out more than its limit would mean the bound
+            # is not enforced.
+            re.compile(r"without hitting its \d+ MiB limit", re.M),
+        ],
+    ),
+    "heapguard": Expectation(
+        name="heap guard page",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *HEAP_INIT_LINES,
+            re.compile(
+                r"^\[heaptest\] guard page test: writing to 0xffffc00004001000",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\) \*\*\*", re.M),
+            # CR2 is the exact address written: the first byte above the
+            # heap's limit.
+            re.compile(r"^\[trap\] cr2=0xffffc00004001000\b", re.M),
+            # Not-present, write, supervisor. A *present* page here would
+            # mean the guard is mapped and the test proved nothing.
+            re.compile(r"^\[trap\] error_code=0x0{15}2\b", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M4 checks passed", re.M),
+            re.compile(r"the heap's upper guard page did not fault", re.M),
         ],
     ),
 }

@@ -3,9 +3,9 @@ target = "x86_64-unknown-none"
 
 [unstable]
 # core and compiler_builtins must be rebuilt from source: the bare-metal
-# target ships no precompiled std. `alloc` is deliberately absent -- the
-# kernel performs no allocation before M4.
-build-std = ["core", "compiler_builtins"]
+# target ships no precompiled std. `alloc` joins them in M4, which supplies
+# the #[global_allocator] it needs (kernel/src/memory/heap.rs, ADR 016).
+build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
 # The following are already set by the x86_64-unknown-none target spec and

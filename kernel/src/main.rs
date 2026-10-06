@@ -32,15 +32,29 @@
 //!  14. The bootloader's memory reclaimed, after copying out everything
 //!      still being read.
 //!
+//! Added by M4:
+//!  15. A kernel heap in KHEAP, growing on demand, with guard pages at
+//!      both ends. `Box`, `Vec`, `BTreeMap` and `String` work from here
+//!      on.
+//!  16. Size-classed free lists, so that both `alloc` and `dealloc` are
+//!      O(1) with no searching -- a precondition for allocating on M9's
+//!      IPC path. See ADR 016.
+//!
 //! Deliberately absent: external interrupts (the PIC is masked as Limine
-//! left it), user space, and any heap -- there is no `alloc` before M4.
+//! left it), threads, and user space.
 
 #![no_std]
 #![no_main]
 
+// The heap arrives in M4; `alloc` is pulled in here rather than being
+// implied, because `#[global_allocator]` has to exist before anything can
+// use it. See kernel/src/memory/heap.rs.
+extern crate alloc;
+
 mod cpu;
 mod faults;
 mod gdt;
+mod heaptest;
 mod idt;
 mod interrupts;
 mod io;
@@ -61,7 +75,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M3");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M4");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -444,6 +458,18 @@ extern "C" fn kmain() -> ! {
     // longer exists.
     let features = cpu::features();
 
+    // ---- Kernel heap (M4) ----------------------------------------------
+    //
+    // After reclaim, so the frames the bootloader gave back are available
+    // to the heap, and after vm::init, since growing the heap maps pages
+    // through the kernel's own tables.
+    //
+    // SAFETY: First and only call, single-threaded, interrupts disabled,
+    // with the page tables and the frame allocator both up.
+    unsafe {
+        memory::heap::init();
+    }
+
     // ---- Fault-injection hooks -----------------------------------------
     //
     // Each of these is reached through a token on the kernel command line,
@@ -515,7 +541,23 @@ extern "C" fn kmain() -> ! {
         vmtest::run_stack_overflow();
     }
 
-    println!("[boot] M3 checks passed");
+    // M4 heap scenarios.
+    if cmdline.contains("heap-oom") {
+        println!("[boot] cmdline requested the heap exhaustion test");
+        heaptest::run_oom();
+    }
+
+    if cmdline.contains("heap-guard") {
+        println!("[boot] cmdline requested the heap guard page test");
+        heaptest::run_guard();
+    }
+
+    if cmdline.contains("heap-test") {
+        println!("[boot] cmdline requested the heap tests");
+        heaptest::run();
+    }
+
+    println!("[boot] M4 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

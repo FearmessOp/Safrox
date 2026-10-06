@@ -37,8 +37,42 @@ pub const PMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// address physically.
 pub const PMAP_SIZE: u64 = 64 * TIB;
 
-/// Base of the kernel heap. Reserved in M3, mapped in M4.
+/// Base of the kernel heap area. Reserved in M3, used from M4.
+///
+/// The heap itself does not start here: the first page of the area is an
+/// unmapped guard, so a pointer that walks off the bottom faults instead
+/// of landing in whatever precedes the heap. See [`KHEAP_START`].
 pub const KHEAP_BASE: u64 = 0xFFFF_C000_0000_0000;
+
+/// First byte the heap may actually hand out.
+///
+/// One page above [`KHEAP_BASE`], leaving a guard below. Underflow in
+/// pointer arithmetic is the failure this catches -- `ptr.sub(n)` past the
+/// start of the first block.
+pub const KHEAP_START: u64 = KHEAP_BASE + FRAME_SIZE;
+
+/// Largest the heap may grow to, in bytes.
+///
+/// 64 MiB. Chosen as a limit, not a reservation: pages are mapped on
+/// demand and a kernel that needs more than this has a leak rather than a
+/// requirement. The bound exists so that a runaway allocation loop ends in
+/// a legible panic ("the heap hit its 64 MiB limit") instead of quietly
+/// consuming every frame on the machine and failing somewhere unrelated.
+///
+/// It also keeps the heap comfortably inside the 8 TiB KHEAP range with
+/// room for the guard pages at both ends.
+pub const KHEAP_MAX_SIZE: u64 = 64 * 1024 * 1024;
+
+/// One past the last byte the heap may use.
+pub const KHEAP_END: u64 = KHEAP_START + KHEAP_MAX_SIZE;
+
+/// Start of the unmapped page above the heap's maximum extent.
+///
+/// The heap grows upwards, so this is where an overrun lands. Unlike the
+/// lower guard, this one only becomes reachable once the heap has actually
+/// grown to its limit -- but it is never mapped, so the protection does
+/// not depend on how far the heap has grown.
+pub const KHEAP_GUARD_TOP: u64 = KHEAP_END;
 
 /// Base of the kernel stack area.
 pub const KSTACK_BASE: u64 = 0xFFFF_C800_0000_0000;
@@ -154,6 +188,14 @@ const _: () = {
         "PMAP runs into the kernel heap"
     );
     assert!(KHEAP_BASE < KSTACK_BASE, "heap and stacks are out of order");
+    assert!(
+        KHEAP_GUARD_TOP + FRAME_SIZE <= KSTACK_BASE,
+        "the heap's upper guard page runs into the kernel stack area"
+    );
+    assert!(
+        KHEAP_MAX_SIZE.is_multiple_of(FRAME_SIZE),
+        "the heap limit must be a whole number of pages"
+    );
     assert!(KSTACK_BASE < KMMIO_BASE, "stacks and MMIO are out of order");
     assert!(KMMIO_BASE < KIMAGE_BASE, "MMIO runs into the kernel image");
 

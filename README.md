@@ -3,12 +3,12 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M3 — Virtual memory.** The kernel builds its own page
-tables and switches to them: a physical window that is NX and covers only
-RAM, the kernel image mapped W^X section by section, kernel stacks behind
-genuinely unmapped guard pages, and TLB invalidation enforced by the type
-system. Limine's memory is then reclaimed — after the kernel has copied out
-everything it still reads *and* moved off the stack the bootloader gave it.
+**Current milestone: M4 — Kernel heap.** `Box`, `Vec`, `BTreeMap` and
+`String` work. The allocator is size-classed free lists over a 64 MiB
+region that grows on demand and has unmapped guard pages at both ends. Both
+`alloc` and `dealloc` are O(1) with no searching — not "usually fast",
+bounded — because M9 will allocate on the IPC path and a kernel path may
+not contain an unbounded loop.
 
 ## Quick start
 
@@ -58,7 +58,10 @@ cloned into `third_party/` automatically.
 | `make run-guardpage` | Write below the IST stack → #PF; **must** exit 35 |
 | `make run-nx` | Execute from a data page → #PF; **must** exit 35 |
 | `make run-stackovf` | Overflow the main stack → #DF on IST1; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all twelve scenarios, runner self-test |
+| `make run-heaptest` | Kernel heap suite; **must** exit 33 |
+| `make run-heapoom` | The heap runs out and says so; **must** exit 35 |
+| `make run-heapguard` | Write above the heap's limit → #PF; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all fifteen scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -66,9 +69,9 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M3 acceptance criteria
+## M4 acceptance criteria
 
-Twelve scenarios, all booting the **same** `kernel.elf` through different
+Fifteen scenarios, all booting the **same** `kernel.elf` through different
 Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
@@ -312,6 +315,96 @@ rather than faulting. That is a live demonstration of the hazard
 reason `TlbFlush` is `#[must_use]` with a panicking `Drop`. It is recorded
 as advisory because the opposite outcome would also be legitimate; see
 *Known gaps*.
+### Kernel heap — `make run-heaptest`, exit 33
+
+Five checks, each measuring something rather than merely exercising it:
+
+```
+[heap] base 0xffffc00000001000..0xffffc00004001000 (limit 64 MiB), 1 page(s) mapped
+[heap] guard pages: 0xffffc00000000000 (below), 0xffffc00004001000 (above)
+[heap] 17 size classes, 16 B .. 1024 KiB; alloc and dealloc are O(1) with no search
+
+[heaptest] collections: Box, Vec(1000), String(400), BTreeMap(500) all allocate
+           and read back correctly
+[heaptest] alloc: 10000 blocks, 1 B .. 3 KiB, every one aligned and inside the heap
+[heaptest] canaries: all 10000 blocks intact; no two allocations overlap
+[heaptest] fragmentation: 5925046 bytes requested, 9367936 bytes reserved
+           (158% -- the size classes guarantee at most 200%)
+[heaptest] growth: 524288 bytes requested, heap grew from 2868 to 3071 pages,
+           both ends writable
+[heaptest] baseline: 0 bytes in use (was 0), 3071 pages still mapped
+[heaptest] free lists: 10003 blocks across 12 of 17 classes (9668 KiB held for
+           reuse; the heap does not shrink and does not coalesce -- ADR 016)
+[heaptest] calls: 10101 alloc, 10101 dealloc, 2753 grow
+```
+
+Three of these lines report things the design chose, not things that
+happened to work:
+
+**The canary check runs after all ten thousand allocations**, not after
+each one. A block that overlaps another is only visible once the second
+one has been written, so checking as you go would miss exactly the case
+the check exists for.
+
+**12 MiB stays mapped after everything is freed.** The live byte count is
+back to zero; the pages are not returned. That is the cost of not
+coalescing — a free 64 KiB block cannot serve a 16 B request — and it is
+printed rather than hidden, because silently holding 12 MiB and leaking
+12 MiB look identical from outside.
+
+**2753 of 10101 allocations grew the heap.** The ADR predicted the slow
+path would run "once per size class"; the measurement says 27% of the
+time. The reason is the test itself: it holds all ten thousand blocks
+live, so nothing ever returns to a free list and almost every allocation
+carves from the frontier. The design is unchanged but the claim was
+wrong, and [ADR 016](docs/adr/016-kernel-heap-allocator.md) now says so —
+with the consequence that M9's IPC path will *need* pre-warmed classes
+rather than merely benefiting from them.
+
+### Heap exhaustion — `make run-heapoom`, exit 35
+
+1 MiB at a time until the heap hits its limit. The panic names the size,
+the alignment, the size class, and how much is live:
+
+```
+[heaptest] 57 MiB allocated and leaked, 14847 pages mapped
+
+*** KERNEL PANIC ***
+[PANIC] heap exhausted: allocating 1048576 bytes (align 8, class 1048576) would
+        take the heap to 66556 KiB, past its 65536 KiB limit. 66060288 bytes are
+        live in 63 allocations.
+```
+
+This test failed in an instructive way first. It reported *the opposite*
+of what it was checking:
+
+```
+[PANIC] the heap handed out 72 MiB without hitting its 64 MiB limit
+```
+
+The limit was fine. The allocations had not happened: LLVM recognises
+`alloc` as an allocation function and may delete one whose result is never
+used — and a null check is not a use. Adding a `write_volatile` at each
+end of every block fixed it. The same trap had caught the stack-overflow
+test in M3, where an unused array was optimised away and nothing
+overflowed. **A test whose effect the optimiser can erase is not a test.**
+
+### Heap guard page — `make run-heapguard`, exit 35
+
+A write to the first byte above the heap's maximum extent:
+
+```
+[heaptest] guard page test: writing to 0xffffc00004001000, the unmapped page
+           above the heap's 64 MiB limit
+
+*** EXCEPTION: #PF page fault (vector 14) ***
+[trap] cr2=0xffffc00004001000  (supervisor write not-present)
+```
+
+There is a guard below the heap too, at `0xffffc00000000000`, for pointer
+underflow. Neither is ever mapped, so the protection does not depend on
+how far the heap has grown.
+
 
 ### Deliberate panic — `make run-panic`, exit 35
 
@@ -397,8 +490,10 @@ kernel/src/memory/layout.rs       Address-space constants, canonicality, stack s
 kernel/src/memory/paging.rs       Entry/PageTable/PageFlags, map/unmap/translate, TlbFlush
 kernel/src/memory/vm.rs           Builds PMAP + W^X image + stacks, switches CR3 and RSP
 kernel/src/memory/bootinfo.rs     Copies Limine's responses out, then reclaims its memory
+kernel/src/memory/heap.rs         Size-classed free lists, #[global_allocator], grows on demand
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
 kernel/src/vmtest.rs    Virtual memory acceptance tests and negative scenarios
+kernel/src/heaptest.rs  Kernel heap acceptance tests and negative scenarios
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -482,6 +577,38 @@ ADR 010 ve 013, uygulama sırasında bulunanlarla güncellendi: 010'a EFER.NXE
 ön koşulu ve PMAP takma adının W^X'i nasıl deldiği, 013'e tasarımın
 kaçırdığı beşinci kapı eklendi.
 
+M4:
+
+- [016 — Kernel heap: boyut sınıflı serbest listeler](docs/adr/016-kernel-heap-allocator.md)
+
+ADR 016 da ölçümlerle güncellendi: yavaş yolun sıklığı tahmin edilenden
+yüksek çıktı ve parçalanma rakamları artık varsayım değil, kabul testinin
+raporladığı sayılar.
+
+## What M4 cost: three defects, two of them in the tests
+
+| # | Defect | How it surfaced | What it says |
+|---|---|---|---|
+| 1 | `heap-oom` reported the heap exceeding its own limit | `the heap handed out 72 MiB without hitting its 64 MiB limit` | The limit was fine; LLVM had deleted the allocations, because a null check is not a *use* of the returned pointer. Second time this project has been bitten by an optimised-away test — the first was M3's stack overflow. |
+| 2 | The stress phase ran the heap out of memory, three times running | A clean OOM panic where a pass was expected | My arithmetic, not the heap's. Cycling evenly through logarithmic size classes puts 1/n of the allocations in the largest one, and that class alone then dominates: 769 × 64 KiB = 48 MiB against a 64 MiB heap. |
+| 3 | `[heap] grew to ...` printed on every growth | Hundreds of lines; serial output dominated the run | Logging that is useful once per boot is noise once per allocation. Now reported at powers of two. |
+
+Defect 2 took *three* wrong guesses before the arithmetic got done: a size
+sequence that doubled, then a class index written as 16 when 64 KiB is
+class 12, then the realisation that even a correct 64 KiB sweep is too
+much. The fix was to compute the index from the byte count instead of
+writing it down.
+
+None of the three was in the allocator. Its limit check, OOM message and
+guard pages all worked the first time they were exercised — some evidence
+that reasoning about bounded `alloc`/`dealloc` in
+[ADR 016](docs/adr/016-kernel-heap-allocator.md) before writing the code
+was worth the time.
+
+What the ADR got *wrong* was a prediction, not a design: it claimed the
+slow path would run roughly once per size class. The measurement says 27%
+of allocations. The ADR now carries the number and the reason.
+
 ## What M3 cost: seven defects
 
 Each of these was found by running the thing, not by reading it. They are
@@ -508,6 +635,39 @@ just produce one.
 Things this milestone deliberately did not finish, each with the evidence
 and the milestone it belongs to.
 
+Claims that are *untestable here* rather than unfinished — the ones QEMU
+cannot settle — are collected separately in
+[docs/hardware-todo.md](docs/hardware-todo.md). The sharpest of them:
+deleting the body of `TlbFlush::flush` entirely, `invlpg` and `mfence`
+both, leaves all fifteen scenarios passing. The experiment was run. What
+`TlbFlush` buys in this environment is compile-time only.
+
+**The heap has no lock and no reference to a budget.** Same shape as the
+frame allocator's gap: one CPU, interrupts disabled, one non-reentrant
+entry point. There is also an `IN_ALLOC` flag that panics if the mapping
+path ever allocates — not a lock, a tripwire for a future mistake.
+
+**The heap never shrinks.** Freeing everything returns the live byte count
+to zero and leaves 12 MiB mapped; the free lists hold it for reuse within
+their own size class. Returning pages would mean counting live blocks per
+page, which is the same bookkeeping that
+[ADR 015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md) declined for
+page tables and for the same reason. **Revisit after M9**, when there is a
+real allocation pattern to measure instead of a synthetic one.
+
+**Allocations above 1 MiB panic.** Deliberate: the fallback would be a
+search for contiguous free pages, which is the unbounded loop the whole
+design exists to avoid. A kernel object that large should come from the
+frame allocator directly. See
+[ADR 016](docs/adr/016-kernel-heap-allocator.md).
+
+**M9 will need pre-warmed size classes.** Measured, not predicted: 27% of
+allocations in the acceptance test took the slow path, because nothing was
+being freed. On the IPC path that is the difference between 15
+instructions and up to 256 page mappings, decided by whether a free list
+happens to be empty. `heap::prewarm(class, count)` does not exist yet; its
+place is marked.
+
 **PMAP aliases the kernel image as writable.** No single page is both
 writable and executable, but `.text`'s physical frames are reachable
 read-write through the physical window. W^X therefore holds per virtual
@@ -517,10 +677,12 @@ means mapping the image's physical range read-only in the window, which
 costs a few extra page tables. **Due before M8.** See
 [ADR 010](docs/adr/010-hhdm-kaderi.md).
 
-**SMEP and SMAP are enabled but untested.** `-cpu qemu64` does not report
-them, so the code path runs (detect → skip → warn) but the protection has
-never been exercised. Re-run with `-cpu host` or a model that advertises
-them. **Due in M8**, when there is finally a user page to protect.
+**SMEP and SMAP are now on, but still protect nothing.** M3 left this as
+"enabled but untested"; M4 changed `QEMU_FLAGS` to
+`-cpu qemu64,+smep,+smap` and the boot log now reads `smep: enabled, smap:
+enabled`, which `run.py` requires in every scenario. What remains untested
+is the protection itself — there are no user mappings to protect until
+M8, so the bits are set and idle.
 
 **SMAP will need `stac`/`clac`.** Once user mappings exist, deliberate
 kernel access to user memory faults unless `EFLAGS.AC` is set. This should
@@ -566,11 +728,12 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: a heap (`alloc`
-does not exist yet — M4), external interrupts (the PIC is still masked as
-Limine left it), threads and scheduling, user-mode segments and ring 3, the
-capability object model (Untyped, CNode, TCB, Endpoint, Notification,
-Frame, PageTable, IRQHandler), user space, and IPC.
+Deliberately absent, each belonging to a later milestone: external
+interrupts (the PIC is still masked as Limine left it), threads and
+scheduling, user-mode segments and ring 3, the capability object model
+(Untyped, CNode, TCB, Endpoint, Notification, Frame, PageTable,
+IRQHandler), user space, and IPC.
 
 Everything *present* but incomplete is in **Known gaps** above, with the
-milestone that owes it.
+milestone that owes it. Everything that cannot be verified under QEMU is
+in [docs/hardware-todo.md](docs/hardware-todo.md).

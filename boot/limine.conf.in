@@ -15,6 +15,9 @@
 #  10 -> guard page         build/pythos-guardpage.iso  exit 35
 #  11 -> NX enforcement     build/pythos-nx.iso         exit 35
 #  12 -> stack overflow     build/pythos-stackovf.iso   exit 35
+#  13 -> kernel heap        build/pythos-heaptest.iso   exit 33
+#  14 -> heap exhaustion    build/pythos-heapoom.iso    exit 35
+#  15 -> heap guard page    build/pythos-heapguard.iso  exit 35
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -102,3 +105,25 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vm-stack-overflow
+
+/PythOS (kernel heap tests)
+    comment: Box/Vec/BTreeMap/String, 10000 sized allocations with canaries,
+    comment: growth, and a return to the baseline byte count. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: heap-test
+
+/PythOS (heap exhaustion)
+    comment: Allocate 1 MiB at a time and leak it until the heap hits its
+    comment: limit or physical memory runs out. Either way: a panic naming
+    comment: the size and alignment, never a silent null. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: heap-oom
+
+/PythOS (heap guard page)
+    comment: Write to the unmapped page above the heap's maximum extent.
+    comment: #PF with CR2 in the guard. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: heap-guard

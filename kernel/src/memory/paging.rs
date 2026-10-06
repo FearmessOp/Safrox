@@ -314,13 +314,31 @@ impl TlbFlush {
     }
 
     /// Invalidate this page's translation and discharge the obligation.
+    ///
+    /// # This is not verified by the test suite
+    ///
+    /// Replacing this entire function body with a no-op -- no `invlpg`, no
+    /// `mfence` -- and running the full acceptance suite under QEMU gives
+    /// **twelve passes out of twelve**. The experiment was run; this
+    /// paragraph is its result, not a guess.
+    ///
+    /// So the runtime value of this code is, in this environment, zero.
+    /// What `TlbFlush` buys is entirely at compile time: the `#[must_use]`
+    /// and the panicking `Drop` make it impossible to *forget* the
+    /// invalidation, whether or not forgetting would be observable here.
+    ///
+    /// Two things follow. First, the discipline is still worth having:
+    /// real hardware has a real TLB, and the bug class this prevents is
+    /// nondeterministic and distant from its cause. Second, nobody should
+    /// believe the suite is checking it. Listed in docs/hardware-todo.md
+    /// as something only real silicon can settle.
     pub fn flush(self) {
         // The page-table write has already happened. A barrier between the
         // write and the invalidation makes sure the CPU cannot reorder the
         // two -- the SDM may not strictly require it (4.10.4.1 is open to
-        // reading), but it could not be verified under QEMU, and where a
-        // thing cannot be measured the worst case is assumed. The cost is
-        // one instruction on a path that already touches page tables.
+        // reading), and QEMU cannot distinguish the two cases, so the
+        // worst case is assumed. One instruction on a path that already
+        // touches page tables.
         //
         // SAFETY: `mfence` orders memory operations and has no other
         // effect. `invlpg` invalidates one TLB entry; it requires CPL 0,

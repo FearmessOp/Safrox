@@ -376,9 +376,16 @@ fn report(f: &Features) {
         if f.nx_enabled { "set" } else { "CLEAR" }
     );
 
-    // SMEP and SMAP are advisory for now: no user mappings exist, so their
-    // absence cannot break anything in M3. It would matter in M8, which is
-    // why the warning names the milestone.
+    // SMEP and SMAP protect nothing yet -- no user mappings exist -- but
+    // they are enabled now so that M8 inherits the protection instead of
+    // having to remember it.
+    //
+    // The test environment asks QEMU for `-cpu qemu64,+smep,+smap`. Until
+    // M4 it did not, and the result was this path printing "unsupported"
+    // on every run: the code worked, the protection did not exist, and
+    // nothing failed. The acceptance runner now requires the "enabled"
+    // form of this line, so a CPU model that stops advertising them is a
+    // test failure rather than a silent downgrade.
     println!(
         "[cpu] smep: {}, smap: {}, pge: {}",
         feature_state(f.smep_supported, f.smep_enabled),
@@ -389,7 +396,7 @@ fn report(f: &Features) {
     if !f.smep_supported || !f.smap_supported {
         println!(
             "[cpu] WARNING: SMEP/SMAP unavailable on this CPU; ring 3 in M8 \
-             will have weaker isolation"
+             will have weaker isolation. Under QEMU, add +smep,+smap to -cpu."
         );
     }
 }

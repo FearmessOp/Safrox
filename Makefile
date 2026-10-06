@@ -45,11 +45,16 @@ ISO_STALETLB := $(BUILD_DIR)/pythos-staletlb.iso
 ISO_GUARD    := $(BUILD_DIR)/pythos-guardpage.iso
 ISO_NX       := $(BUILD_DIR)/pythos-nx.iso
 ISO_STACKOVF := $(BUILD_DIR)/pythos-stackovf.iso
+# M4 kernel heap images.
+ISO_HEAPTEST  := $(BUILD_DIR)/pythos-heaptest.iso
+ISO_HEAPOOM   := $(BUILD_DIR)/pythos-heapoom.iso
+ISO_HEAPGUARD := $(BUILD_DIR)/pythos-heapguard.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
                $(ISO_VMTEST) $(ISO_STALETLB) $(ISO_GUARD) $(ISO_NX) \
-               $(ISO_STACKOVF)
+               $(ISO_STACKOVF) \
+               $(ISO_HEAPTEST) $(ISO_HEAPOOM) $(ISO_HEAPGUARD)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -76,10 +81,21 @@ RUST_SRCS := $(shell find kernel/src -name '*.rs')
 # isa-debug-exit turns a guest I/O write into a host process exit status;
 #              see kernel/src/qemu.rs for the (value << 1) | 1 encoding
 
+# The CPU model is `qemu64` plus two features it does not advertise by
+# default. M3 enabled SMEP and SMAP from CPUID and found neither present,
+# so the detect-and-warn path ran but the protection itself was never
+# exercised. Asking for them explicitly means `cpu::init` reports
+# "enabled" and the bits are actually in CR4 -- which is the state M8 will
+# depend on.
+#
+# `+smep,+smap` rather than `-cpu max`: max pulls in everything the host
+# and QEMU version happen to support, which makes the test environment
+# depend on the developer's machine. Naming the two features keeps the
+# run reproducible.
 QEMU_FLAGS := \
 	-M q35 \
 	-m 256M \
-	-cpu qemu64 \
+	-cpu qemu64,+smep,+smap \
 	-no-reboot \
 	-no-shutdown \
 	-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -94,6 +110,7 @@ QEMU_FLAGS := \
 .PHONY: all build kernel isos run run-panic run-int3 run-pf run-df \
         run-memtest run-doublefree \
         run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
+        run-heaptest run-heapoom run-heapguard \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -197,6 +214,15 @@ $(ISO_NX): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 $(ISO_STACKOVF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 	$(call build_iso,$@,12)
 
+$(ISO_HEAPTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,13)
+
+$(ISO_HEAPOOM): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,14)
+
+$(ISO_HEAPGUARD): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,15)
+
 # ---- Run & test --------------------------------------------------------
 
 run: $(ISO)
@@ -239,6 +265,16 @@ run-nx: $(ISO_NX)
 run-stackovf: $(ISO_STACKOVF)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_STACKOVF) --expect stackovf -- $(QEMU_FLAGS)
 
+# M4 kernel heap scenarios.
+run-heaptest: $(ISO_HEAPTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_HEAPTEST) --expect heaptest -- $(QEMU_FLAGS)
+
+run-heapoom: $(ISO_HEAPOOM)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_HEAPOOM) --expect heapoom -- $(QEMU_FLAGS)
+
+run-heapguard: $(ISO_HEAPGUARD)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_HEAPGUARD) --expect heapguard -- $(QEMU_FLAGS)
+
 # The full acceptance suite, in order:
 #
 #   fmt        formatting is consistent
@@ -259,6 +295,9 @@ run-stackovf: $(ISO_STACKOVF)
 #   run-guardpage   writing below a kernel stack faults: exits 35
 #   run-nx          executing from a data page faults: exits 35
 #   run-stackovf    recursing off the main stack hits the guard: exits 35
+#   run-heaptest    Box/Vec/BTreeMap/String, 10k allocations, growth: 33
+#   run-heapoom     the heap runs out and says so, loudly: exits 35
+#   run-heapguard   writing above the heap's limit faults: exits 35
 #   self-test  the runner itself is proven to validate: handed the panic ISO
 #              while expecting success, it must FAIL. Without this, a runner
 #              that accepted everything would look identical to a working one.
@@ -266,10 +305,11 @@ run-stackovf: $(ISO_STACKOVF)
 # Every scenario additionally fails if the kernel banner appears twice,
 # which would mean the machine triple-faulted and rebooted.
 test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree \
-      run-vmtest run-staletlb run-guardpage run-nx run-stackovf
+      run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
+      run-heaptest run-heapoom run-heapguard
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M3: all acceptance tests passed"
+	@echo "M4: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"
