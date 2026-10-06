@@ -585,6 +585,63 @@ ADR 016 da ölçümlerle güncellendi: yavaş yolun sıklığı tahmin edilenden
 yüksek çıktı ve parçalanma rakamları artık varsayım değil, kabul testinin
 raporladığı sayılar.
 
+M5 architect pass (karar alındı, kod M5'te):
+
+- [017 — Nesne kümesi: sekiz tip](docs/adr/017-nesne-kumesi.md)
+- [018 — CPtr formatı: iki seviye, guard yok](docs/adr/018-cptr-ve-cspace.md)
+- [019 — Derivation tree ve revoke'un sınırı](docs/adr/019-derivation-tree.md)
+- [020 — Retype: atomiklik, watermark, sıfırlama](docs/adr/020-retype-semantigi.md)
+- [021 — Haklar: dört bit, monoton daralma](docs/adr/021-capability-haklari.md)
+- [022 — Kernel'in ayrıcalıklı kaynakları](docs/adr/022-kernelin-ayricalikli-kaynaklari.md)
+- [023 — Testler optimize edilip silinemez](docs/adr/023-test-disiplini.md)
+
+## The object model
+
+Fixed as of the M5 architect pass: the **eight object types, the CPtr
+format and the four rights bits will not change before M13**. The full
+reference — every object's size, invariants and invocations, a rights
+matrix, and an ASCII walkthrough of an Endpoint being retyped from an
+Untyped and then revoked — is in
+[docs/object-model.md](docs/object-model.md).
+
+Three decisions depart from seL4, each named where it happens:
+
+**One `PageTable` type instead of four.** seL4 gives PML4, PDPT, PD and
+PT separate object types, which catches level confusion at compile time.
+We use one type and decide the level by where the table is mapped. Four
+nearly identical retype paths and invocation sets were not worth the
+type safety, since the error is caught at runtime either way.
+
+**CPtr resolution has no loop.** seL4's guarded radix tree is the most
+flexible design and the hardest part of seL4 to understand; resolution
+walks a variable number of levels. Ours is fixed at two: 32 reserved bits
+that must be zero, 16 bits of L1 index, 16 of L0. Worst case is two
+memory accesses and three comparisons — under 20 instructions, no
+iteration. The cost is that CSpace hierarchies cannot nest more than two
+deep, so multi-level component delegation is closed off. The reserved
+bits leave room to open it.
+
+**Revocation is bounded but the bound is large.** The derivation tree
+lives in the capability slots as a doubly linked list in preorder, so
+revoke is a forward scan rather than a tree walk, and derivation depth is
+capped at 8 so the "is this a descendant" test is a single comparison.
+Breadth is not capped, though: the worst case on a 256 MiB machine is
+**8.4 million slots, about 56 ms**. The number was computed rather than
+hoped for, and it is written down in
+[ADR 019](docs/adr/019-derivation-tree.md) along with what happens during
+those 56 ms — interrupts are serviced, threads are not switched. To be
+re-examined in M10 against a measured workload.
+
+### Open questions
+
+Six decisions want review before M5's implementation begins, listed with
+options and a recommendation in
+[docs/m5-acik-sorular.md](docs/m5-acik-sorular.md). The two that would be
+most expensive to change later: whether to add a generation counter to
+CPtrs now (one comparison per lookup, closes an ABA hole), and whether
+the IPC buffer lives inside the TCB or in a separate Frame (decides the
+maximum message size for M9).
+
 ## What M4 cost: three defects, two of them in the tests
 
 | # | Defect | How it surfaced | What it says |
@@ -730,10 +787,14 @@ milestone for every range, is in
 
 Deliberately absent, each belonging to a later milestone: external
 interrupts (the PIC is still masked as Limine left it), threads and
-scheduling, user-mode segments and ring 3, the capability object model
-(Untyped, CNode, TCB, Endpoint, Notification, Frame, PageTable,
-IRQHandler), user space, and IPC.
+scheduling, user-mode segments and ring 3, user space, and IPC.
+
+The capability object model is **designed but not implemented**: the
+eight types, the CPtr format, the derivation tree and the rights
+semantics are fixed in [docs/object-model.md](docs/object-model.md) and
+ADRs 017–023. No code exists yet; that is M5.
 
 Everything *present* but incomplete is in **Known gaps** above, with the
 milestone that owes it. Everything that cannot be verified under QEMU is
-in [docs/hardware-todo.md](docs/hardware-todo.md).
+in [docs/hardware-todo.md](docs/hardware-todo.md). Everything awaiting a
+decision is in [docs/m5-acik-sorular.md](docs/m5-acik-sorular.md).
