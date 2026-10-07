@@ -40,18 +40,17 @@
 //! |---|---|---|
 //! | **M9a** | Endpoint, `Send`, `Recv`, the wait queue, cancellation | **live** |
 //! | **M9b** | `Call`, `Reply`, `ReplyRecv`, badges, reply validation | **live** |
-//! | M9c | capability transfer, Notification, bound waiting | written, `dead_code` |
+//! | **M9c** | capability transfer, Notification, bound waiting | **live** |
 //!
-//! The remaining part is marked `#[allow(dead_code)]` rather than
-//! commented out or deleted. Commenting it out would stop the
-//! compiler checking it; deleting it would throw away work that is
-//! correct as far as it goes. This way it is type-checked on every
-//! build and turned on by removing one attribute — and nothing
-//! claims to be tested that is not.
+//! Nothing is left behind `#[allow(dead_code)]`. Across the three
+//! parts that attribute did one job: keep written-but-unrun code
+//! under the compiler's eye while making sure **nothing claimed to
+//! be tested that was not.**
 //!
-//! Splitting the milestone paid for itself twice over. Turning M9b on
-//! found **four** defects that M9a's tests could not reach, every one
-//! of them on the first run of the scenario that reached it:
+//! Splitting the milestone paid for itself three times over. Turning
+//! M9b on found **four** defects that M9a's tests could not reach,
+//! every one of them on the first run of the scenario that reached
+//! it:
 //!
 //! * the global delivery slot was unsound — see [`Incoming`] in
 //!   `tcb.rs`; the invariant it asserted was never true, only
@@ -66,6 +65,25 @@
 //! Three of those are in code M9a shipped and tested. Written all at
 //! once, they would have arrived together, in a build that had never
 //! run.
+//!
+//! M9c then found three more — and found them by **reading the ADRs
+//! against the code before running anything**, which is cheaper
+//! still:
+//!
+//! * `release_ipc_references` had no `Notification` arm, hidden by a
+//!   `_ => {}`. A thread in `Wait` when its Notification was revoked
+//!   would have waited forever, and the scenario for it would not
+//!   have failed — it would have **hung**. Making that match
+//!   exhaustive also surfaced `IrqHandler`, which M12 will owe an
+//!   arm;
+//! * `wait`'s outcome match had a catch-all that swallowed
+//!   `Pending`, which is the one value M9b's panic exists to catch;
+//! * `recv`'s `pending_signal` was a hardcoded `false`, so bound
+//!   waiting — and with it the whole alternation branch — could
+//!   never run.
+//!
+//! One M9c mutation also **survived**, which is recorded rather than
+//! quietly dropped: see `ipctest::check_no_starvation` and ADR 038.
 //!
 //! [`Incoming`]: super::tcb::Incoming
 
@@ -611,9 +629,9 @@ pub unsafe fn endpoint_at(object: ObjectRef) -> &'static mut Endpoint {
 /// from these three sources" is. A counter would overflow, and what to
 /// do then is a question with no good answer (ADR 038).
 ///
-/// **M9c.** Retyping one already works — the object model has had the
-/// type since M5 — but nothing signals or waits on it until M9c.
-#[allow(dead_code)]
+/// Retyping one has worked since M5 — the object model has had the
+/// type all along — but nothing signalled or waited on one until
+/// M9c.
 #[repr(C, align(64))]
 pub struct Notification {
     /// Accumulated signal bits. Badges are OR'd in (ADR 037).
@@ -638,7 +656,6 @@ const _: () = {
     );
 };
 
-#[allow(dead_code)]
 impl Notification {
     pub fn signalled(&self) -> u32 {
         self.signalled
@@ -679,7 +696,6 @@ impl Notification {
 /// # Safety
 ///
 /// `slot` must hold a live Notification capability, unaliased.
-#[allow(dead_code)] // M9c
 pub unsafe fn notification_from_slot(slot: &Slot) -> Result<&'static mut Notification, CapError> {
     if slot.is_empty() {
         return Err(CapError::EmptySlot);
@@ -696,7 +712,6 @@ pub unsafe fn notification_from_slot(slot: &Slot) -> Result<&'static mut Notific
 /// # Safety
 ///
 /// `object` must name a live Notification, unaliased.
-#[allow(dead_code)] // M9c
 pub unsafe fn notification_at(object: ObjectRef) -> &'static mut Notification {
     debug_assert!(!object.is_null(), "null Notification address");
     debug_assert!(
@@ -735,6 +750,28 @@ static BOUND_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 /// "notification first" implementation would leave it at zero while
 /// everything else still passed.
 static ALTERNATION_CHOSE_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+/// Times the alternation bit chose the notification over a waiting
+/// sender.
+///
+/// The other half of the evidence. `ALTERNATION_CHOSE_ENDPOINT` alone
+/// would be satisfied by an "endpoint first" implementation, which
+/// starves the notification instead — the same defect in the other
+/// direction (ADR 038 rejected both). Requiring **both** counters to
+/// move is what shows the choice alternates rather than being fixed.
+static ALTERNATION_CHOSE_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `recv` should narrate each alternation decision.
+///
+/// Off by default and turned on by `ipc-starvation` alone. The
+/// scenario needs to see the *state at the decision*, not only which
+/// way it went — and three attempts at it were spent inferring that
+/// state from outcomes, which produced two wrong diagnoses.
+static ALTERNATION_TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// Turn the alternation trace on or off.
+pub fn set_alternation_trace(on: bool) {
+    ALTERNATION_TRACE.store(u64::from(on), Ordering::Release);
+}
 /// Cancellations: a queued thread removed by suspend or revoke.
 static CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 /// Replies that found their target gone (ADR 036).
@@ -783,6 +820,10 @@ pub fn alternation_chose_endpoint() -> u64 {
     ALTERNATION_CHOSE_ENDPOINT.load(Ordering::Acquire)
 }
 
+pub fn alternation_chose_notification() -> u64 {
+    ALTERNATION_CHOSE_NOTIFICATION.load(Ordering::Acquire)
+}
+
 pub fn cancellations() -> u64 {
     CANCELLATIONS.load(Ordering::Acquire)
 }
@@ -820,10 +861,11 @@ pub fn report() {
     );
     println!(
         "[ipc] notifications: {} signals delivered, {} to a bound waiter, \
-         {} times alternation chose the endpoint",
+         {} times alternation chose the endpoint and {} the notification",
         signals_delivered(),
         bound_deliveries(),
-        alternation_chose_endpoint()
+        alternation_chose_endpoint(),
+        alternation_chose_notification()
     );
     println!(
         "[ipc] {} cancellations, {} replies found their target gone",
@@ -908,7 +950,6 @@ unsafe fn copy_message(
 ///
 /// Both TCBs live, interrupts disabled, and `sender_space` the sender's
 /// own CSpace.
-#[allow(dead_code)] // M9c
 unsafe fn transfer_caps(
     sender: &Tcb,
     receiver: &Tcb,
@@ -1151,15 +1192,16 @@ unsafe fn complete_rendezvous(
     let registers =
         unsafe { copy_message(sender, receiver, &message.registers, message.tag.length()) };
 
-    // 2. Capabilities, into slots the receiver opened — **M9c**.
+    // 2. Capabilities, into slots the receiver opened (ADR 035).
     //
-    // Until then no message carries one: `validate` accepts a non-zero
-    // `caps` field, but nothing in M9a's path can produce a CPtr to
-    // transfer, and the tag below reports zero. That is not a silent
-    // drop — it is the honest count, which is exactly what ADR 034
-    // requires the receiver to be told.
-    let _ = sender_space;
-    let transferred = 0usize;
+    // Five checks, each dropping one capability and carrying on with
+    // the next. The count that comes back is what actually arrived,
+    // which is the only thing the receiver is told — see
+    // `transfer_caps` for why neither side gets an error.
+    //
+    // SAFETY: Both TCBs are live and distinct; interrupts disabled;
+    // `sender_space` is the sending thread's own CSpace.
+    let transferred = unsafe { transfer_caps(sender, receiver, message.caps, sender_space) };
 
     // 3. The tag, carrying the count that is true rather than the one
     //    that was asked for. A tag claiming four when one arrived
@@ -1506,7 +1548,6 @@ unsafe fn endpoint_phys(endpoint: &Endpoint) -> u64 {
 /// # Safety
 ///
 /// As [`endpoint_phys`].
-#[allow(dead_code)] // M9c
 unsafe fn notification_phys(notification: &Notification) -> u64 {
     let virt = core::ptr::from_ref(notification) as u64;
     virt - crate::memory::pmap_base()
@@ -1584,13 +1625,57 @@ pub unsafe fn recv(slot: &Slot) -> Result<Delivery, CapError> {
     // SAFETY: We are the running thread.
     let receiver = unsafe { crate::sched::current() };
 
-    // M9c: a bound notification holding a signal, and the alternation
-    // bit that keeps either source from starving the other (ADR 038).
-    // No thread has a bound notification until M9c, so this is false.
-    let pending_signal = false;
+    // A bound notification holding a signal, and the alternation bit
+    // that keeps either source from starving the other (ADR 038).
+    //
+    // SAFETY: We are the running thread; `bound_signal_pending` only
+    // reads, and a non-zero bound notification names a live object.
+    let pending_signal = unsafe { bound_signal_pending(receiver) };
     let sender_waiting = endpoint.state() == EndpointState::SendersWaiting;
 
-    if sender_waiting {
+    // **The alternation, and it is one branch.**
+    //
+    // When both sources are ready, the one that did *not* win last
+    // time wins now. ADR 038 calls this a correctness guarantee
+    // rather than an optimisation, and the distinction decides how it
+    // is verified: an optimisation is measured, a progress guarantee
+    // is not — it either holds or it does not. `ipc-starvation` is
+    // what shows this one holds, and it is built so that replacing
+    // this branch with "notification first" makes the scenario
+    // *hang*. An infinite wait is the definition of starvation, so a
+    // test that hangs is stronger evidence than one that prints a
+    // number.
+    //
+    // When only one source is ready there is nothing to alternate
+    // between: the bit is not consulted, only updated.
+    let take_endpoint = if sender_waiting && pending_signal {
+        receiver.last_delivery_was_notification()
+    } else {
+        sender_waiting
+    };
+
+    // Diagnostic trace for the starvation scenario, off by default.
+    //
+    // Three attempts at that scenario were spent reasoning about an
+    // interleaving none of the logs could show: the counters said
+    // which branch *won*, never what the state was when the choice
+    // was made. Guessing from an outcome is how the last two
+    // "fixes" went in — one of them a real kernel change made for a
+    // reason that turned out to be wrong.
+    //
+    // Turned on by the test, so an ordinary run pays nothing.
+    if ALTERNATION_TRACE.load(Ordering::Acquire) != 0 {
+        crate::println!(
+            "[ipc] trace: sender_waiting={} pending_signal={} \
+             last_was_ntfn={} -> take_endpoint={}",
+            sender_waiting,
+            pending_signal,
+            receiver.last_delivery_was_notification(),
+            take_endpoint
+        );
+    }
+
+    if take_endpoint {
         if pending_signal {
             // Both were ready and alternation chose the endpoint. This
             // counter is the evidence for ADR 038's guarantee: a
@@ -1665,9 +1750,26 @@ pub unsafe fn recv(slot: &Slot) -> Result<Delivery, CapError> {
             }
         }
 
-        if pending_signal {
-            receiver.set_last_delivery_was_notification(false);
+        // The bit is updated whether or not there was a choice to
+        // make. Only updating it when both sources were ready would
+        // leave it stale: a thread that took ten endpoint messages
+        // with no signals pending would still have it reading
+        // "notification last", and the first time both arrived
+        // together the endpoint would win again.
+        receiver.set_last_delivery_was_notification(false);
+        return Ok(delivery);
+    }
+
+    // The bound notification won — either because it was the only
+    // source ready, or because alternation chose it over a waiting
+    // sender.
+    if pending_signal {
+        if sender_waiting {
+            ALTERNATION_CHOSE_NOTIFICATION.fetch_add(1, Ordering::AcqRel);
         }
+        // SAFETY: Running thread, and `bound_signal_pending` just
+        // found a live bound notification holding a signal.
+        let delivery = unsafe { deliver_bound_signal(receiver) };
         return Ok(delivery);
     }
 
@@ -2011,7 +2113,6 @@ pub unsafe fn cancel_all_waiters(endpoint: &mut Endpoint) -> usize {
 /// # Safety
 ///
 /// `slot` must hold a live Notification capability.
-#[allow(dead_code)] // M9c
 pub unsafe fn signal(slot: &Slot) -> Result<(), CapError> {
     let _guard = crate::sched::InterruptGuard::new();
 
@@ -2084,6 +2185,21 @@ pub unsafe fn signal(slot: &Slot) -> Result<(), CapError> {
                 registers: [0; REGISTER_WORDS],
             };
 
+            // The bit records what was delivered last, so the next
+            // *contested* decision can pick the other source. This
+            // delivery is uncontested -- the thread was blocked and
+            // only the notification was ready -- but it is still a
+            // delivery, and the next decision should know a
+            // notification went most recently.
+            //
+            // Worth recording that this line was removed during
+            // M9c and then put back. The starvation scenario was
+            // reporting `chose endpoint 7 / notification 0`, and
+            // deleting this looked like the cause: it inverted the
+            // figures to 0/7, which is not a fix but the same defect
+            // mirrored. The actual explanation was in the test, and
+            // it took a trace of the decision state to see it. See
+            // `ipc-starvation` for what the figures mean.
             bound.set_last_delivery_was_notification(true);
             bound.record_send_outcome(tcb::SendOutcome::Delivered);
             SIGNALS_DELIVERED.fetch_add(1, Ordering::AcqRel);
@@ -2110,7 +2226,6 @@ pub unsafe fn signal(slot: &Slot) -> Result<(), CapError> {
 ///
 /// `slot` must hold a live Notification capability; no other mutable
 /// borrow of the current TCB may be held.
-#[allow(dead_code)] // M9c
 pub unsafe fn wait(slot: &Slot) -> Result<u32, CapError> {
     let _guard = crate::sched::InterruptGuard::new();
 
@@ -2149,16 +2264,114 @@ pub unsafe fn wait(slot: &Slot) -> Result<u32, CapError> {
         crate::sched::block_current();
     }
 
+    // Woken: a signal arrived, or the Notification was revoked.
+    //
+    // The outcome is matched **exhaustively**, and that is M9b's
+    // lesson applied to a path M9b never reached. The first version
+    // of this code had a `_ =>` arm, which looks tidy and is not: it
+    // folds `Pending` — "nothing happened, and yet here you are" —
+    // into the same answer as a cancelled wait. A thread resumed from
+    // an IPC wait was resumed by *something*, and that something owes
+    // it an answer; three separate wake paths in M9b turned out not
+    // to be recording one, and every one of them was found by this
+    // panic rather than by a wrong result.
+    //
+    // A catch-all would have hidden all three.
     match thread.take_send_outcome() {
         tcb::SendOutcome::Delivered => {
             // SAFETY: Running again, interrupts disabled.
             Ok(unsafe { take_delivery(thread) }.badge)
         }
-        _ => {
-            notification.clear_waiter();
-            Err(CapError::EndpointDead)
+        // The Notification was revoked while this thread waited on it
+        // (ADR 039). `cancel_notification_wait` already cleared the
+        // waiter field — the object may not exist any more, so
+        // touching it here would be a use-after-free.
+        tcb::SendOutcome::Cancelled => Err(CapError::EndpointDead),
+        // Not reachable from a Notification wait: `ReplyGone` is
+        // recorded only for a thread in `BlockedOnReply`, and `Wait`
+        // never enters that state. Stated as a claim about the state
+        // machine rather than handled as a case.
+        tcb::SendOutcome::ReplyGone => panic!(
+            "a thread waiting on a Notification woke with outcome \
+             ReplyGone, which is only recorded for a thread in \
+             BlockedOnReply -- Wait never enters that state"
+        ),
+        outcome @ tcb::SendOutcome::Pending => {
+            unexpected_wake("Wait, blocked on a Notification", outcome)
         }
     }
+}
+
+/// Wake the thread waiting on a Notification that is being revoked
+/// (ADR 039).
+///
+/// The Notification's counterpart to [`cancel_all_waiters`], and the
+/// reasoning is the same one ADR 039 gives for endpoints: the waiter
+/// may belong to *another component*, so refusing the revoke would
+/// let any component make a Notification immortal by parking a
+/// thread on it.
+///
+/// At most one thread can be waiting (ADR 038), so this is O(1) and
+/// there is no queue to drain.
+///
+/// # Safety
+///
+/// `notification` must be live and interrupts disabled.
+pub unsafe fn cancel_notification_waiter(notification: &mut Notification) -> bool {
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    let waiter_phys = notification.waiter();
+    if waiter_phys == 0 {
+        return false;
+    }
+
+    // SAFETY: A non-zero waiter is the address of a live TCB that
+    // blocked in `wait`; `wait` is the only writer and it clears the
+    // field on every exit.
+    let waiter = unsafe { tcb::tcb_at(ObjectRef(PhysAddr(waiter_phys))) };
+
+    // Cleared **here**, before the object goes away. `wait` cannot do
+    // it on the way out: by then the Notification may have been
+    // retyped into something else, and clearing a field through that
+    // pointer would write into a stranger.
+    notification.clear_waiter();
+
+    waiter.discard_incoming();
+    waiter.record_send_outcome(tcb::SendOutcome::Cancelled);
+    CANCELLATIONS.fetch_add(1, Ordering::AcqRel);
+
+    // SAFETY: A thread blocked in `wait` sits in no endpoint queue.
+    unsafe {
+        make_runnable(waiter);
+    }
+    true
+}
+
+/// Break the two-way link between a dying Notification and the thread
+/// bound to it (ADR 038).
+///
+/// Without this, a revoked Notification would leave `bound_notification`
+/// pointing at memory that may since have been retyped — and the next
+/// `Recv` by that thread calls `bound_signal_pending`, which would
+/// read a stranger's bytes as a signal mask.
+///
+/// # Safety
+///
+/// As [`cancel_notification_waiter`].
+pub unsafe fn release_bound_tcb(notification: &mut Notification) -> bool {
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    let bound_phys = notification.bound_tcb();
+    if bound_phys == 0 {
+        return false;
+    }
+
+    // SAFETY: A non-zero `bound_tcb` names the live TCB that
+    // `bind_notification` linked; both ends are written together.
+    let bound = unsafe { tcb::tcb_at(ObjectRef(PhysAddr(bound_phys))) };
+    bound.set_bound_notification(0);
+    notification.set_bound_tcb(0);
+    true
 }
 
 /// `Poll`: read and clear the mask without blocking.
@@ -2172,7 +2385,6 @@ pub unsafe fn wait(slot: &Slot) -> Result<u32, CapError> {
 /// # Safety
 ///
 /// `slot` must hold a live Notification capability.
-#[allow(dead_code)] // M9c
 pub unsafe fn poll(slot: &Slot) -> Result<u32, CapError> {
     let _guard = crate::sched::InterruptGuard::new();
 
@@ -2197,7 +2409,6 @@ pub unsafe fn poll(slot: &Slot) -> Result<u32, CapError> {
 /// # Safety
 ///
 /// `thread` must be live.
-#[allow(dead_code)] // M9c
 unsafe fn bound_signal_pending(thread: &Tcb) -> bool {
     let bound = thread.bound_notification();
     if bound == 0 {
@@ -2215,7 +2426,6 @@ unsafe fn bound_signal_pending(thread: &Tcb) -> bool {
 ///
 /// `thread` must be the running thread with a live bound notification
 /// holding a pending signal; interrupts disabled.
-#[allow(dead_code)] // M9c
 unsafe fn deliver_bound_signal(thread: &mut Tcb) -> Delivery {
     // SAFETY: Caller's guarantee.
     let notification = unsafe { notification_at(ObjectRef(PhysAddr(thread.bound_notification()))) };
@@ -2243,7 +2453,6 @@ unsafe fn deliver_bound_signal(thread: &mut Tcb) -> Delivery {
 /// # Safety
 ///
 /// Both slots must hold live capabilities of the right types.
-#[allow(dead_code)] // M9c
 pub unsafe fn bind_notification(tcb_slot: &Slot, ntfn_slot: &Slot) -> Result<(), CapError> {
     let _guard = crate::sched::InterruptGuard::new();
 
@@ -2283,7 +2492,6 @@ pub unsafe fn bind_notification(tcb_slot: &Slot, ntfn_slot: &Slot) -> Result<(),
 /// # Safety
 ///
 /// As [`bind_notification`].
-#[allow(dead_code)] // M9c
 pub unsafe fn unbind_notification(tcb_slot: &Slot) -> Result<(), CapError> {
     let _guard = crate::sched::InterruptGuard::new();
 
@@ -2325,7 +2533,6 @@ pub unsafe fn unbind_notification(tcb_slot: &Slot) -> Result<(), CapError> {
 ///
 /// `tcb_slot` must hold a live TCB capability and `cnode_slot`, if
 /// given, a live CNode capability.
-#[allow(dead_code)] // M9c
 pub unsafe fn set_receive_slots(
     tcb_slot: &Slot,
     cnode_slot: Option<&Slot>,

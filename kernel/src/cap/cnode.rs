@@ -623,7 +623,71 @@ unsafe fn release_ipc_references(slot: &Slot) {
                 );
             }
         }
-        _ => {}
+        CapType::Notification => {
+            // **M9c, and the arm that was missing.**
+            //
+            // Until M9c nothing could wait on a Notification, so the
+            // fall-through below was unreachable rather than wrong.
+            // The moment `Wait` became live it was both: a thread
+            // blocked on a revoked Notification would have stayed
+            // blocked forever, and `ipc-notification-revoked` would
+            // have hung rather than failed.
+            //
+            // Found by reading this function against ADR 039 before
+            // writing the scenario. Worth recording *how*: the catch-
+            // all `_ => {}` arm is what hid it. An exhaustive match
+            // would have been a build failure the day CapType gained
+            // the variant -- the same argument as `wait`'s outcome
+            // match in ipc.rs, and the same conclusion.
+            //
+            // SAFETY: The slot holds a live Notification and
+            // interrupts are disabled, so nothing can begin waiting
+            // on it meanwhile.
+            let notification = unsafe { crate::cap::ipc::notification_at(slot.object()) };
+
+            // SAFETY: As above.
+            let woken = unsafe { crate::cap::ipc::cancel_notification_waiter(notification) };
+            if woken {
+                crate::println!(
+                    "[ipc] notification at {} deleted with a thread waiting; \
+                     woken with EndpointDead (ADR 039)",
+                    slot.object()
+                );
+            }
+
+            // The bound thread is not waiting *on* this object, but it
+            // holds a pointer to it -- and its next `Recv` would read
+            // that pointer to ask whether a signal is pending. After
+            // the revoke the memory may be anything at all.
+            //
+            // SAFETY: As above.
+            let unbound = unsafe { crate::cap::ipc::release_bound_tcb(notification) };
+            if unbound {
+                crate::println!(
+                    "[ipc] notification at {} was bound to a thread; the \
+                     binding is broken rather than left dangling (ADR 038)",
+                    slot.object()
+                );
+            }
+        }
+        // Everything else: an object nothing in the IPC layer holds a
+        // reference to. Listed rather than matched with `_` so that a
+        // new CapType is a build failure here -- which is exactly how
+        // the Notification arm above came to be missing.
+        //
+        // That paid off immediately. Making this match exhaustive
+        // produced `non-exhaustive patterns: CapType::IrqHandler not
+        // covered` -- a variant M12 will need an arm for, since an
+        // IRQHandler binds to a Notification (ADR 038) and revoking
+        // one has to break that binding. Today nothing creates an
+        // IrqHandler, so there is nothing to release; when M12
+        // arrives, this line is where the compiler will stop it.
+        CapType::Null
+        | CapType::Untyped
+        | CapType::CNode
+        | CapType::Frame
+        | CapType::PageTable
+        | CapType::IrqHandler => {}
     }
 }
 

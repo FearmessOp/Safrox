@@ -23,6 +23,37 @@ Dört, bir ölçüm değil bir yargı. Gerekçe:
 bir derivation ağacı ekleme (ADR 019). Dördü, en kötü durumda IPC
 yolunun maliyetini belirgin biçimde artırıyor ama sınırlı tutuyor.
 
+> **Ölçüldü (M9c, `ipc-cap-cost`).** Yargının dayandığı "sınırlı
+> iş" artık bir rakam — ve rakamın hangi yarısının güvenilir olduğu
+> da bir bulgu:
+>
+> | Yük | Çevrim (tek başına) | Çevrim (suite içinde) |
+> |---|---|---|
+> | `Send`+`Recv`, 0 cap | 1302 | — |
+> | 1 cap | 2058 | — |
+> | 4 cap | 3360 | — |
+> | **ilk cap** | 756 | **1806** |
+> | **sonraki her cap** | ~434 | ~126 |
+>
+> **İlk cap'in rakamı ölçüm değil.** Hedef CNode'un slotlarına ilk
+> dokunuşu — bir sayfa dolaşımı ve bir önbellek doldurma —
+> taşıyor, ve örneklerin minimumu bunu temizleyemiyor: her örnek o
+> slotları silip yeniden dolduruyor, yani ısınma *yolu* ısıtıyor,
+> veriyi değil. Ne kadarının bu rakama düştüğü, öncesinde ne
+> koştuğuna bağlı.
+>
+> İlk sürümde "dördüncü cap birincisi kadar mı" diye sorulmuştu ve
+> assertion **kararsız** çıktı: tek başına 756/434 ile geçti,
+> `make test` içinde 1806/126 ile düştü — 14 kat, süperdoğrusal bir
+> maliyet diye raporlandı, ki öyle bir şey yoktu.
+>
+> Güvenilir olan ve ADR'nin savının gerçekten ilgilendiği rakam
+> **marjinal** maliyet: ikinci cap ile dördüncü arasında büyüyor
+> mu. Büyümüyor. Dört bir sınır, bir uçurum değil.
+>
+> Emülasyon şerhi: QEMU'nun TCG'si önbellek davranışını modellemiyor
+> ve CPtr çözümlemeleri bir CNode dolaşıyor. Rakamlar bir **taban**.
+
 **M13 için yeterli.** En karmaşık senaryo: init sistemi bir bileşen
 başlatırken ona CSpace kökü, VSpace kökü, bir Endpoint ve bir
 Notification veriyor — tam dört. Beşinci gerekiyorsa ikinci bir
@@ -242,7 +273,17 @@ kabul edilebilir.
   kurulamaz.
 - Beş kontrol, her biri **sessizce düşürüyor**: CPtr geçersiz,
   `GRANT` yok, hedef dolu, derinlik aşıldı. Bir cap'in düşmesi
-  diğerlerini etkilemiyor.
+  diğerlerini etkilemiyor. Beşi de M9c'de ayrı ayrı tetikleniyor
+  (`ipc-cap-test` 1–6, ADR 023'ün K5'i), ve "cap düştü" ile "mesaj
+  geçti" **ayrı** iddialar olarak yazılıyor: mesajın tamamını
+  reddeden bir kernel, yalnızca birincisine bakan bir testi geçerdi.
+  Dolu slot senaryosunda engel **ortada** — ilkte olsaydı, ilk
+  engelde pes eden bir uygulama da geçerdi.
+- **Maliyeti ölçüldü** (`ipc-cap-cost`): marjinal maliyet cap
+  sayısıyla büyümüyor, yani dört bir sınır — bir uçurum değil. İlk
+  cap'in rakamı koşudan koşuya değişiyor (756 ↔ 1806) çünkü hedef
+  slotlara ilk dokunuşu taşıyor; o yüzden iddia marjinal maliyet
+  üzerine kurulu, ilk cap üzerine değil.
 - Hata dönmemenin gerekçesi: gönderene dönmek tarama imkânı verir,
   alıcıya dönmek gereksiz — `caps` sayısı zaten söylüyor.
 - Haklar transferde **değişmiyor**. Daraltma `copy` ile, önceden.

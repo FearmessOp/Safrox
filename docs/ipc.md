@@ -3,8 +3,8 @@
 Bu belge ADR 033–040'ın birlikte ne anlama geldiğini tek yerde
 topluyor. Kararların gerekçesi ADR'lerde; burada **ne olduğu** var.
 
-Güncelleme: **M9a ve M9b uygulandı.** Belge hem şartname hem de
-artık çalışan kodun tarifi; ikisinin ayrımı aşağıdaki tabloda.
+Güncelleme: **M9 tamamlandı — M9a, M9b ve M9c.** Belge artık
+şartname değil, çalışan kodun tarifi.
 
 ## Kapsam: ne çalışıyor, ne yazıldı ama kapalı
 
@@ -17,19 +17,42 @@ tamamı "denenmemiş iddia iddia değildir" üzerine kurulu.
 |---|---|---|
 | **M9a** | Endpoint, `Send`, `Recv`, bekleme kuyruğu, iptal | **çalışıyor, test ediliyor** |
 | **M9b** | `Call`, `Reply`, `ReplyRecv`, badge, cevap doğrulama | **çalışıyor, test ediliyor** |
-| M9c | Capability transferi, Notification, bağlı bekleme | yazıldı, `dead_code` |
+| **M9c** | Capability transferi, Notification, bağlı bekleme | **çalışıyor, test ediliyor** |
 
-Kalan parça yorum satırına alınmadı, silinmedi:
-`#[allow(dead_code)]` ile duruyor. Yorumlamak derleyicinin
-denetimini keserdi; silmek, olduğu kadarıyla doğru olan işi çöpe
-atardı. Böylece her derlemede tip denetiminden geçiyor ve bir
-attribute silinerek açılıyor — ve **hiçbir şey test edilmediği
-halde test edilmiş gibi durmuyor.**
+`#[allow(dead_code)]` arkasında bekleyen bir şey kalmadı. Üç parça
+boyunca o attribute'un yaptığı iş şuydu: yazılmış ama hiç
+koşturulmamış kodu derleyici denetiminde tutmak, ve **test
+edilmediği halde test edilmiş gibi durmasını engellemek.**
 
-Bu belgedeki M9c bölümleri dolayısıyla hâlâ şartname. M9a ve M9b'nin
-bölümleri ölçülmüş: kabul testleri `ipc-test`, `ipc-cancel-cost`,
+Kabul testleri: `ipc-test`, `ipc-cancel-cost`,
 `ipc-endpoint-revoked`, `ipc-call-test`, `ipc-server-dies`,
-`ipc-stale-reply`, `ipc-self-call` ve `ipc-cost`.
+`ipc-stale-reply`, `ipc-self-call`, `ipc-cost`, `ipc-cap-test`,
+`ipc-cap-hostile`, `ipc-notification-revoked`, `ipc-cap-cost`.
+Toplam 46 senaryo.
+
+### M9c'nin bulduğu üç kusur — ve hayatta kalan bir mutasyon
+
+M9c'yi açmadan önce ADR 035 ve 038, yazılmış `dead_code` ile
+karşılaştırıldı. Üç eksik çıktı, üçü de kod koşmadan:
+
+1. **`release_ipc_references`'ta Notification kolu yoktu.** Bir
+   `_ => {}` kolu onu saklıyordu. `Wait`'te bekleyen bir thread,
+   Notification revoke edilince sonsuza kadar bekleyecekti —
+   `ipc-notification-revoked` başarısız olmaz, **asılırdı**. Kol
+   eklendi ve `match` tüketici yapıldı; derleyici o anda
+   `IrqHandler`'ı da bildirdi (M12'nin borcu, kaydedildi).
+2. **`wait()`'in `_ =>` kolu `Pending`'i yutuyordu.** M9b'nin
+   kuralı: her uyandırma yolu bir cevap borçlu, ve "tanımsız" bir
+   cevap değil. Yakalayıcı kol, M9b'de üç ayrı kusuru bulan paniği
+   susturuyordu.
+3. **`recv`'de `pending_signal` sabit `false`'tu.** Bağlı bekleme
+   hiç çalışmıyordu; dönüşüm dalı erişilemezdi.
+
+Ve bir **K5 mutasyonu hayatta kaldı** — dönüşüm kaldırıldığında
+açlık senaryosu geçmeye devam etti. Sebebi ADR 038'in düzeltme
+notunda: bloke bir thread'e giden sinyal teslimatta tüketiliyor,
+dolayısıyla bu yapılandırmada bağlı alıcı zaten aç bırakılamıyor.
+Dönüşüm uygulandı ve çalışıyor; açlık savı M12'de sınanacak.
 
 ### Parçalara bölmek ne kazandırdı
 

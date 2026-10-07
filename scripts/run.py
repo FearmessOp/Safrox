@@ -2259,6 +2259,239 @@ EXPECTATIONS = {
             re.compile(r"did not cost more than a bare rendezvous", re.M),
         ],
     ),
+    # ---- M9c: capability transfer and notifications --------------------
+    #
+    # Four scenarios, all exiting 33 -- including both negatives. A
+    # dropped capability and a woken waiter are outcomes, not faults.
+    "ipccap": Expectation(
+        name="capability transfer",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # 1. All four counts, each landing in the right slot with
+            #    rights intact. "in order" is required text: a
+            #    transfer delivering the right *number* in the wrong
+            #    order would satisfy a count.
+            re.compile(
+                r"^\[ipc\] caps: 1, 2, 3 and 4 capabilities each arrived "
+                r"in the receiver's own slots, in order, with rights "
+                r"unchanged; [1-9]\d* transferred in total",
+                re.M,
+            ),
+            # 2. The fifth is refused by the tag rather than dropped by
+            #    the loop -- the limit lives in the message format.
+            re.compile(
+                r"^\[ipc\] caps: a 5-capability message is refused by the "
+                r"tag with TooManyCaps",
+                re.M,
+            ),
+            # 3. **Two outcomes, and the second is the load-bearing
+            #    one.** A kernel that failed the whole send would pass
+            #    a check that only looked at the dropped capability.
+            re.compile(
+                r"^\[ipc\] caps: a capability without GRANT was dropped "
+                r"silently and \*\*the message still arrived\*\* -- tag "
+                r"says caps=0, label intact",
+                re.M,
+            ),
+            # 4. No window is an absence rather than a refusal.
+            re.compile(
+                r"^\[ipc\] caps: with no receive window open, 2 "
+                r"capabilities went nowhere and the message arrived intact",
+                re.M,
+            ),
+            # 5. The obstacle in the middle: 1st and 3rd through, 2nd
+            #    dropped, occupant untouched.
+            re.compile(
+                r"^\[ipc\] caps: three sent with the MIDDLE destination "
+                r"occupied -- the 1st and 3rd arrived, the 2nd was "
+                r"dropped, and the occupant is untouched",
+                re.M,
+            ),
+            # 6. The delegation chain stops at the depth limit.
+            re.compile(
+                r"^\[ipc\] caps: a capability already at depth 8 was "
+                r"dropped rather than carried to depth 9",
+                re.M,
+            ),
+            # 7. Signals OR rather than overwrite. Requiring the
+            #    combined mask by value is what rules out a
+            #    "last signal wins" implementation.
+            re.compile(
+                r"^\[ipc\] notification: two badged signals accumulated to "
+                r"0x101 -- both bits present, so the mask ORs rather than "
+                r"overwrites",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] notification: Wait blocked while the mask was "
+                r"empty",
+                re.M,
+            ),
+            # 8. One thread, both sources, and the tag bit telling them
+            #    apart. Both halves required: a kernel that only ever
+            #    delivered notifications would pass the first.
+            re.compile(
+                r"^\[ipc\] bound: one thread in Recv was woken by "
+                r"\*\*both\*\* sources -- a signal \(mask 0x100, "
+                r"IS_NOTIFICATION set\) and an endpoint message",
+                re.M,
+            ),
+            # 9. **The starvation test.**
+            #
+            # The run length carries the claim: starvation is not
+            # "slow once" but "always behind another one", so the
+            # figure is the longest run of notifications between two
+            # endpoint deliveries. Several endpoint deliveries are
+            # required, because one proves nothing -- with a queued
+            # sender the first round takes a message before any
+            # signal can exist.
+            #
+            # The contested count must be non-zero: that is what says
+            # the alternation branch ran at all. *Which way* each
+            # contested decision went is deliberately not required --
+            # see the note in `check_no_starvation` for why that is a
+            # property of the stream's rhythm rather than of a
+            # correct kernel. An earlier version of this pattern did
+            # require both directions, and it was wrong.
+            re.compile(
+                r"^\[ipc\] starvation: under a continuous signal stream, "
+                r"[1-9]\d* endpoint messages got through and the longest "
+                r"run of notifications between any two of them was \d+ "
+                r"\(bound 4, stream capped at 200\)\. [1-9]\d* decisions "
+                r"were contested",
+                re.M,
+            ),
+            # And the note that the contention is built rather than
+            # hoped for. Required text, because a later edit replacing
+            # the driven stream with a free-running one would still
+            # pass on a lucky run (ADR 023's K8).
+            re.compile(
+                r"^\[ipc\] starvation: the stream is driven one signal per "
+                r"round by the test itself",
+                re.M,
+            ),
+            re.compile(r"^\[ipc\] all M9c capability transfer tests passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+    "ipccaphostile": Expectation(
+        name="hostile capability transfers",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # Four shapes, and **zero transferred**. The count is what
+            # makes this more than "no crash": a kernel that let one
+            # through would still print a cheerful summary.
+            re.compile(
+                r"^\[ipc\] cap-hostile: 4 malformed transfers refused -- "
+                r"reserved bits, leaf index out of range, root index out "
+                r"of range, and a well-formed capability without GRANT\. "
+                r"[1-9]\d* dropped, 0 transferred, and every message "
+                r"still arrived",
+                re.M,
+            ),
+            # The claim this scenario exists for.
+            re.compile(
+                r"^\[ipc\] cap-hostile: the kernel is still running",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+    "ipcntfnrev": Expectation(
+        name="revoked notification",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The kernel says so from inside `delete`, which is where
+            # the wiring lives -- the same reasoning as `ipcrevoked`:
+            # this tests that the call is present, not only that its
+            # effect was achieved somehow.
+            re.compile(
+                r"^\[ipc\] notification at .* deleted with a thread "
+                r"waiting; woken with EndpointDead",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] notification-revoked: the waiter woke with "
+                r"EndpointDead and received no mask",
+                re.M,
+            ),
+            # And the reasoning, which is ADR 039's rather than
+            # ADR 026's.
+            re.compile(
+                r"^\[ipc\] notification-revoked: woken rather than the "
+                r"delete being refused",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "ipccapcost": Expectation(
+        name="capability transfer cost (measurement)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # Three figures, all non-zero.
+            re.compile(
+                r"^\[ipc\] cap-cost: Send\+Recv with 0 caps [1-9]\d* "
+                r"cycles, 1 cap [1-9]\d* cycles, 4 caps [1-9]\d* cycles",
+                re.M,
+            ),
+            # The per-capability cost, which is ADR 035's actual claim:
+            # four is a limit because each one is bounded work, not
+            # because four happens to be affordable.
+            #
+            # The *first* capability's figure is deliberately not
+            # constrained here. It carries the first touch of the
+            # destination slots and moves between runs -- 756
+            # standalone against 1806 inside the suite -- which made
+            # an earlier assertion comparing it to the marginal cost
+            # intermittent. The marginal figure is the stable one and
+            # the one the ADR's argument is about.
+            re.compile(
+                r"^\[ipc\] cap-cost: the first capability costs [1-9]\d* "
+                r"cycles, each of the next three about \d+",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] cap-cost: each capability past the first costs "
+                r"about [1-9]\d* cycles and the count does not change that",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] cap-cost: measured under emulation",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            # The kernel's own sanity checks on the measurement.
+            re.compile(r"did not cost more than carrying none", re.M),
+            re.compile(r"is not plausibly flat", re.M),
+        ],
+    ),
 }
 
 

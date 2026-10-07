@@ -449,3 +449,50 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: ipc-cost
+/+PythOS (M9c: capability transfer)
+    comment: ADR 035's authority half. Four capabilities at most, into
+    comment: slots the RECEIVER opened -- a sender cannot name a
+    comment: destination in another CSpace, so there is nothing for it
+    comment: to force. Six transfer scenarios and three notification
+    comment: ones, including the starvation test that is the whole
+    comment: reason ADR 038's alternation bit exists. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-captransfer
+
+/+PythOS (M9c: hostile capability transfers)
+    comment: Malformed transfers: reserved CPtr bits, a leaf index past
+    comment: its CNode, a root index past the root, and a well-formed
+    comment: capability without GRANT. Each is dropped silently (ADR
+    comment: 035 refuses to tell either side, because telling the
+    comment: sender would let it scan the receiver's CSpace) and every
+    comment: message still arrives. The kernel stays up: these are
+    comment: caller errors, and from M13 the caller is a component.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-captransferhostile
+
+/+PythOS (M9c: revoked notification)
+    comment: A thread blocked in Wait when the Notification's
+    comment: capability is deleted. It wakes with EndpointDead rather
+    comment: than waiting forever -- ADR 039's reasoning, which is not
+    comment: ADR 026's: the waiter may be another component's thread,
+    comment: so refusing the revoke would make the object immortal.
+    comment: Without the Notification arm in release_ipc_references
+    comment: this does not fail, it hangs. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-notification-revoked
+
+/+PythOS (M9c: capability transfer cost)
+    comment: What a capability costs on the IPC path: Send+Recv with 0,
+    comment: 1 and 4 of them. ADR 035 chose four on the grounds that
+    comment: each is bounded work -- a CPtr resolution, a rights check,
+    comment: a slot check and a derivation insertion -- and this is the
+    comment: figure behind that claim. Three points rather than two, so
+    comment: the fourth capability can be compared against the first.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-captransfercost

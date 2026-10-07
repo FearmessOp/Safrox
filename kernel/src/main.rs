@@ -702,7 +702,22 @@ extern "C" fn kmain() -> ! {
 
     // M5 capability scenarios.
     //
-    // `cap-test` is checked last. It is a substring of nothing here, but
+    // `cap-test` is checked last — and M9c proved why that mattered.
+    //
+    // The note here used to read "it is a substring of nothing here",
+    // which was true when written and stopped being true the moment
+    // M9c added a scenario. That one was spelled `ipc-cap-test`, which
+    // *contains* `cap-test`, so the capability suite ran first, filled
+    // the object CNode, and the IPC scenario died on `SlotNotEmpty` —
+    // a fixture failure reported from a test nobody had asked to run.
+    //
+    // The IPC scenarios are now spelled `ipc-captransfer` and friends,
+    // with no token containing another. Ordering rules are a fragile
+    // way to hold this invariant: each one has to be remembered by
+    // whoever adds the next scenario, and the failure is silent. Names
+    // that cannot overlap need remembering once.
+    //
+    // `cap-test` is a substring of nothing here, and the one that
     // the three other tokens all begin "cap-", and `contains` does not
     // care about word boundaries; ordering the specific ones first means
     // a future token like "cap-test-extra" cannot silently run the wrong
@@ -839,6 +854,34 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("ipc-self-call") {
         println!("[boot] cmdline requested the self-call test");
         ipctest::run_self_call();
+    }
+
+    // M9c's scenarios. Deliberately **not** spelled `ipc-cap-test`:
+    // that contains `cap-test`, which dispatches M5's capability
+    // suite, and the first run of this scenario died inside it with
+    // `SlotNotEmpty`. See the note above `cap-test`.
+    if cmdline.contains("ipc-captransfercost") {
+        println!("[boot] cmdline requested the capability transfer measurement");
+        ipctest::run_cap_cost();
+    }
+
+    if cmdline.contains("ipc-captransferhostile") {
+        println!("[boot] cmdline requested the hostile capability transfer test");
+        ipctest::run_cap_hostile();
+    }
+
+    // After the two above, because `ipc-captransfer` is a prefix of
+    // both. Prefixes are the one overlap left, and they are at least
+    // visible in a single list -- unlike `cap-test` buried in another
+    // milestone's block.
+    if cmdline.contains("ipc-captransfer") {
+        println!("[boot] cmdline requested the capability transfer tests");
+        ipctest::run_cap_transfer();
+    }
+
+    if cmdline.contains("ipc-notification-revoked") {
+        println!("[boot] cmdline requested the revoked-notification test");
+        ipctest::run_notification_revoked();
     }
 
     if cmdline.contains("ipc-cost") {

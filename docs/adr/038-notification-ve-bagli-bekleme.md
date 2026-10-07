@@ -197,22 +197,68 @@ bit ona göre güncellenir.
 
 ### Açlığın imkânsızlığı test ediliyor
 
-Garanti ölçülmez, ama **imkânsızlık gösterilebilir.** `ipc-test`
+Garanti ölçülmez, ama **imkânsızlık gösterilebilir.** `ipc-cap-test`
 senaryo 9:
 
 ```
 Notification'a kesintisiz sinyal gonderilirken
-Endpoint'e bir istek geliyor.
-Istegin kac sinyal icinde teslim edildigini bas.
+Endpoint'e de surekli bir gonderen kuyrukta duruyor.
+Iki endpoint teslimati arasindaki EN UZUN bildirim serisini bas.
 ```
 
-Dönüşümlü teslimle bu sayı **küçük ve sınırlı**. "Notification önce"
-olsaydı test **sonsuza kadar beklerdi** — yani bu, ADR 023'ün K5'ini
-karşılayan türden bir test: kararı geri alırsanız test geçmez,
-*asılır*.
+Ölçülen şeyin bir **seri uzunluğu** olması gerekiyor, tek bir
+gecikme değil: açlık "bir kez yavaş kaldı" değil, "hep başkasının
+arkasında" demek.
 
-Bir açlık testinin asılarak başarısız olması, sayı basarak başarılı
-olmasından daha güçlü bir kanıt: sonsuz bekleme, açlığın tanımı.
+> **Düzeltme (M9c uygulaması).** Bu bölüm "karar geri alınırsa test
+> *asılır*" diyordu. **Yanlış çıktı, ve K5 mutasyonu bunu gösterdi.**
+>
+> Dönüşüm kaldırılıp yerine "hep Notification" konduğunda senaryo
+> **geçti**: 8 endpoint mesajı teslim edildi, en uzun seri 3, sınır
+> olan 4'ün altında. Sinyal akışı turda bir sinyalden beş sinyallik
+> bir seriye çıkarıldığında rakam hiç değişmedi (48 sinyal, aynı
+> seri).
+>
+> Sebebi, karar anının izi alınınca göründü ve akışın zayıflığı
+> değil, tasarımın bir özelliği:
+>
+> ```
+> sender_waiting=1 pending_signal=1 last_was_ntfn=1 -> notification
+> sender_waiting=1 pending_signal=0 last_was_ntfn=1 -> endpoint
+> ```
+>
+> Her çevrimin ikinci turunda maske **boş**. `Signal`, *bloke* bir
+> bağlı thread'e bitleri doğrudan verip temizliyor; o thread `recv`'e
+> ulaştığında bekleyen bir şey kalmıyor ve endpoint **çekişmesiz**
+> kazanıyor. Dönüşüm biti o turda hiç okunmuyor, dolayısıyla
+> kaldırılması bir şeyi değiştirmiyor.
+>
+> **Sonuç, garantinin test edilmediği değil: bu yapılandırmada bağlı
+> bir alıcı zaten aç bırakılamıyor.** Bloke bir thread'e giden sinyal
+> teslimatta tüketiliyor, yani ikinci bir sinyal endpoint'in önüne
+> geçemiyor. Bu, dönüşümün verdiğinden daha güçlü bir özellik ve bit
+> olsun olmasın geçerli.
+>
+> Endpoint'i aç bırakmak için maskeyi **alıcının bloke olduğu
+> pencere boyunca** dolu tutan bir kaynak gerekiyor — yani test
+> thread'i çalışırken sinyal gönderen *başka* bir thread. Tasarımda
+> böyle tek bir kaynak var: M12'nin kesme işleyicisi.
+>
+> Durum, açıkça:
+>
+> - dönüşüm **uygulandı** ve **çalıştırılıyor** (senaryo, çekişmeli
+>   karar sayısının sıfır olmadığını iddia ediyor; seçimi yapan o
+>   daldır);
+> - açlık savı **başarısız olan bir testle gösterilmedi**;
+> - gösterecek yapılandırma **M12'de** doğuyor, ve iddia orada
+>   sınanmalı.
+>
+> Hayatta kalan bir K5 mutasyonu, test hakkında bir sonuçtur. Bunu
+> gömmek, dosyadaki diğer bütün K5 iddialarının değerini düşürürdü.
+>
+> Eski cümlenin nereden geldiği de kayda değer: yazıldığında makul
+> bir tahmindi ve hiç koşulmamıştı. "Test asılır" demek, "test
+> asıldı" demekle aynı şey değil.
 
 ### Bir thread kaç Notification'a bağlanabilir
 
@@ -304,8 +350,12 @@ taşmanın sessizce bilgi kaybetmesi.
 - Gerekçe: bu bir optimizasyon değil **doğruluk garantisi**, ve
   garantiler ölçülmez — ya vardır ya yoktur. "Kesme hızı sınırlı"
   varsayımı donanımın iyi davranmasına güvenmek olurdu.
-- **Açlığın imkânsızlığı test ediliyor** (`ipc-test` 9). Karar geri
-  alınırsa test geçmez, *asılır* — sonsuz bekleme açlığın tanımı.
+- **Açlık senaryosu var** (`ipc-cap-test` 9) ve dönüşümlü dalın
+  çalıştığını gösteriyor: çekişmeli karar sayısı sıfır değil. Ama
+  K5 mutasyonu (dönüşümü kaldır) bu senaryoyu **öldürmedi** —
+  yukarıdaki düzeltme notu. Bağlı bir alıcı bu yapılandırmada
+  zaten aç bırakılamıyor; açlığı gösterecek kaynak M12'nin kesme
+  işleyicisi, iddia orada sınanacak. **Açık kalem.**
 - Bir thread **bir** Notification'a bağlanabilir; birden çok kaynak
   için badge bitleri kullanılır (ADR 037).
 - `Poll` var, `NBRecv` yok: Notification zaten bloke olmayan bir

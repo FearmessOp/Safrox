@@ -3,17 +3,34 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M9b — Call, Reply and badges.** A client can now
-make a request and wait for the answer. `Call`, `Reply`, `ReplyRecv`,
-badges that let one server tell its clients apart, and a reply right
-that cannot be stolen or delivered to a stranger. No capability
-transfer and no Notification — those are M9c, written and
-type-checked but behind `#[allow(dead_code)]` rather than claimed.
+**Current milestone: M9c — capability transfer and notifications.
+IPC is complete.** A message can carry up to four capabilities, into
+slots the *receiver* opened; a Notification accumulates signals
+without ever blocking its sender; and one thread can wait on an
+endpoint and a notification at once, which is what M13's driver will
+need.
 
-M9 is landing in three parts because one attempt at all eleven
+M9 landed in three parts because one attempt at all eleven
 acceptance criteria produced code that did not compile and was never
 run. Worth stating plainly: the discipline here is that an untested
 claim is not a claim.
+
+**The authority side is the half that matters here.** ADR 035's rule
+is that a sender cannot name a destination in another component's
+CSpace — not as a safe default but as a structural impossibility,
+because there is no field for it. A server replying to a client
+cannot push an unwanted Untyped onto it; the capability simply falls
+nowhere. Taking authority is an action.
+
+```
+[ipc] caps: a capability without GRANT was dropped silently and **the
+message still arrived** -- tag says caps=0, label intact
+```
+
+Two outcomes, deliberately separated. "The capability was refused"
+and "the message was refused" are different things, and a kernel
+that failed the whole send would pass a test that only checked the
+first.
 
 **Splitting it paid for itself.** Turning M9b on found four kernel
 defects that M9a's tests could not reach — each on the *first* run of
@@ -179,6 +196,139 @@ cloned into `third_party/` automatically.
 | `make toolchain-check` | Report tool availability |
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
+
+## M9c acceptance criteria
+
+Four scenarios, all exiting 33 — including both negatives. A dropped
+capability and a woken waiter are outcomes, not faults.
+
+### 1. `make run-ipccap` — transfer, notifications, and starvation
+
+Nine checks. The transfer half walks ADR 035's five rules one at a
+time:
+
+```
+[ipc] caps: 1, 2, 3 and 4 capabilities each arrived in the receiver's own slots, in order, with rights unchanged
+[ipc] caps: a 5-capability message is refused by the tag with TooManyCaps
+[ipc] caps: with no receive window open, 2 capabilities went nowhere and the message arrived intact
+[ipc] caps: three sent with the MIDDLE destination occupied -- the 1st and 3rd arrived, the 2nd was dropped
+[ipc] caps: a capability already at depth 8 was dropped rather than carried to depth 9
+```
+
+The obstacle goes in the **middle** for the same reason M5's partial
+overlap test put one there: an implementation that gave up at the
+first obstacle would pass a test where the obstacle was last.
+
+Then the notification half, and the figure that rules out the
+obvious wrong implementation:
+
+```
+[ipc] notification: two badged signals accumulated to 0x101 -- both bits present, so the mask ORs rather than overwrites
+[ipc] bound: one thread in Recv was woken by **both** sources -- a signal (mask 0x100, IS_NOTIFICATION set) and an endpoint message (word 0xfeed, bit clear)
+```
+
+A mask that kept only the *last* signal would pass any test that
+sent one; requiring `0x101` by value is what catches it.
+
+### 2. `make run-ipccaphostile` — a component cannot force a transfer
+
+```
+[ipc] cap-hostile: 4 malformed transfers refused -- reserved bits, leaf index out of
+range, root index out of range, and a well-formed capability without GRANT.
+4 dropped, 0 transferred, and every message still arrived
+[ipc] cap-hostile: the kernel is still running
+```
+
+Each is a caller's error, and from M13 the caller is a user
+component — so a kernel that faulted here would be one any component
+could halt. The zero matters as much as the four: a cheerful summary
+with one capability through would be worse than a crash.
+
+### 3. `make run-ipcntfnrev` — a waiter is woken, not stranded
+
+```
+[ipc] notification at 0x... deleted with a thread waiting; woken with EndpointDead
+```
+
+**This scenario is why reading the ADRs against the code first was
+worth it.** `release_ipc_references` had no `Notification` arm —
+hidden behind a `_ => {}` — so a thread in `Wait` when its
+Notification was revoked would have waited forever. The scenario
+would not have failed; it would have **hung**. Making that match
+exhaustive also made the compiler name `IrqHandler`, a variant M12
+will owe an arm.
+
+### 4. `make run-ipccapcost` — what a capability costs
+
+```
+[ipc] cap-cost: Send+Recv with 0 caps 1302 cycles, 1 cap 2058 cycles, 4 caps 3360 cycles
+[ipc] cap-cost: each capability past the first costs about 434 cycles and the count
+does not change that
+```
+
+ADR 035 chose four on the grounds that each capability is **bounded
+work** — a CPtr resolution, a rights check, a slot check, a
+derivation insertion. The marginal cost is the figure behind that,
+and it does not grow with the count: four is a limit rather than a
+cliff.
+
+**The first capability's figure is not a measurement, and finding
+that out cost a flaky test.** The original check asserted that the
+fourth capability costs about what the first does. It passed alone
+at 756/434 and failed inside `make test` at 1806/126 — reported as
+a factor of 14, a superlinear cost that does not exist. The first
+capability carries the first touch of the destination slots, and
+taking the minimum over samples cannot remove it: every sample
+clears and refills those slots, so the warm-up warms the *path*,
+not the data. How much of that lands in the first figure depends on
+what ran before, which is why the suite and the standalone run
+disagreed.
+
+The marginal cost is stable, and it is also the question ADR 035
+actually asks — whether the fourth costs more than the second. The
+assertion is on that; the first figure is printed with a note
+rather than compared against anything.
+
+### K5 in M9c: a mutation that **survived**
+
+[ADR 023](docs/adr/023-test-disiplini.md)'s K5 asks for a mutation
+per milestone. M9c's was to remove the alternation bit — replacing
+it with "notification first", which is what
+[ADR 038](docs/adr/038-notification-ve-bagli-bekleme.md) said in its
+first draft and corrected before implementation.
+
+**The scenario kept passing.** 8 endpoint messages through, longest
+notification run 3, inside the bound of 4. Raising the signal stream
+from one per round to a burst of five changed nothing: 48 signals,
+same figure.
+
+A trace of the decision state explained it, and the explanation is
+not a weakness in the stream:
+
+```
+sender_waiting=1 pending_signal=1 last_was_ntfn=1 -> notification
+sender_waiting=1 pending_signal=0 last_was_ntfn=1 -> endpoint
+```
+
+On the second round of every cycle the mask is **empty**, however
+hard the test signals — `Signal` to a *blocked* bound thread hands
+the bits over directly and clears them, so by the time that thread
+reaches `recv` the endpoint wins uncontested and the alternation bit
+is never read.
+
+So the honest conclusion is not "the guarantee is untested" but
+**"this configuration cannot starve a bound receiver at all"**: a
+signal to a blocked thread is consumed on delivery, which is a
+stronger property than alternation and holds with or without the
+bit. Starving the endpoint needs a source that keeps the mask full
+*across the receiver's blocked window* — another thread signalling,
+which in this design means M12's interrupt handler.
+
+The alternation is implemented and exercised (the scenario asserts
+that contested decisions happen). Its starvation argument is an
+**open item**, recorded in ADR 038 and owed to M12. A mutation that
+survives is a result about the test, and burying it would devalue
+every other K5 claim in this project.
 
 ## M9b acceptance criteria
 
