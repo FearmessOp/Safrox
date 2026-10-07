@@ -102,7 +102,7 @@ koydum" savunulabilir bir pozisyon olmaya devam ediyor.
 
 ---
 
-## 4. SMEP ve SMAP (M3 → M4'te kısmen kapandı)
+## 4. SMEP ve SMAP (M3 → M4 → **M8'de QEMU tarafı kapandı**)
 
 **Durum: kısmen çözüldü.** M3'te `-cpu qemu64` bu bitleri bildirmiyordu,
 yani kod yolu çalışıyor ama koruma yoktu. M4'te `QEMU_FLAGS` artık
@@ -115,16 +115,51 @@ yani kod yolu çalışıyor ama koruma yoktu. M4'te `QEMU_FLAGS` artık
 `run.py` bu satırı her senaryoda zorunlu tutuyor, yani CPU modelinin
 sessizce geri alınması test hatası.
 
-**Hâlâ doğrulanmamış olan.** Bitler CR4'te, ama **koruyacak bir user
-sayfası yok.** SMEP'in gerçekten bir user sayfasından komut getirmeyi
-engellediği, SMAP'in okuma/yazmayı engellediği M8'den önce
-gösterilemiyor. Ayrıca QEMU'nun bu bitleri doğru uyguladığı da
-varsayılıyor.
+**M8 geldi ve üçü de gösterildi.** Artık korunacak user sayfaları
+var.
 
-**M8'de.** Bir user sayfası eşle, kernel'den yürütmeyi dene (#PF
-bekleniyor, SMEP), sonra okumayı dene (#PF bekleniyor, SMAP), sonra
-`stac` ile tekrar oku (başarılı olmalı). Üçü de hem QEMU'da hem gerçek
-donanımda.
+`user-smep`: bir user kod sayfası, ring 3'ten **101 kez** çalıştı,
+sonra aynı sayfa CPL 0'dan getirildi:
+
+```
+[trap] error_code=0x0000000000000011  rip=0x0000000000400000  cs=0x0008
+[trap] cr2=0x0000000000400000  (supervisor instruction fetch
+                                protection-violation)
+```
+
+Bit 4 (instruction fetch) ve bit 0 (present) birlikte: sayfa var,
+çalıştırılabilir, ve yine de reddedildi. SMEP'ten başka bir şey bu
+kombinasyonu üretmiyor.
+
+**Aynı sayfanın** kullanılması kasıtlı. Farklı bir sayfa olsaydı,
+"biri çalışıyor, diğeri faultluyor" gözlemi bir eşleme farkıyla da
+açıklanabilirdi; test o zaman SMEP'i değil, kendi kurulumunu ölçerdi.
+
+`user-smap`: kernel aynı user sayfasını iki kez okudu. `UserAccess`
+guard'ı ile başarılı; guard'sız:
+
+```
+[trap] cr2=0x0000000000600000  (supervisor read protection-violation)
+```
+
+İkisi tek senaryoda, çünkü ayrı ayrı her biri iddianın yarısını
+kanıtlıyor. Guard'lı okuma **önce** koşuyor — guard'sız olan VM'i
+bitiriyor.
+
+**Hâlâ doğrulanmamış olan.** QEMU'nun bu bitleri doğru uyguladığı
+varsayımı. Gözlemlenen davranış mimarinin tarif ettiğiyle birebir
+örtüşüyor, ama bu QEMU'nun doğru modellediğini gösterir, silikonun
+aynısını yapacağını değil.
+
+**Gerçek donanımda.** `user-smep` ve `user-smap` ISO'larını USB'den
+boot et, seri çıktıdan error code'ları oku. Beklenen: aynı iki satır.
+Farklı çıkarsa ya QEMU yanlış modelliyor ya da bu CPU'nun SMEP/SMAP
+davranışı farklı — ikisi de bilinmeye değer.
+
+Not: `-cpu qemu64` bu bitleri bildirmiyor; `+smep,+smap` olmadan
+senaryolar **vacuous geçmez**, açıkça panic eder ("SMEP is not
+enabled on this CPU, so this scenario cannot demonstrate anything").
+M3'te sessizce hiçbir şey test etmeyen durumun tekrarlanmaması için.
 
 ---
 
@@ -156,3 +191,94 @@ Seri çıktı için ya gerçek bir COM portu ya bir USB-seri adaptör gerekiyor;
 `isa-debug-exit` gerçek donanımda yok, yani kernel çıkış kodu yerine son
 satıra bakılacak. `run.py` bu senaryo için kullanılamaz — elle
 doğrulama.
+
+---
+
+## 6. `sysret`'in kanonik olmayan RCX davranışı (M8)
+
+**İddia** ([ADR 029](adr/029-ring-3-giris-ve-cikis.md)): `sysretq`,
+RCX kanonik değilse Intel'de `#GP` veriyor — ve bu `#GP`, SS zaten
+user değerini almışken ama stack hâlâ kernel'inken alınıyor. Yani
+handler, user'ın etkileyebildiği bir yığında CPL 0'da çalışıyor.
+CVE-2012-0217 bu.
+
+Kernel bu yüzden `sysret` öncesi RCX'i kontrol ediyor ve kanonik
+değilse `iretq`'e düşüyor.
+
+**Ölçüm.** `user-test` koşusunda:
+
+```
+[syscall] 9810054 calls (0 returned an error), 9810054 via sysret,
+          0 forced onto iretq by a non-canonical rcx
+```
+
+Yani kontrol **hiç tetiklenmedi.** Çalıştığına dair kanıt sadece üç
+komutun orada durması; davranışsal bir kanıt yok.
+
+**Neden QEMU'da sınanması zor.** Tetiklemek için user kodunun kanonik
+olmayan bir adrese dönmeyi denemesi gerekiyor, ki bunun için RCX'i
+`syscall`'dan *sonra* bozması lazım — ama `syscall` RCX'i kendisi
+yazıyor, yani user kodu araya giremiyor. Tek yol kernel'in frame'deki
+RCX'i kasten bozması, ki o da gerçek senaryoyu değil testi test
+ediyor.
+
+Ayrıca AMD ve Intel bu durumu **farklı** ele alıyor, ve QEMU'nun
+hangisini modellediği belli değil. Farkın kendisi tehlikenin parçası:
+bir platformda çalışan kod diğerinde açık veriyor.
+
+**Yapılacak.** İki iş var ve ikisi de ertelendi:
+
+1. Kernel tarafından RCX'i bozan bir senaryo (`user-sysret-canonical`),
+   ki en azından `iretq` yolunun koştuğu gösterilsin. Testi test
+   etmek olduğu için değeri sınırlı ama sıfır değil — şu an o yola
+   hiç girilmiyor ve bir derleme hatası bile fark edilmez.
+2. Gerçek donanımda, Intel ve AMD'de ayrı ayrı. Beklenen: `iretq`
+   sayacı sıfırdan büyük, kernel ayakta.
+
+**Yanlış çıkarsa.** Kontrol gereksizse üç komut kazanılır. Gerekliyse
+ve yanlış yazılmışsa — bu bir ayrıcalık yükseltme açığı.
+
+---
+
+## 7. Tek CPU varsayımı syscall yoluna girdi (M8)
+
+**İddia** ([ADR 030](adr/030-syscall-abi.md)): `syscall` RSP'ye
+dokunmuyor, ve kernel stack'ine geçmek için `swapgs` yerine iki
+RIP-göreli `static` kullanılıyor: `KERNEL_RSP` ve `SAVED_USER_RSP`.
+
+**Neden doğru, ve ne zaman yanlış olacak.** Tek CPU'da iki static
+yeterli ve `swapgs`'in tuzaklarından kaçınıyor (her exception
+handler'ında "nereden geldim" kontrolü). İkinci CPU geldiği an
+yanlış: iki CPU aynı `SAVED_USER_RSP`'ye yazarsa biri diğerinin user
+RSP'sini kaybeder, ve o thread user'a dönerken başka bir thread'in
+yığınına döner.
+
+**Neden sınanamıyor.** Tek CPU ile çalışıyoruz. Madde 5 ile aynı
+durum: iddia doğru *ve* test edilemez.
+
+**Ne zaman.** SMP geldiğinde bu bir "doğrulanacak" madde değil,
+"yeniden yazılacak" madde — `swapgs` ve CPU-başına veri. ADR 030
+bunu bilinen borç olarak kaydetti.
+
+---
+
+## 8. AVX kapalı tutularak kaçınıldı (M8)
+
+**İddia** ([ADR 031](adr/031-fpu-sse-durumu.md)): `fxsave` 512 bayt
+ile x87, MMX ve XMM0-15'i kaydediyor; AVX durumu (YMM'nin üst yarısı)
+kaydedilmiyor. Bu güvenli, çünkü CR4.OSXSAVE temiz tutuluyor ve user
+kodu AVX komutlarını çalıştıramıyor — `#UD` alıyor.
+
+**Doğrulanmamış olan.** "OSXSAVE temizse AVX erişilemez" iddiası
+test edilmedi. Bir user thread'inin AVX komutu denediği ve `#UD`
+aldığı bir senaryo yok.
+
+**Neden önemli.** Yanlışsa sessiz: bir user thread'i YMM'nin üst
+yarısına yazar, preempt edilir, ve geri döndüğünde orada başka bir
+thread'in verisi olur. Bir bilgi sızıntısı, ve hiçbir şey hata
+vermez.
+
+**Yapılacak.** `user-avx` senaryosu: ring 3'ten `vzeroupper` ya da
+`vmovdqu` dene, `#UD` bekle. Hem QEMU'da hem donanımda —
+`-cpu qemu64` AVX bildirmiyor, yani QEMU'da `#UD` yanlış sebepten
+gelebilir ve test vacuous olur. Donanımda anlamlı.

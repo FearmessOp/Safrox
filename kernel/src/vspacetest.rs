@@ -196,7 +196,8 @@ fn build_space(base_slot: usize, pattern: u64) -> TestSpace {
     let frame = unsafe { cnode.slot(frame_slot) };
     // SAFETY: Both slots hold live capabilities, and the tables above
     // are in place.
-    unsafe { vspace::map_frame(root, frame, address) }.expect("could not map the frame");
+    unsafe { vspace::map_frame(root, frame, address, vspace::MapPermissions::ReadWrite) }
+        .expect("could not map the frame");
 
     // Write the pattern through the physical window, before anything
     // runs in this address space. Going through PMAP rather than
@@ -616,7 +617,8 @@ fn check_rights_narrowing() {
     // SAFETY: Index in range.
     let ro_cap = unsafe { cnode.slot(112) };
     // SAFETY: Both slots hold live capabilities.
-    unsafe { vspace::map_frame(root, ro_cap, ro_address) }.expect("mapping a read-only Frame");
+    unsafe { vspace::map_frame(root, ro_cap, ro_address, vspace::MapPermissions::ReadOnly) }
+        .expect("mapping a read-only Frame");
 
     // SAFETY: The slot holds a live PageTable.
     let (_, ro_flags) = unsafe { vspace::translate(root, ro_address) }.expect("translate");
@@ -631,6 +633,31 @@ fn check_rights_narrowing() {
         ro_flags
     );
 
+    // Asking for *more* than the capability holds is refused, not
+    // quietly downgraded. M7 downgraded, and ADR 032 changed it: a
+    // caller that wanted a writable mapping and silently got a
+    // read-only one discovers it at its first store, which is a #PF
+    // in a different function with no trace of the real cause.
+    let rw_attempt = VirtAddr::new(TEST_ADDRESS + 3 * crate::memory::FRAME_SIZE);
+    // SAFETY: Both slots hold live capabilities; expected to fail.
+    match unsafe { vspace::map_frame(root, ro_cap, rw_attempt, vspace::MapPermissions::ReadWrite) }
+    {
+        Err(CapError::InsufficientRights { needed, .. }) => {
+            assert_eq!(
+                needed,
+                crate::cap::Rights::WRITE,
+                "the error named the wrong missing right"
+            );
+        }
+        other => panic!(
+            "asking for ReadWrite with a READ-only capability returned \
+             {:?} instead of InsufficientRights. M7 downgraded silently \
+             here; ADR 032 made it an error, because the caller finds \
+             out at its first store otherwise.",
+            other
+        ),
+    }
+
     // No rights at all: refused, rather than mapped unreadable.
     // SAFETY: Indices in range, and the two slots are distinct.
     unsafe {
@@ -644,7 +671,7 @@ fn check_rights_narrowing() {
     let null_cap = unsafe { cnode.slot(113) };
     let far = VirtAddr::new(TEST_ADDRESS + 2 * crate::memory::FRAME_SIZE);
     // SAFETY: Both slots hold live capabilities; expected to fail.
-    match unsafe { vspace::map_frame(root, null_cap, far) } {
+    match unsafe { vspace::map_frame(root, null_cap, far, vspace::MapPermissions::ReadOnly) } {
         Err(CapError::InsufficientRights { .. }) => {}
         other => panic!(
             "mapping a Frame with no rights returned {:?} instead of \
@@ -1080,7 +1107,14 @@ pub fn run_kernel_half() -> ! {
 
     for (address, what) in targets {
         // SAFETY: Both slots hold live capabilities; expected to fail.
-        let result = unsafe { vspace::map_frame(root, frame, VirtAddr::new(address)) };
+        let result = unsafe {
+            vspace::map_frame(
+                root,
+                frame,
+                VirtAddr::new(address),
+                vspace::MapPermissions::ReadWrite,
+            )
+        };
         match result {
             Err(CapError::NotUserAddress { address: reported }) => {
                 assert_eq!(reported, address, "the error named the wrong address");
@@ -1235,7 +1269,8 @@ pub fn run_isolation() -> ! {
     // SAFETY: Index in range.
     let far_frame = unsafe { cnode.slot(123) };
     // SAFETY: Both slots hold live capabilities.
-    unsafe { vspace::map_frame(root_b, far_frame, far) }.expect("could not map the far frame");
+    unsafe { vspace::map_frame(root_b, far_frame, far, vspace::MapPermissions::ReadWrite) }
+        .expect("could not map the far frame");
 
     // B can see it; A cannot. Checked through translate first, so the
     // log carries the evidence before the fault arrives.

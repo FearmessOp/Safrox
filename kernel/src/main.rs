@@ -67,7 +67,9 @@ mod panic;
 mod qemu;
 mod sched;
 mod serial;
+mod syscall;
 mod threadtest;
+mod usertest;
 mod vmtest;
 mod vspacetest;
 
@@ -81,7 +83,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M7");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M8");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -334,6 +336,11 @@ pub extern "C" fn kstart() -> ! {
         interrupts::EXCEPTION_COUNT,
         gdt::DOUBLE_FAULT_IST_INDEX
     );
+    println!(
+        "[cpu] gdt: user cs={:#06x}, user ss={:#06x} (ring 3, ADR 029)",
+        gdt::USER_CODE_SELECTOR,
+        gdt::USER_DATA_SELECTOR
+    );
 
     // ---- CPU features (M3) ---------------------------------------------
     //
@@ -349,6 +356,23 @@ pub extern "C" fn kstart() -> ! {
     // different stack and nothing in this frame survives the switch.
     unsafe {
         cpu::init();
+    }
+
+    // ---- syscall/sysret (M8) -------------------------------------------
+    //
+    // After `gdt::init`, because STAR names selectors from the GDT and
+    // the const assertions there tie its arithmetic to the layout. The
+    // stub itself needs nothing but an address.
+    //
+    // Enabled here rather than later so that `syscall` is a working
+    // instruction before any thread exists -- there is then no window
+    // in which a user thread could be scheduled with SCE still clear,
+    // where its first syscall would be #UD.
+    //
+    // SAFETY: First and only call, after `gdt::init`, with interrupts
+    // disabled. The entry point obeys ADR 030's contract.
+    unsafe {
+        cpu::enable_syscall(syscall::entry_address());
     }
 
     // ---- Physical memory (M2) ------------------------------------------
@@ -744,7 +768,40 @@ extern "C" fn kmain() -> ! {
         vspacetest::run();
     }
 
-    println!("[boot] M7 checks passed");
+    // M8 ring 3 scenarios. Longest token first, as above: `contains`
+    // does not care about word boundaries, and every token here
+    // begins "user-".
+    if cmdline.contains("user-privileged") {
+        println!("[boot] cmdline requested the privileged-instruction test");
+        usertest::run_privileged();
+    }
+
+    if cmdline.contains("user-kernel-read") {
+        println!("[boot] cmdline requested the kernel-read test");
+        usertest::run_kernel_read();
+    }
+
+    if cmdline.contains("user-cap-forge") {
+        println!("[boot] cmdline requested the capability forgery test");
+        usertest::run_cap_forge();
+    }
+
+    if cmdline.contains("user-smep") {
+        println!("[boot] cmdline requested the SMEP test");
+        usertest::run_smep();
+    }
+
+    if cmdline.contains("user-smap") {
+        println!("[boot] cmdline requested the SMAP test");
+        usertest::run_smap();
+    }
+
+    if cmdline.contains("user-test") {
+        println!("[boot] cmdline requested the ring 3 tests");
+        usertest::run();
+    }
+
+    println!("[boot] M8 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

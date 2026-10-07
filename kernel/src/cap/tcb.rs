@@ -139,6 +139,47 @@ impl ThreadState {
 /// the figure to mean anything.
 pub const IPC_BUFFER_OFFSET: usize = 1024;
 
+/// Where the FPU/SSE state lives inside the TCB (ADR 031).
+///
+/// `fxsave` writes 512 bytes and **requires 16-byte alignment** — a
+/// misaligned one raises #GP, and that fault would not appear until
+/// the first thread that touched the FPU.
+///
+/// A TCB is 2048-byte aligned (ADR 017), so any offset inside it that
+/// is a multiple of 16 is 16-aligned in absolute terms too. 256 rather
+/// than the first available multiple (144) so the scheduler's fields
+/// have room to grow without moving this.
+pub const FXSAVE_OFFSET: usize = 256;
+
+/// Size of an `fxsave` area: fixed by the architecture.
+///
+/// Reference: Intel SDM Vol. 2A, "FXSAVE", Table 3-43.
+pub const FXSAVE_SIZE: usize = 512;
+
+/// Default MXCSR: every SSE exception masked.
+///
+/// The value matters because the alternative is zero, and a zeroed
+/// MXCSR means every exception *unmasked* — the first floating-point
+/// operation in a new thread would raise #XM. Writing zeroes into an
+/// `fxrstor` area is not "a clean FPU"; it is a differently broken
+/// one.
+///
+/// Reference: Intel SDM Vol. 1, 11.6.4 ("the default MXCSR value at
+/// reset is 1F80H").
+const MXCSR_DEFAULT: u32 = 0x1F80;
+
+/// Default x87 control word: all exceptions masked, extended precision.
+///
+/// Reference: Intel SDM Vol. 1, 8.1.5.
+const X87_CW_DEFAULT: u16 = 0x037F;
+
+/// Offsets within the `fxsave` area that `configure` has to fill in.
+///
+/// Reference: Intel SDM Vol. 2A, Table 3-43 "Layout of the FXSAVE and
+/// FXRSTOR Memory Region".
+const FXSAVE_FCW_OFFSET: usize = 0;
+const FXSAVE_MXCSR_OFFSET: usize = 24;
+
 /// The thread control block itself.
 ///
 /// `#[repr(C, align(2048))]`: the alignment is what ADR 017's retype
@@ -212,12 +253,35 @@ pub struct Tcb {
     /// Precisely the problem ADR 018 solved for CPtrs, wearing a
     /// different hat. See ADR 028.
     vspace_generation: u8,
-    _pad2: [u8; 7],
+
+    /// Whether this thread runs at CPL 3 (ADR 029).
+    ///
+    /// A byte rather than a `bool` so the struct's layout is written
+    /// out rather than inferred; the assembly does not read it, but
+    /// the field's position is part of a layout the `const` assertions
+    /// below pin down.
+    user_mode: u8,
+    _pad2: [u8; 6],
+
+    /// Reserved. Brings the fixed part to FXSAVE_OFFSET.
+    _reserved: [u8; FXSAVE_OFFSET - 136],
+
+    /// FPU/SSE state, saved and restored on **every** switch (ADR 031).
+    ///
+    /// Not lazily: the kernel never sets CR0.TS and never takes #NM.
+    /// Lazy switching would save a `fxsave` on threads that do not use
+    /// the FPU — a population that barely exists in user code — and it
+    /// is the mechanism behind CVE-2018-3665.
+    ///
+    /// `align(16)` is not written here because the containing struct's
+    /// 2048-byte alignment plus a 16-multiple offset already gives it;
+    /// the `const` assertion below checks that rather than trusting it.
+    fpu_state: [u8; FXSAVE_SIZE],
 
     /// Reserved. Brings the fixed part to IPC_BUFFER_OFFSET.
-    _reserved: [u8; IPC_BUFFER_OFFSET - 136],
+    _reserved2: [u8; IPC_BUFFER_OFFSET - FXSAVE_OFFSET - FXSAVE_SIZE],
 
-    /// The IPC buffer. Untouched in M6.
+    /// The IPC buffer. Untouched until M9.
     _ipc_buffer: [u8; super::TCB_SIZE - IPC_BUFFER_OFFSET],
 }
 
@@ -235,6 +299,24 @@ const _: () = {
         core::mem::offset_of!(Tcb, context) == 0,
         "the context must be first: the assembly treats a TCB pointer as \
          a context pointer"
+    );
+
+    // M8: the FPU area must be where ADR 031 says, and 16-byte
+    // aligned. A misaligned `fxsave` raises #GP, and nothing would
+    // reach that fault until the first thread used the FPU -- long
+    // after whatever edit moved the field.
+    assert!(
+        core::mem::offset_of!(Tcb, fpu_state) == FXSAVE_OFFSET,
+        "the fxsave area is not at FXSAVE_OFFSET"
+    );
+    assert!(
+        FXSAVE_OFFSET.is_multiple_of(16),
+        "the fxsave area must be 16-byte aligned; the TCB's own 2048-byte \
+         alignment only helps if the offset is a multiple of 16"
+    );
+    assert!(
+        FXSAVE_OFFSET + FXSAVE_SIZE <= IPC_BUFFER_OFFSET,
+        "the fxsave area runs into the IPC buffer"
     );
 };
 
@@ -360,6 +442,65 @@ impl Tcb {
         addr > self.stack_bottom && addr <= self.stack_top
     }
 
+    /// Whether this thread runs at CPL 3 (ADR 029).
+    pub fn is_user_mode(&self) -> bool {
+        self.user_mode != 0
+    }
+
+    /// Pointer to this thread's `fxsave` area.
+    ///
+    /// Raw rather than a slice, because `fxsave` and `fxrstor` take a
+    /// memory operand the compiler must make no assumptions about.
+    ///
+    /// # Safety
+    ///
+    /// The caller must use it only as the operand of `fxsave` or
+    /// `fxrstor`, and must hold no Rust reference to the same bytes
+    /// across the instruction.
+    pub unsafe fn fpu_state_ptr(&mut self) -> *mut u8 {
+        let ptr = self.fpu_state.as_mut_ptr();
+        debug_assert!(
+            (ptr as usize).is_multiple_of(16),
+            "the fxsave area is not 16-byte aligned, so fxsave would #GP"
+        );
+        ptr
+    }
+
+    /// Fill the `fxsave` area with a *clean* FPU state.
+    ///
+    /// Not zeroes. A zeroed area restores MXCSR = 0, which unmasks
+    /// every SSE exception -- so the thread's first floating-point
+    /// operation raises #XM -- and an x87 control word of 0, which is
+    /// wrong in the same way. `fxrstor` can also #GP on reserved MXCSR
+    /// bits.
+    ///
+    /// Only two fields need writing; the rest of a clean state really
+    /// is zeroes (empty registers, clear tag word) and retype already
+    /// zeroed the object.
+    ///
+    /// Same reasoning as zeroing RBP in [`Tcb::configure`]: a thread's
+    /// initial state has to be chosen rather than inherited.
+    fn initialise_fpu_state(&mut self) {
+        self.fpu_state = [0; FXSAVE_SIZE];
+
+        let fcw = X87_CW_DEFAULT.to_le_bytes();
+        self.fpu_state[FXSAVE_FCW_OFFSET..FXSAVE_FCW_OFFSET + 2].copy_from_slice(&fcw);
+
+        let mxcsr = MXCSR_DEFAULT.to_le_bytes();
+        self.fpu_state[FXSAVE_MXCSR_OFFSET..FXSAVE_MXCSR_OFFSET + 4].copy_from_slice(&mxcsr);
+    }
+
+    /// What MXCSR this thread's saved state holds, for the test.
+    ///
+    /// Reported because "the FPU state was initialised" is otherwise
+    /// indistinguishable from "the FPU state is zeroes", and the two
+    /// behave identically until the first floating-point operation.
+    pub fn saved_mxcsr(&self) -> u32 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&self.fpu_state[FXSAVE_MXCSR_OFFSET..FXSAVE_MXCSR_OFFSET + 4]);
+        u32::from_le_bytes(bytes)
+    }
+
     pub fn switch_count(&self) -> u64 {
         self.switch_count
     }
@@ -451,6 +592,12 @@ impl Tcb {
         self.switch_count = 0;
         self.next_ready = 0;
         self.state = ThreadState::Inactive as u8;
+        self.user_mode = 0;
+
+        // A clean FPU, not a zeroed one (ADR 031). The difference is
+        // MXCSR: zero unmasks every SSE exception, so the thread's
+        // first floating-point operation would raise #XM.
+        self.initialise_fpu_state();
 
         // The address space is *not* reset here. `SetRegisters` gives a
         // thread somewhere to start; `SetSpace` gives it somewhere to
@@ -458,6 +605,110 @@ impl Tcb {
         // VSpace here would make the order they are called in matter,
         // which is the sort of hidden coupling that shows up much
         // later as "it works if you do it the other way round".
+    }
+
+    /// Give this thread a user entry point, to be reached at **CPL 3**.
+    ///
+    /// Same shape as [`Tcb::configure`] and a different destination.
+    /// The thread still starts on its kernel stack, in the kernel, with
+    /// a trampoline as its RIP -- but that trampoline ends in `iretq`
+    /// into ring 3 rather than a `jmp` into kernel code.
+    ///
+    /// # Why the first entry is `iretq` and not `sysret`
+    ///
+    /// Both are "return" instructions and both can lower the privilege
+    /// level; there is no instruction for *entering* ring 3. ADR 029
+    /// chose `iretq` for the first entry because all five values -- RIP,
+    /// CS, RFLAGS, RSP, SS -- are written out on the stack where they
+    /// can be read if the transition faults. `sysret` derives CS and SS
+    /// from an MSR and takes RFLAGS from R11, so a mistake there is a
+    /// `#GP` with nothing to look at.
+    ///
+    /// Later returns, from syscalls, do use `sysret`: that path is hot
+    /// and it runs thousands of times rather than once.
+    ///
+    /// # The register handoff
+    ///
+    /// Three values have to reach the trampoline, and the only channel
+    /// is the callee-saved set the context switch restores:
+    ///
+    /// * **R12** -- the user entry point,
+    /// * **R13** -- the user stack pointer,
+    /// * **R14** -- a value handed to the user code in RDI.
+    ///
+    /// Same mechanism M6 used to get an entry point past the switch,
+    /// for the same reason: `switch_context` loads these as part of an
+    /// ordinary context, so nothing special is needed on the way in.
+    ///
+    /// # Safety
+    ///
+    /// `kernel_stack_top` must be this thread's own kernel stack, as
+    /// [`Tcb::configure`] requires. `user_entry` must be a canonical
+    /// user address that is mapped executable in this thread's VSpace,
+    /// and `user_stack` a mapped, writable, 16-byte-aligned user
+    /// address. Neither is checked here: the mapping lives in a VSpace
+    /// this function cannot see, and a wrong value produces a #PF in
+    /// ring 3 -- which is a user fault, not a kernel one.
+    pub unsafe fn configure_user(
+        &mut self,
+        user_entry: u64,
+        user_stack: u64,
+        argument: u64,
+        kernel_stack_top: VirtAddr,
+        kernel_stack_bottom: VirtAddr,
+        stack_slot: u64,
+    ) {
+        assert!(
+            crate::memory::layout::is_user(user_entry),
+            "the user entry point {:#018x} is not in the user half; a \
+             thread at CPL 3 cannot fetch from the kernel half at all",
+            user_entry
+        );
+        assert!(
+            crate::memory::layout::is_user(user_stack),
+            "the user stack {:#018x} is not in the user half",
+            user_stack
+        );
+        assert!(
+            user_stack.is_multiple_of(16),
+            "the user stack {:#018x} is not 16-byte aligned",
+            user_stack
+        );
+
+        // SAFETY: Caller's guarantee about the kernel stack. The entry
+        // function passed here is the trampoline, which diverges.
+        unsafe {
+            self.configure(
+                crate::sched::user_entry_trampoline_fn(),
+                kernel_stack_top,
+                kernel_stack_bottom,
+                stack_slot,
+            );
+        }
+
+        // `configure` built a *kernel* thread's context: RIP is M6's
+        // trampoline and R12 is whatever entry point it was handed.
+        // Both have to be replaced, and forgetting the first one is
+        // not a subtle failure -- it is this milestone's first real
+        // bug, and SMEP caught it.
+        //
+        // The symptom was a #PF at the user entry point with
+        // `cs=0x0008` and the instruction-fetch bit set: M6's
+        // trampoline had run `sti; jmp r12` with R12 already pointing
+        // at user code, so the kernel jumped into a USER page at
+        // CPL 0. SMEP refused the fetch, which is exactly what ADR 032
+        // says it is for -- it simply found a kernel bug before it
+        // found a hostile one.
+        //
+        // Had SMEP been off, the user program would have run happily
+        // at ring 0 and every check in `user-test` would have passed
+        // except the one that reads CS.
+        self.context.rip = crate::sched::user_entry_trampoline();
+        self.context.r12 = user_entry;
+        self.context.r13 = user_stack;
+        self.context.r14 = argument;
+
+        self.user_mode = 1;
     }
 
     /// Record the stack of a thread that is **already running**.
@@ -485,6 +736,17 @@ impl Tcb {
         self.next_ready = 0;
         // Left as Inactive; `sched::init` sets Running.
         self.state = ThreadState::Inactive as u8;
+
+        // The boot thread is kernel code and stays kernel code.
+        self.user_mode = 0;
+
+        // Its FPU state is live in the CPU right now, and the first
+        // switch *away* from it is what writes this area -- the same
+        // argument that keeps `adopt_running` from touching `context`.
+        // But the area must still hold a legal state in case something
+        // restores it before that first save, so it is initialised
+        // rather than left as retype's zeroes.
+        self.initialise_fpu_state();
 
         // The boot thread runs in the kernel's address space, which is
         // what zero means (ADR 027). It never gets a VSpace capability

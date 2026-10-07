@@ -201,6 +201,20 @@ static CR3_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// Threads stopped because their address space had been revoked.
 static VSPACE_STALE: AtomicU64 = AtomicU64::new(0);
 
+/// FPU states saved with `fxsave` (M8, ADR 031).
+///
+/// Counted so the acceptance test can show the save happens on *every*
+/// switch. "The XMM register was preserved" would pass on a lazy
+/// implementation too -- a correct lazy switcher also preserves it.
+/// The count matching the switch count is what rules lazy out.
+static FXSAVE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// FPU states restored with `fxrstor`.
+static FXRSTOR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Switches that updated TSS.RSP0 and the syscall stack.
+static RSP0_UPDATES: AtomicU64 = AtomicU64::new(0);
+
 /// Timer ticks taken.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -222,6 +236,105 @@ pub fn cr3_skipped_count() -> u64 {
 
 pub fn stale_vspace_count() -> u64 {
     VSPACE_STALE.load(Ordering::Acquire)
+}
+
+pub fn fxsave_count() -> u64 {
+    FXSAVE_COUNT.load(Ordering::Acquire)
+}
+
+pub fn fxrstor_count() -> u64 {
+    FXRSTOR_COUNT.load(Ordering::Acquire)
+}
+
+pub fn rsp0_update_count() -> u64 {
+    RSP0_UPDATES.load(Ordering::Acquire)
+}
+
+/// Save the CPU's FPU/SSE state into a thread's TCB.
+///
+/// Unconditional (ADR 031). The kernel never sets CR0.TS, never takes
+/// #NM, and never asks whether the outgoing thread used the FPU --
+/// that question is what lazy switching exists to answer, and lazy
+/// switching is the mechanism behind CVE-2018-3665.
+///
+/// # Safety
+///
+/// Interrupts must be disabled, and `tcb` must be a live TCB whose
+/// `fxsave` area nothing else is using.
+unsafe fn save_fpu(tcb: &mut tcb::Tcb) {
+    // SAFETY: `fpu_state_ptr` returns a 512-byte, 16-byte-aligned area
+    // inside the TCB -- the alignment is checked at build time and
+    // again by a debug assertion -- and the caller guarantees nothing
+    // else is touching it. CR4.OSFXSR is set by `cpu::init`, so the
+    // instruction is not #UD.
+    //
+    // Reference: Intel SDM Vol. 2A, "FXSAVE".
+    unsafe {
+        let area = tcb.fpu_state_ptr();
+        core::arch::asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags));
+    }
+    FXSAVE_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Load a thread's FPU/SSE state into the CPU.
+///
+/// # Safety
+///
+/// As [`save_fpu`], and the area must hold a state `fxrstor` accepts:
+/// either one `fxsave` wrote, or one `initialise_fpu_state` built.
+/// Arbitrary bytes can raise #GP through MXCSR's reserved bits.
+unsafe fn restore_fpu(tcb: &mut tcb::Tcb) {
+    // SAFETY: As `save_fpu`, plus the caller's guarantee that the area
+    // holds a legal state -- which holds because every TCB's area is
+    // written by `initialise_fpu_state` at configure time and by
+    // `fxsave` thereafter.
+    //
+    // Reference: Intel SDM Vol. 2A, "FXRSTOR".
+    unsafe {
+        let area = tcb.fpu_state_ptr();
+        core::arch::asm!("fxrstor [{}]", in(reg) area, options(nostack, preserves_flags));
+    }
+    FXRSTOR_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Point the kernel-entry paths at a thread's own kernel stack.
+///
+/// Two places hold the same address and the CPU reaches them
+/// differently:
+///
+/// * `TSS.RSP0` -- read by the CPU when an *interrupt* raises the
+///   privilege level from ring 3.
+/// * `syscall::KERNEL_RSP` -- read by the syscall stub, because
+///   `syscall` does not consult the TSS at all (ADR 030).
+///
+/// Both are written here so they cannot drift apart. If two user
+/// threads shared one of them, the second to enter the kernel would
+/// overwrite the first's frame -- random corruption, far from its
+/// cause (ADR 029).
+///
+/// # Safety
+///
+/// Interrupts must be disabled, and `tcb` must be the thread about to
+/// run, with a mapped kernel stack.
+unsafe fn set_kernel_entry_stack(tcb: &tcb::Tcb) {
+    let top = tcb.stack_top();
+
+    // SAFETY: `top` is this thread's own kernel stack, mapped by the
+    // code that created the thread, and interrupts are disabled so no
+    // entry can be in flight reading a half-written value.
+    unsafe {
+        crate::gdt::set_rsp0(top);
+        crate::syscall::set_kernel_stack(top);
+    }
+
+    debug_assert_eq!(
+        crate::gdt::rsp0(),
+        crate::syscall::kernel_stack(),
+        "TSS.RSP0 and the syscall stack disagree; an interrupt and a \
+         syscall from the same thread would land on different stacks"
+    );
+
+    RSP0_UPDATES.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Root page table of the running thread, or zero for the kernel's.
@@ -491,6 +604,131 @@ pub fn entry_trampoline() -> u64 {
     (thread_entry_trampoline as *const ()) as u64
 }
 
+// ---- Entering ring 3 for the first time (M8, ADR 029) ------------------
+
+unsafe extern "C" {
+    /// Where a thread configured by `configure_user` begins.
+    ///
+    /// Named `_asm` so that [`user_entry_trampoline`] can be the
+    /// function returning its address — matching the pair M6
+    /// established for the kernel trampoline.
+    #[link_name = "user_entry_trampoline"]
+    fn user_entry_trampoline_asm() -> !;
+}
+
+// A user thread's first instruction at CPL 3.
+//
+// Reached the same way the kernel trampoline is -- `switch_context`
+// restores the callee-saved set and returns into it -- so the three
+// values it needs arrive in R12, R13 and R14 (ADR 029).
+//
+// `iretq` rather than `sysret` for this first entry. Both are the only
+// ways down to ring 3; `iretq` takes all five values from the stack,
+// where a mistake can be read out of a fault's frame. `sysret` derives
+// CS and SS from STAR and takes RFLAGS from R11, so a mistake is a #GP
+// with nothing to inspect. Syscall *returns* do use `sysret`: that
+// path runs thousands of times rather than once.
+//
+// The frame, pushed highest first:
+//
+//     SS      user data selector, RPL 3
+//     RSP     the user stack
+//     RFLAGS  IF set -- and set *here*, not by `sti`
+//     CS      user code selector, RPL 3
+//     RIP     the user entry point
+//
+// RFLAGS carries IF for the same reason M6's kernel trampoline runs
+// `sti`: a thread that never opens the interrupt window can never be
+// preempted, and the timer meant to take the CPU back is masked in its
+// own flags. But a plain `sti` here would be wrong -- it would enable
+// interrupts *before* `iretq`, inside the scheduler's critical region,
+// and the next instruction is the privilege transition. Putting IF in
+// the pushed RFLAGS makes it take effect exactly at the transition,
+// atomically.
+//
+// Bit 1 of RFLAGS is reserved and must be 1; the CPU rejects a frame
+// without it.
+//
+// The user's own registers: RDI carries the argument from R14, and
+// every other general register is zeroed. Not tidiness -- whatever the
+// kernel last left in a register would otherwise be readable from ring
+// 3, and the kernel's registers routinely hold kernel addresses.
+core::arch::global_asm!(
+    ".section .text",
+    ".code64",
+    ".align 16",
+    ".global user_entry_trampoline",
+    "user_entry_trampoline:",
+    // Build the iretq frame from R12 (entry), R13 (stack).
+    "    mov rax, {user_ss}",
+    "    push rax",
+    "    push r13",
+    "    mov rax, {rflags}",
+    "    push rax",
+    "    mov rax, {user_cs}",
+    "    push rax",
+    "    push r12",
+    // The argument, then scrub everything else. RAX is last because
+    // the pushes above used it.
+    "    mov rdi, r14",
+    "    xor rsi, rsi",
+    "    xor rdx, rdx",
+    "    xor rcx, rcx",
+    "    xor r8, r8",
+    "    xor r9, r9",
+    "    xor r10, r10",
+    "    xor r11, r11",
+    "    xor r12, r12",
+    "    xor r13, r13",
+    "    xor r14, r14",
+    "    xor r15, r15",
+    "    xor rbx, rbx",
+    "    xor rbp, rbp",
+    "    xor rax, rax",
+    "    iretq",
+    user_ss = const crate::gdt::USER_DATA_SELECTOR as u64,
+    user_cs = const crate::gdt::USER_CODE_SELECTOR as u64,
+    // IF (bit 9) plus the reserved bit 1, which must be set.
+    rflags = const (1u64 << 9) | (1u64 << 1),
+);
+
+/// Address of the trampoline a user thread starts at.
+///
+/// [`tcb::Tcb::configure_user`] stores this as the thread's RIP,
+/// overwriting the kernel trampoline `configure` left there.
+///
+/// Omitting that overwrite was this milestone's first bug. The kernel
+/// trampoline ran `sti; jmp r12` with R12 already holding the user
+/// entry point, so the kernel jumped into a USER page at CPL 0 — and
+/// SMEP refused the fetch. The #PF named the right address with the
+/// wrong CS, which is as clear a diagnosis as that mistake can
+/// produce.
+pub fn user_entry_trampoline() -> u64 {
+    // Through a pointer rather than a direct numeric cast, as
+    // `entry_trampoline` does and for the same reason.
+    (user_entry_trampoline_asm as *const ()) as u64
+}
+
+/// The trampoline a thread configured by `configure_user` starts at.
+///
+/// Typed as a diverging `extern "C" fn` so it can be handed to
+/// `Tcb::configure`, which takes the same shape for kernel threads.
+pub fn user_entry_trampoline_fn() -> extern "C" fn() -> ! {
+    // `user_entry_trampoline` is declared `-> !` in the extern block
+    // and never returns: it ends in `iretq`.
+    //
+    // SAFETY: Reinterpreting one `extern "C"` function pointer as
+    // another with the same (empty) argument list and the same
+    // divergence. The assembly takes no arguments in the ABI sense --
+    // it reads R12, R13 and R14, which the context switch loaded --
+    // and does not return.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn() -> !, extern "C" fn() -> !>(
+            user_entry_trampoline_asm,
+        )
+    }
+}
+
 /// Install `next`'s address space, if it differs from the current one.
 ///
 /// Returns `false` if the thread's VSpace has been revoked, in which
@@ -602,6 +840,25 @@ unsafe fn switch_to(next: &'static mut tcb::Tcb) {
     let next_phys = unsafe { tcb::tcb_phys(next) }.0;
     CURRENT.store(next_phys, Ordering::Release);
     SWITCH_COUNT.fetch_add(1, Ordering::AcqRel);
+
+    // The FPU, and the stacks the kernel will next be entered on (M8).
+    //
+    // Both before `switch_context`, for the same reason the CR3 reload
+    // is: after it, this function is not executing any more.
+    //
+    // Save then restore, with nothing between them that could touch an
+    // XMM register. The kernel builds with `-mno-sse` precisely so
+    // that "nothing between them" is a property of the compiler rather
+    // than a hope -- and that is also why the kernel itself never
+    // needs its FPU state saved on the interrupt path.
+    //
+    // SAFETY: Interrupts are disabled, both TCBs are live, and each
+    // fxsave area belongs to exactly one thread.
+    unsafe {
+        save_fpu(previous);
+        restore_fpu(next);
+        set_kernel_entry_stack(next);
+    }
 
     // Put the outgoing thread back on the queue *before* switching:
     // after `switch_context` this code is not running any more, and
@@ -796,6 +1053,18 @@ pub unsafe fn init(boot_tcb: &mut tcb::Tcb) {
     let phys = unsafe { tcb::tcb_phys(boot_tcb) }.0;
     CURRENT.store(phys, Ordering::Release);
 
+    // Arm the kernel-entry stacks for the thread that is running right
+    // now (M8). Without this they stay zero until the *first* switch,
+    // and a ring-3 thread entering the kernel before then would have
+    // the CPU load RSP0 = 0 -- a stack at address zero, which faults
+    // while already delivering a fault.
+    //
+    // SAFETY: Interrupts are disabled (asserted above) and the boot
+    // thread's stack is the main stack, mapped by `vm::init`.
+    unsafe {
+        set_kernel_entry_stack(boot_tcb);
+    }
+
     println!(
         "[sched] boot thread adopted: tcb at {:#018x}, stack {:#018x}..{:#018x}",
         phys,
@@ -819,5 +1088,17 @@ pub fn report() {
         cr3_switch_count(),
         cr3_skipped_count(),
         stale_vspace_count()
+    );
+    // M8. The equality between `fxsave` and the switch count is what
+    // makes "no lazy switching" testable at all: a correct lazy
+    // implementation also preserves every register, so preservation
+    // alone proves nothing about which strategy is in use (ADR 031).
+    println!(
+        "[sched] fpu: {} fxsave, {} fxrstor over {} switches; {} rsp0 \
+         updates",
+        fxsave_count(),
+        fxrstor_count(),
+        switch_count(),
+        rsp0_update_count()
     );
 }

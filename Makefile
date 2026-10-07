@@ -62,6 +62,13 @@ ISO_VSPACETEST := $(BUILD_DIR)/pythos-vspacetest.iso
 ISO_VSKERNEL := $(BUILD_DIR)/pythos-vskernel.iso
 ISO_VSISOLATION := $(BUILD_DIR)/pythos-vsisolation.iso
 ISO_VSSTALE := $(BUILD_DIR)/pythos-vsstale.iso
+# M8 ring 3 images.
+ISO_USERTEST := $(BUILD_DIR)/pythos-usertest.iso
+ISO_USERPRIV := $(BUILD_DIR)/pythos-userpriv.iso
+ISO_USERKREAD := $(BUILD_DIR)/pythos-userkread.iso
+ISO_USERSMEP := $(BUILD_DIR)/pythos-usersmep.iso
+ISO_USERSMAP := $(BUILD_DIR)/pythos-usersmap.iso
+ISO_USERFORGE := $(BUILD_DIR)/pythos-userforge.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -72,7 +79,9 @@ ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_CAPRETIRED) $(ISO_THREADTEST) $(ISO_THREADOVF) \
                $(ISO_THREADINTALLOC) $(ISO_THREADKILL) \
                $(ISO_VSPACETEST) $(ISO_VSKERNEL) $(ISO_VSISOLATION) \
-               $(ISO_VSSTALE)
+               $(ISO_VSSTALE) \
+               $(ISO_USERTEST) $(ISO_USERPRIV) $(ISO_USERKREAD) \
+               $(ISO_USERSMEP) $(ISO_USERSMAP) $(ISO_USERFORGE)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -132,6 +141,8 @@ QEMU_FLAGS := \
         run-captest run-caprevoke run-capintalloc run-capretired \
         run-threadtest run-threadovf run-threadintalloc run-threadkill \
         run-vspacetest run-vskernel run-vsisolation run-vsstale \
+        run-usertest run-userpriv run-userkread run-usersmep \
+        run-usersmap run-userforge \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -381,10 +392,12 @@ test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
       run-heaptest run-heapoom run-heapguard \
       run-captest run-caprevoke run-capintalloc run-capretired \
       run-threadtest run-threadovf run-threadintalloc run-threadkill \
-      run-vspacetest run-vskernel run-vsisolation run-vsstale
+      run-vspacetest run-vskernel run-vsisolation run-vsstale \
+      run-usertest run-userpriv run-userkread run-usersmep \
+      run-usersmap run-userforge
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
-		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M7: all acceptance tests passed"
+	--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
+	@echo "M8: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"
@@ -444,3 +457,45 @@ run-vsisolation: $(ISO_VSISOLATION)
 
 run-vsstale: $(ISO_VSSTALE)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSSTALE) --expect vsstale -- $(QEMU_FLAGS)
+
+# ---- M8 ring 3 images --------------------------------------------------
+
+$(ISO_USERTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,28)
+
+$(ISO_USERPRIV): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,29)
+
+$(ISO_USERKREAD): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,30)
+
+$(ISO_USERSMEP): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,31)
+
+$(ISO_USERSMAP): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,32)
+
+$(ISO_USERFORGE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,33)
+
+# M8 ring 3 scenarios. usertest and userforge exit 33 -- the second
+# because a refused invocation is a caller error and the kernel must
+# still be running afterwards. The other four exit 35.
+
+run-usertest: $(ISO_USERTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERTEST) --expect usertest -- $(QEMU_FLAGS)
+
+run-userpriv: $(ISO_USERPRIV)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERPRIV) --expect userpriv -- $(QEMU_FLAGS)
+
+run-userkread: $(ISO_USERKREAD)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERKREAD) --expect userkread -- $(QEMU_FLAGS)
+
+run-usersmep: $(ISO_USERSMEP)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERSMEP) --expect usersmep -- $(QEMU_FLAGS)
+
+run-usersmap: $(ISO_USERSMAP)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERSMAP) --expect usersmap -- $(QEMU_FLAGS)
+
+run-userforge: $(ISO_USERFORGE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERFORGE) --expect userforge -- $(QEMU_FLAGS)

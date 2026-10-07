@@ -24,6 +24,12 @@
 #  25 -> kernel-half map    build/pythos-vskernel.iso   exit 33 (refused, not fatal)
 #  26 -> isolation          build/pythos-vsisolation.iso exit 35
 #  27 -> revoked vspace     build/pythos-vsstale.iso    exit 35
+#  28 -> ring 3             build/pythos-usertest.iso   exit 33
+#  29 -> privileged insn    build/pythos-userpriv.iso   exit 35
+#  30 -> kernel read        build/pythos-userkread.iso  exit 35
+#  31 -> SMEP               build/pythos-usersmep.iso   exit 35
+#  32 -> SMAP               build/pythos-usersmap.iso   exit 35
+#  33 -> forged capability  build/pythos-userforge.iso  exit 33 (refused, not fatal)
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -252,3 +258,67 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vspace-stale-cr3
+
+/PythOS (ring 3 tests)
+    comment: A thread running at CPL 3, in its own address space, with
+    comment: code in a page that is executable and not writable. It reads
+    comment: CS and reports the privilege level through the one syscall;
+    comment: two such threads read the same virtual address and see
+    comment: different bytes, enter the kernel on different stacks, and
+    comment: keep their own XMM registers across preemption. The fxsave
+    comment: count equals the switch count, which is what shows nothing
+    comment: is lazy. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-test
+
+/PythOS (privileged instruction from ring 3)
+    comment: User code executes cli, then hlt, rdmsr and lgdt. Each is
+    comment: privileged, so the first one must raise #GP -- and cli is
+    comment: first deliberately, because it is the one that looks
+    comment: harmless. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-privileged
+
+/PythOS (user reads the kernel half)
+    comment: Ring 3 reads an address in the kernel heap. #PF with the
+    comment: USER bit set in the error code -- that bit is what tells a
+    comment: user overreach from a kernel pointer bug, and the two mean
+    comment: entirely different things. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-kernel-read
+
+/PythOS (SMEP)
+    comment: The kernel jumps into a user code page -- the *same* page
+    comment: ring 3 has just executed successfully, so the fault cannot
+    comment: be explained by a mapping difference. #PF with the
+    comment: instruction-fetch bit set. SMEP has been in CR4 since M3
+    comment: with nothing to protect; this is its first real test.
+    comment: Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-smep
+
+/PythOS (SMAP)
+    comment: The kernel reads a user page twice: once holding a
+    comment: UserAccess guard, which must succeed, and once without,
+    comment: which must fault. Both halves in one scenario, because
+    comment: either alone proves half the claim. The guarded read runs
+    comment: first -- the unguarded one ends the VM. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-smap
+
+/PythOS (forged capability pointers)
+    comment: The first genuinely hostile input this kernel has taken.
+    comment: Ring 3 invokes with reserved bits set, an out-of-range
+    comment: index, a stale generation, an empty slot, a real object of
+    comment: the wrong type, and an unknown method. Each must come back
+    comment: with its *own* error -- six InvalidArguments would satisfy
+    comment: a count and prove nothing -- and the kernel must still be
+    comment: running afterwards. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: user-cap-forge

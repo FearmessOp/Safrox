@@ -29,6 +29,25 @@ use crate::println;
 /// MSR address 0xC000_0080.
 const IA32_EFER: u32 = 0xC000_0080;
 
+/// `IA32_STAR`: the segment selectors `syscall` and `sysret` use.
+///
+/// Bits 47:32 are the base `syscall` derives CS and SS from; bits 63:48
+/// are the base `sysret` derives them from. See ADR 029 for why the
+/// GDT's order is dictated by this register.
+///
+/// Reference: Intel SDM Vol. 4, Table 2-2, MSR address 0xC000_0081.
+const IA32_STAR: u32 = 0xC000_0081;
+
+/// `IA32_LSTAR`: the address `syscall` jumps to in 64-bit mode.
+///
+/// Reference: Intel SDM Vol. 4, Table 2-2, MSR address 0xC000_0082.
+const IA32_LSTAR: u32 = 0xC000_0082;
+
+/// `IA32_FMASK`: RFLAGS bits cleared on `syscall`.
+///
+/// Reference: Intel SDM Vol. 4, Table 2-2, MSR address 0xC000_0084.
+const IA32_FMASK: u32 = 0xC000_0084;
+
 bitflags! {
     /// Bits of `IA32_EFER` that this kernel cares about.
     ///
@@ -64,6 +83,19 @@ bitflags! {
         /// page-table entry is ignored and every CR3 reload flushes the
         /// kernel's mappings too.
         const PGE = 1 << 7;
+        /// Bit 9, OSFXSR: the OS supports `fxsave`/`fxrstor`.
+        ///
+        /// Also the master switch for SSE: without it every SSE
+        /// instruction raises #UD. M8 needs both halves -- user code
+        /// uses SSE, and the context switch saves it (ADR 031).
+        const OSFXSR = 1 << 9;
+        /// Bit 10, OSXMMEXCPT: unmasked SSE floating-point errors are
+        /// reported as #XM (vector 19).
+        ///
+        /// Without it the same errors arrive as #UD -- "invalid
+        /// opcode", which is actively misleading about what happened.
+        /// M1's IDT already fills vector 19.
+        const OSXMMEXCPT = 1 << 10;
         /// Bit 20, SMEP: supervisor mode execution prevention. Fetching an
         /// instruction from a user page at CPL 0 faults.
         const SMEP = 1 << 20;
@@ -71,6 +103,29 @@ bitflags! {
         /// writing a user page at CPL 0 faults unless EFLAGS.AC is set
         /// (via `stac`/`clac`).
         const SMAP = 1 << 21;
+    }
+}
+
+bitflags! {
+    /// Bits of CR0 that affect the FPU.
+    ///
+    /// Reference: Intel SDM Vol. 3A, Figure 2-7 and 10.2.1.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Cr0: u64 {
+        /// Bit 1, MP: monitor coprocessor. Makes `wait`/`fwait` respect
+        /// TS. TS is never set here, but MP is the configuration the
+        /// architecture recommends and it costs nothing.
+        const MP = 1 << 1;
+        /// Bit 2, EM: emulation. When set, **every** SSE and x87
+        /// instruction raises #UD. Must be clear.
+        const EM = 1 << 2;
+        /// Bit 3, TS: task switched.
+        ///
+        /// The key to lazy FPU switching, which ADR 031 rejected --
+        /// partly because it is the basis of CVE-2018-3665. Cleared
+        /// explicitly rather than left alone, so that "TS might have
+        /// been set somewhere" is not a possibility to reason about.
+        const TS = 1 << 3;
     }
 }
 
@@ -84,6 +139,12 @@ pub struct Features {
     pub smap_supported: bool,
     pub smap_enabled: bool,
     pub pge_enabled: bool,
+    /// M8: `fxsave`/`fxrstor` and SSE are usable (CR4.OSFXSR).
+    pub fxsr_enabled: bool,
+    /// M8: SSE errors arrive as #XM rather than #UD (CR4.OSXMMEXCPT).
+    pub xmmexcpt_enabled: bool,
+    /// M8: `syscall`/`sysret` are usable (EFER.SCE).
+    pub syscall_enabled: bool,
 }
 
 /// [`Features`] packed into a word, so [`features`] can hand it back later.
@@ -108,6 +169,9 @@ impl Features {
             | (self.smap_enabled as u64) << 5
             | (self.pge_enabled as u64) << 6
             | Self::VALID
+            | (self.fxsr_enabled as u64) << 8
+            | (self.xmmexcpt_enabled as u64) << 9
+            | (self.syscall_enabled as u64) << 10
     }
 
     fn from_bits(bits: u64) -> Self {
@@ -119,6 +183,9 @@ impl Features {
             smap_supported: bits & (1 << 4) != 0,
             smap_enabled: bits & (1 << 5) != 0,
             pge_enabled: bits & (1 << 6) != 0,
+            fxsr_enabled: bits & (1 << 8) != 0,
+            xmmexcpt_enabled: bits & (1 << 9) != 0,
+            syscall_enabled: bits & (1 << 10) != 0,
         }
     }
 }
@@ -228,6 +295,31 @@ fn read_cr4() -> u64 {
     value
 }
 
+/// Read CR0.
+fn read_cr0() -> u64 {
+    let value: u64;
+    // SAFETY: Reading a control register into a general register has no
+    // side effects and touches no memory. Requires CPL 0, which holds.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Write CR0.
+///
+/// # Safety
+///
+/// CR0 holds PE, PG and WP among others; clearing one of those while
+/// paging is active is undefined. Only the FPU bits are touched here.
+unsafe fn write_cr0(value: u64) {
+    // SAFETY: The caller guarantees `value` is legal for the current
+    // mode. Writing CR0 is serialising.
+    unsafe {
+        asm!("mov cr0, {}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
 /// Write CR4.
 ///
 /// # Safety
@@ -322,6 +414,24 @@ pub unsafe fn init() -> Features {
         cr4 |= Cr4::SMAP;
     }
 
+    // --- FPU/SSE (M8, ADR 031) ------------------------------------------
+    //
+    // OSFXSR is the master switch for SSE *and* for fxsave/fxrstor. The
+    // kernel builds with -mno-sse and does not need it, but user code
+    // does -- there is no way to tell a user component not to use SSE,
+    // and no sane memcpy avoids XMM.
+    //
+    // OSXMMEXCPT decides how an unmasked SSE error is reported. Without
+    // it the CPU raises #UD -- "invalid opcode" -- for an instruction
+    // that is perfectly valid and merely produced a NaN. The diagnostic
+    // would point at the wrong thing entirely.
+    //
+    // OSXSAVE is deliberately *not* set. It would enable AVX, whose
+    // state fxsave does not cover; leaving it clear means the state
+    // this kernel cannot save is state user code cannot reach. See
+    // ADR 031 for why xsave was not used instead.
+    cr4 |= Cr4::OSFXSR | Cr4::OSXMMEXCPT;
+
     // Preserve the bits we do not manage (PAE, PSE, OSFXSR and friends):
     // start from the current value and only add.
     let cr4_after = cr4_before | cr4.bits();
@@ -337,6 +447,39 @@ pub unsafe fn init() -> Features {
     // silent downgrade of protection.
     let cr4_now = Cr4::from_bits_truncate(read_cr4());
 
+    // --- CR0: the FPU must not be emulated, and TS must stay clear ------
+    //
+    // EM set would make every SSE instruction #UD. Limine leaves it
+    // clear, but "Limine probably does X" is not something to build on
+    // -- the same argument M3 made about NXE.
+    //
+    // TS is cleared explicitly rather than merely left alone. It is the
+    // switch lazy FPU switching turns on, and ADR 031 rejected lazy
+    // switching; clearing it here means "TS might be set somewhere" is
+    // not a state anyone has to reason about.
+    let cr0_before = read_cr0();
+    let cr0_after = (cr0_before | Cr0::MP.bits()) & !(Cr0::EM.bits() | Cr0::TS.bits());
+
+    // SAFETY: Only the three FPU bits are touched; PE, PG and WP keep
+    // their current values, so paging and write protection are
+    // undisturbed.
+    unsafe {
+        write_cr0(cr0_after);
+    }
+
+    let cr0_now = Cr0::from_bits_truncate(read_cr0());
+    assert!(
+        !cr0_now.contains(Cr0::EM),
+        "CR0.EM is set: every SSE instruction would raise #UD, and user \
+         code cannot avoid SSE"
+    );
+    assert!(
+        !cr0_now.contains(Cr0::TS),
+        "CR0.TS is set, which is the lazy-FPU switch ADR 031 rejected; \
+         the first FPU instruction after a switch would take #NM and \
+         nothing handles it"
+    );
+
     let features = Features {
         nx_supported,
         nx_enabled,
@@ -345,6 +488,11 @@ pub unsafe fn init() -> Features {
         smap_supported,
         smap_enabled: cr4_now.contains(Cr4::SMAP),
         pge_enabled: cr4_now.contains(Cr4::PGE),
+        fxsr_enabled: cr4_now.contains(Cr4::OSFXSR),
+        xmmexcpt_enabled: cr4_now.contains(Cr4::OSXMMEXCPT),
+        // Set later, by `enable_syscall`: it needs the GDT loaded and
+        // the entry stub's address, neither of which exists here.
+        syscall_enabled: false,
     };
 
     FEATURE_BITS.store(features.to_bits(), Ordering::Release);
@@ -395,10 +543,186 @@ fn report(f: &Features) {
 
     if !f.smep_supported || !f.smap_supported {
         println!(
-            "[cpu] WARNING: SMEP/SMAP unavailable on this CPU; ring 3 in M8 \
-             will have weaker isolation. Under QEMU, add +smep,+smap to -cpu."
+            "[cpu] WARNING: SMEP/SMAP unavailable on this CPU; ring 3 \
+             isolation is weaker. Under QEMU, add +smep,+smap to -cpu."
         );
     }
+
+    // M8. OSXSAVE is absent from this line deliberately: ADR 031 keeps
+    // it clear, so that the state `fxsave` cannot save is also state
+    // user code cannot reach.
+    println!(
+        "[cpu] fpu: osfxsr {}, osxmmexcpt {}, cr0.em clear, cr0.ts clear \
+         (eager fxsave, no lazy switching -- ADR 031)",
+        if f.fxsr_enabled { "set" } else { "CLEAR" },
+        if f.xmmexcpt_enabled { "set" } else { "CLEAR" }
+    );
+
+    assert!(
+        f.fxsr_enabled,
+        "CR4.OSFXSR did not stick; SSE raises #UD and fxsave does not \
+         exist, so no user thread could run and no context switch could \
+         preserve what it did"
+    );
+    assert!(
+        f.xmmexcpt_enabled,
+        "CR4.OSXMMEXCPT did not stick; an SSE numeric error would arrive \
+         as #UD and the report would name the wrong cause"
+    );
+}
+
+// ---- syscall/sysret (M8, ADR 029 and 030) ------------------------------
+
+/// RFLAGS bits cleared on entry to `syscall`, via `IA32_FMASK`.
+///
+/// Each one is a way user code could otherwise reach into the kernel's
+/// execution environment:
+///
+/// * **IF (9)** — `syscall` is not an interrupt gate and does not clear
+///   IF itself. Without this, an interrupt can arrive between entry and
+///   the stack switch, while RSP still points at *user* memory: the
+///   handler would push its frame to an address user code controls.
+/// * **DF (10)** — the SysV ABI requires DF clear on entry to a C
+///   function. User code can leave it set, and the kernel's first string
+///   operation would then run backwards.
+/// * **TF (8)** — single-step. Set by user code, the kernel's first
+///   instruction takes #DB, and single-stepping walks through kernel
+///   code.
+/// * **AC (18)** — M7's lesson arriving late. `stac` is not privileged:
+///   it needs CR4.SMAP and nothing else, so user code can set AC and
+///   then `syscall`. The `UserAccess` guard reads "AC already set" and
+///   does nothing at all -- neither `stac` nor `clac` -- on the
+///   reasoning that an outer region owns the permission. SMAP would be
+///   off for the whole syscall and nothing would say so.
+///
+/// Reference: Intel SDM Vol. 2B, "SYSCALL"; Vol. 1, Figure 3-8.
+const FMASK_BITS: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 18);
+
+/// What `IA32_FMASK` actually holds.
+///
+/// Read from the MSR, not from [`FMASK_BITS`]. The constant is what
+/// the code meant; the MSR is what the CPU will act on, and
+/// [`enable_syscall`] is where the two could come apart.
+///
+/// Exists because a mutation test found the AC bit's only evidence
+/// was a line of printed text -- which the same edit that removed the
+/// bit could have removed too. ADR 023's K5: a guard indistinguishable
+/// from its own absence is not a guard.
+///
+/// # Panics
+///
+/// Before [`enable_syscall`] has run, when the MSR is whatever the
+/// firmware left.
+pub fn fmask() -> u64 {
+    assert!(
+        features().syscall_enabled,
+        "cpu::fmask() before enable_syscall(); the MSR holds whatever \
+         the firmware left and says nothing about this kernel"
+    );
+    // SAFETY: IA32_FMASK exists on any CPU that implements SYSCALL,
+    // which `enable_syscall` established before setting the flag this
+    // assertion just checked. Reading an MSR has no side effects.
+    unsafe { read_msr(IA32_FMASK) }
+}
+
+/// Turn on `syscall`/`sysret` and point them at the entry stub.
+///
+/// Separate from [`init`] because it needs two things that do not exist
+/// that early: the GDT must be loaded, since STAR names selectors in it,
+/// and the entry stub must have an address.
+///
+/// # Safety
+///
+/// Call once, after `gdt::init`, with interrupts disabled. `entry` must
+/// be the address of a stub that obeys ADR 030's contract: it is entered
+/// with RSP still pointing at user memory, RCX holding the return
+/// address and R11 the saved RFLAGS.
+pub unsafe fn enable_syscall(entry: u64) {
+    // CPUID leaf 0x8000_0001, EDX bit 11: SYSCALL/SYSRET.
+    //
+    // Reference: Intel SDM Vol. 2A, Table 3-8, leaf 80000001H, EDX
+    // bit 11.
+    let (_, _, _, ext_edx) = cpuid(0x8000_0001, 0);
+    assert!(
+        ext_edx & (1 << 11) != 0,
+        "this CPU does not implement SYSCALL/SYSRET, which is the only \
+         way into the kernel from ring 3 that this kernel implements"
+    );
+
+    // STAR holds two 16-bit selector bases. The arithmetic the CPU
+    // applies to each is in ADR 029, and `gdt`'s const assertions tie
+    // the GDT's layout to it -- so a wrong slot is a build failure
+    // rather than a silently wrong descriptor here.
+    let star =
+        ((crate::gdt::STAR_USER_BASE as u64) << 48) | ((crate::gdt::STAR_KERNEL_BASE as u64) << 32);
+
+    // SAFETY: All four MSRs exist on a CPU that just reported SYSCALL
+    // support, and we are at CPL 0. The selectors name descriptors in
+    // the GDT the caller guarantees is loaded.
+    //
+    // SCE is written last. Until it is set `syscall` is #UD, so there
+    // is no window in which the instruction works while its
+    // configuration is half written.
+    unsafe {
+        write_msr(IA32_STAR, star);
+        write_msr(IA32_LSTAR, entry);
+        write_msr(IA32_FMASK, FMASK_BITS);
+
+        let efer = read_msr(IA32_EFER) | Efer::SCE.bits();
+        write_msr(IA32_EFER, efer);
+    }
+
+    // Read everything back. A write that silently did not take would
+    // surface as a #GP or a jump into nowhere on the first syscall,
+    // with nothing to suggest an MSR was the cause.
+    //
+    // SAFETY: As above.
+    let (star_now, lstar_now, fmask_now, efer_now) = unsafe {
+        (
+            read_msr(IA32_STAR),
+            read_msr(IA32_LSTAR),
+            read_msr(IA32_FMASK),
+            Efer::from_bits_truncate(read_msr(IA32_EFER)),
+        )
+    };
+
+    assert_eq!(
+        star_now, star,
+        "IA32_STAR did not take the value written; sysret would load \
+         whatever selectors happen to be there"
+    );
+    assert_eq!(
+        lstar_now, entry,
+        "IA32_LSTAR did not take the entry point; the first syscall would \
+         jump to {:#018x}",
+        lstar_now
+    );
+    assert_eq!(
+        fmask_now, FMASK_BITS,
+        "IA32_FMASK did not take the mask; at least one of IF, DF, TF and \
+         AC would survive into the kernel"
+    );
+    assert!(
+        efer_now.contains(Efer::SCE),
+        "EFER.SCE did not stick; `syscall` is still #UD"
+    );
+
+    // Record it, so `features()` reports the truth rather than the
+    // placeholder `init` stored before the GDT existed.
+    let bits = FEATURE_BITS.load(Ordering::Acquire);
+    FEATURE_BITS.store(bits | (1 << 10), Ordering::Release);
+
+    println!(
+        "[cpu] syscall: enabled (efer.sce set), lstar {:#018x}, star \
+         {:#018x}",
+        entry, star
+    );
+    println!(
+        "[cpu] syscall: fmask clears IF|DF|TF|AC -- AC because `stac` is \
+         unprivileged, so user code can hand the kernel an open SMAP \
+         window and the UserAccess guard would read it as somebody \
+         else's (ADR 030)"
+    );
 }
 
 fn feature_state(supported: bool, enabled: bool) -> &'static str {

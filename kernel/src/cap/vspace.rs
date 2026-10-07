@@ -274,23 +274,73 @@ pub fn root_address(slot: &Slot) -> Result<PhysAddr, CapError> {
     Ok(slot.object().0)
 }
 
-// ---- Rights to permissions ---------------------------------------------
+// ---- Rights and permissions --------------------------------------------
 
-/// Translate capability rights into page permissions (ADR 027).
+/// What a mapping is allowed to do (ADR 032).
 ///
-/// `GRANT` and `GRANTREPLY` have no effect here, and that is worth being
-/// explicit about: `GRANT` reads like "may hand this on", but ADR 021
-/// defines it as the right to carry *capabilities* over an Endpoint. It
-/// says nothing about mapping.
+/// Three variants, and the absence of a fourth is the point. "Readable,
+/// writable **and** executable" is not refused at run time; it cannot
+/// be written down. W^X is a property of the type rather than of a
+/// check somebody has to remember — the same choice ADR 012 made for
+/// `TlbFlush`.
 ///
-/// `EXEC` is never granted in M7. Executable user pages belong to M8,
-/// along with the question of what W^X means on the user side. Not
-/// granting it now is easier than taking it back later.
-fn rights_to_flags(rights: Rights) -> Result<PageFlags, CapError> {
+/// A `PageFlags` argument with an `if write && exec { return Err }`
+/// would do the same job and could be deleted in a refactor. A missing
+/// enum variant cannot be deleted; removing it breaks the build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// Every variant starts with `Read`, and clippy suggests dropping the
+// prefix. Keeping it: the shared prefix *is* the invariant. Every
+// mapping is readable, and what varies is the second permission --
+// which is the whole content of ADR 032. `Only`, `Write` and
+// `Execute` would read as three unrelated things.
+#[allow(clippy::enum_variant_names)]
+pub enum MapPermissions {
+    /// Readable. Not writable, not executable.
+    ReadOnly,
+    /// Readable and writable. Not executable.
+    ReadWrite,
+    /// Readable and executable. **Not writable.**
+    ///
+    /// Needs only `Rights::READ`: making a page executable does not
+    /// change what is in it, and putting something there needs
+    /// `WRITE`. The two steps are what W^X separates.
+    ReadExecute,
+}
+
+impl MapPermissions {
+    pub const fn name(self) -> &'static str {
+        match self {
+            MapPermissions::ReadOnly => "r--",
+            MapPermissions::ReadWrite => "rw-",
+            MapPermissions::ReadExecute => "r-x",
+        }
+    }
+}
+
+/// Translate capability rights and a requested permission into page
+/// flags (ADR 027 for the rights, ADR 032 for the permissions).
+///
+/// Two gates, and both must open. The capability says what *may* be
+/// granted; the argument says what is *being asked for*.
+///
+/// `GRANT` and `GRANTREPLY` have no effect, which is worth stating
+/// because `GRANT` reads like "may hand this on". It is not: ADR 021
+/// defines it as the right to carry *capabilities* over an Endpoint,
+/// and it says nothing about mapping.
+///
+/// # The M7 behaviour that changed
+///
+/// M7 mapped read-only when `WRITE` was missing, silently. That is now
+/// an error. A caller that asked for a writable mapping and got a
+/// read-only one finds out at its first store — a #PF whose cause is
+/// in a different function, possibly a different milestone. Refusing
+/// at the point of the request puts the diagnosis where the mistake
+/// is.
+fn permissions_to_flags(rights: Rights, requested: MapPermissions) -> Result<PageFlags, CapError> {
     if !rights.contains(Rights::READ) {
-        // A mapping that can neither be read nor written is not a
-        // weaker mapping, it is a nonsensical one -- and `PageFlags`
-        // rejects it a layer down anyway.
+        // A mapping nothing may touch is not a weaker mapping, it is a
+        // meaningless one -- and `PageFlags` rejects it a layer down
+        // anyway.
         return Err(CapError::InsufficientRights {
             needed: Rights::READ,
             held: rights,
@@ -298,9 +348,33 @@ fn rights_to_flags(rights: Rights) -> Result<PageFlags, CapError> {
     }
 
     let mut flags = PageFlags::READ | PageFlags::USER;
-    if rights.contains(Rights::WRITE) {
-        flags |= PageFlags::WRITE;
+
+    match requested {
+        MapPermissions::ReadOnly => {}
+        MapPermissions::ReadWrite => {
+            if !rights.contains(Rights::WRITE) {
+                return Err(CapError::InsufficientRights {
+                    needed: Rights::WRITE,
+                    held: rights,
+                });
+            }
+            flags |= PageFlags::WRITE;
+        }
+        MapPermissions::ReadExecute => {
+            flags |= PageFlags::EXEC;
+        }
     }
+
+    // The invariant this function exists to keep. It cannot fail --
+    // no arm above sets both -- which is exactly why it is a
+    // `debug_assert` rather than a returned error: if it ever fires,
+    // the enum has grown a variant that should not exist.
+    debug_assert!(
+        !(flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC)),
+        "a mapping is both writable and executable; W^X is supposed to \
+         be unrepresentable (ADR 032)"
+    );
+
     Ok(flags)
 }
 
@@ -313,6 +387,10 @@ fn rights_to_flags(rights: Rights) -> Result<PageFlags, CapError> {
 /// PageTable at that level first -- the kernel will not spend a frame
 /// the caller did not offer (ADR 027).
 ///
+/// `permissions` says what the mapping may do, within what the Frame
+/// capability's rights allow (ADR 032). Asking for more than the
+/// capability holds is an error rather than a silent downgrade.
+///
 /// # Safety
 ///
 /// Both slots must hold live capabilities, and the caller must not hold
@@ -321,6 +399,7 @@ pub unsafe fn map_frame(
     root_slot: &Slot,
     frame_slot: &Slot,
     address: VirtAddr,
+    permissions: MapPermissions,
 ) -> Result<(), CapError> {
     let _interrupts = crate::sched::InterruptGuard::new();
 
@@ -333,7 +412,7 @@ pub unsafe fn map_frame(
         });
     }
 
-    let flags = rights_to_flags(frame_slot.rights())?;
+    let flags = permissions_to_flags(frame_slot.rights(), permissions)?;
 
     // K1 (ADR 027): a user VSpace takes user addresses only.
     //

@@ -282,7 +282,7 @@ EXPECTATIONS = {
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
             *CAP_INIT_LINES,
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -301,7 +301,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M7 checks passed", re.M)],
+        forbidden=[re.compile(r"M8 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -318,7 +318,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -337,7 +337,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M7 checks passed", re.M)],
+        forbidden=[re.compile(r"M8 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -356,7 +356,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -415,7 +415,7 @@ EXPECTATIONS = {
             # frames -- it panicked with "could not find 2 contiguous
             # frames for a CNode" when this ran to completion. Requiring
             # the line's *absence* keeps the two facts tied together.
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
         ],
     ),
     "doublefree": Expectation(
@@ -435,7 +435,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -483,7 +483,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -528,7 +528,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -557,7 +557,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -613,7 +613,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
@@ -698,7 +698,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -732,7 +732,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             # A null return instead of a panic: out of memory must be loud.
             re.compile(r"returned null instead of panicking", re.M),
             # The heap handing out more than its limit would mean the bound
@@ -761,7 +761,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the heap's upper guard page did not fault", re.M),
         ],
     ),
@@ -920,7 +920,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[captest\] all capability tests passed", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant above is an assert, so a violation is a
@@ -985,7 +985,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the ADR 022 tripwire is not working", re.M),
         ],
     ),
@@ -1007,7 +1007,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the ADR 022 retirement check is not working", re.M),
         ],
     ),
@@ -1147,7 +1147,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[thread\] all thread tests passed", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -1183,7 +1183,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
             re.compile(r"the thread returned from an infinite recursion", re.M),
         ],
@@ -1214,7 +1214,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"does not work on the path that matters", re.M),
             re.compile(r"no timer interrupt arrived within the deadline", re.M),
         ],
@@ -1250,7 +1250,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"instead of ThreadBusy", re.M),
         ],
     ),
@@ -1360,7 +1360,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[vspace\] all address space tests passed", re.M),
-            re.compile(r"^\[boot\] M7 checks passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -1407,7 +1407,7 @@ EXPECTATIONS = {
             # The kernel is still standing afterwards, which is the
             # whole reason this scenario exits 33.
             #
-            # It does not reach "M7 checks passed": the scenario calls
+            # It does not reach "M8 checks passed": the scenario calls
             # `qemu::exit` itself rather than returning to `kmain`,
             # because the point is made as soon as the four refusals
             # have happened and the heap is still readable. Requiring
@@ -1458,7 +1458,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             re.compile(r"the two VSpaces are not isolated", re.M),
         ],
     ),
@@ -1519,7 +1519,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"M8 checks passed", re.M),
             # The failure this scenario exists to rule out: the
             # scheduler switching into a thread whose page tables have
             # been handed back to their Untyped.
@@ -1527,6 +1527,332 @@ EXPECTATIONS = {
             # And the other one: a thread succeeding in destroying the
             # address space it is executing in.
             re.compile(r"instead of VSpaceInUse", re.M),
+        ],
+    ),
+    # ---- M8: ring 3 ----------------------------------------------------
+    #
+    # The positive scenario and five negatives. The negatives are where
+    # the milestone's value is: a kernel that lets user code run but
+    # cannot stop it has gained nothing over M7.
+    "usertest": Expectation(
+        name="ring 3",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The MSRs and the segments. A wrong STAR would make sysret
+            # load the wrong descriptor silently, so the values are
+            # required rather than merely printed.
+            re.compile(
+                r"^\[cpu\] syscall: enabled \(efer\.sce set\), lstar "
+                r"0x[0-9a-f]{16}, star 0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # AC in the mask, which is M7's lesson arriving late: `stac`
+            # is unprivileged, so user code can hand the kernel an open
+            # SMAP window.
+            re.compile(
+                r"^\[cpu\] syscall: fmask clears IF\|DF\|TF\|AC",
+                re.M,
+            ),
+            # And the same claim checked against the *register* rather
+            # than against the line above. A mutation that removed AC
+            # from the mask was caught only by the banner -- which the
+            # same edit could have reworded. ADR 023's K5 does not
+            # accept evidence a guard's author controls.
+            re.compile(
+                r"^\[user\] fmask: read back as 0x[0-9a-f]{16} from the "
+                r"MSR -- IF, DF, TF and AC all cleared on entry",
+                re.M,
+            ),
+            re.compile(
+                r"^\[cpu\] fpu: osfxsr set, osxmmexcpt set, cr0\.em clear, "
+                r"cr0\.ts clear",
+                re.M,
+            ),
+            re.compile(
+                r"^\[user\] selectors: user cs 0x[0-9a-f]{4}, user ss "
+                r"0x[0-9a-f]{4}",
+                re.M,
+            ),
+            # The saved MXCSR must be the architectural default. Zero is
+            # what retype leaves, and it unmasks every SSE exception --
+            # indistinguishable from "initialised" until the first
+            # floating-point operation.
+            re.compile(r"^\[user\] fpu: .*saved mxcsr 0x1f80", re.M),
+            # W^X on the user side: the code page is r-x, and no page is
+            # both writable and executable.
+            re.compile(r"^\[user\] address space: code at .* r-x", re.M),
+            re.compile(
+                r"^\[user\] w\^x: no page is both writable and executable",
+                re.M,
+            ),
+            # **The claim of this milestone.** CS's low two bits are 3.
+            # Nothing else here would fail on a kernel that ran the same
+            # code at CPL 0.
+            re.compile(
+                r"^\[user\] ring 3: cs = 0x003b \(cpl 3\), data page reads "
+                r"0x[0-9a-f]{16}, [1-9]\d* syscalls completed",
+                re.M,
+            ),
+            # Two user threads, two kernel stacks. A single counter would
+            # be satisfied by an implementation that wrote RSP0 once,
+            # because the first value is already correct -- so the two
+            # addresses are required to differ.
+            re.compile(
+                r"^\[user\] kernel stacks: thread A enters at "
+                r"0x[0-9a-f]{16}, thread B at 0x[0-9a-f]{16}; each inside "
+                r"its own stack, [1-9]\d* rsp0 updates",
+                re.M,
+            ),
+            # M7's isolation, now at CPL 3.
+            re.compile(
+                r"^\[user\] isolation: at 0x[0-9a-f]{16}, thread A reads "
+                r"0x[0-9a-f]{16} and thread B reads 0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # The FPU. The equality between fxsave and the switch count
+            # is what rules out lazy switching: a correct lazy
+            # implementation also preserves every register, so
+            # preservation alone says nothing about the strategy.
+            re.compile(
+                r"^\[user\] xmm: thread A holds 0x[0-9a-f]{16}, thread B "
+                r"0x[0-9a-f]{16} across [1-9]\d* reports; [1-9]\d* fxsave "
+                r"over [1-9]\d* switches -- equal, so nothing is lazy",
+                re.M,
+            ),
+            re.compile(
+                r"^\[sched\] fpu: [1-9]\d* fxsave, [1-9]\d* fxrstor over "
+                r"[1-9]\d* switches; [1-9]\d* rsp0 updates",
+                re.M,
+            ),
+            # The timer reaches ring 3.
+            re.compile(
+                r"^\[user\] preemption: [1-9]\d* ticks while the kernel "
+                r"span without yielding",
+                re.M,
+            ),
+            # The measurement, with its emulation caveat.
+            re.compile(
+                r"^\[user\] syscall cost: [1-9]\d* calls in \d+ cycles",
+                re.M,
+            ),
+            re.compile(
+                r"^\[user\] syscall cost: measured under emulation",
+                re.M,
+            ),
+            # The fast path was taken. Without this, ADR 029's
+            # canonical-RCX check could be guarding a path nothing uses.
+            re.compile(
+                r"^\[syscall\] [1-9]\d* calls \(\d+ returned an error\), "
+                r"[1-9]\d* via sysret",
+                re.M,
+            ),
+            # A real capability invocation ran, not only Echo. Echo
+            # resolves no capability at all, so "the capability path
+            # works from ring 3" would otherwise rest on nothing --
+            # and the first run of this scenario reported exactly
+            # that: `last capability invocation: <none yet>`.
+            re.compile(
+                r"^\[user\] capability path: ReadRegisters from ring 3 "
+                r"returned \d+",
+                re.M,
+            ),
+            re.compile(
+                r"^\[syscall\] last capability invocation: ReadRegisters",
+                re.M,
+            ),
+            re.compile(r"^\[user\] all ring 3 tests passed", re.M),
+            re.compile(r"^\[boot\] M8 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # CPL 0 in the CS report would mean the thread never left
+            # the kernel, and every other check would still pass.
+            re.compile(r"\(cpl 0\)", re.M),
+        ],
+    ),
+    "userpriv": Expectation(
+        name="privileged instruction from ring 3",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[user\] running `cli` at cpl 3; expected #GP",
+                re.M,
+            ),
+            # #GP, vector 13.
+            re.compile(
+                r"^\*\*\* EXCEPTION: #GP general protection \(vector 13\)",
+                re.M,
+            ),
+            # From ring 3: the saved CS must be the user selector. A #GP
+            # reported with a kernel CS would mean the fault came from
+            # somewhere else entirely, and the scenario would be
+            # passing for the wrong reason.
+            re.compile(r"^\[trap\] error_code=.*cs=0x003b", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M8 checks passed", re.M),
+            # The failure this exists to rule out.
+            re.compile(r"without faulting", re.M),
+        ],
+    ),
+    "userkread": Expectation(
+        name="user reads the kernel half",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[user\] reading 0x[0-9a-f]{16} from cpl 3; expected #PF",
+                re.M,
+            ),
+            re.compile(
+                r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\)",
+                re.M,
+            ),
+            # The USER bit in the error code. This is the whole point:
+            # it distinguishes "ring 3 reached for the kernel" from "a
+            # kernel pointer went wrong", and the two mean entirely
+            # different things. The decoder prints it as "user".
+            re.compile(r"^\[trap\] cr2=0x[0-9a-f]{16}  \(user read", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"without faulting", re.M),
+            # A supervisor-mode fault here would mean the read happened
+            # in the kernel rather than in ring 3.
+            re.compile(r"\(supervisor read", re.M),
+        ],
+    ),
+    "usersmep": Expectation(
+        name="SMEP",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            # SMEP and SMAP are reported on one line, so the pattern
+            # has to match that line rather than a hypothetical
+            # per-feature one.
+            re.compile(r"^\[cpu\] smep: enabled, smap: enabled", re.M),
+            # Ring 3 executed the page first. Without this half, the
+            # fault below would be explainable by the page simply not
+            # being executable -- and the scenario would prove nothing
+            # about SMEP.
+            re.compile(
+                r"^\[user\] ring 3 executed the page [1-9]\d* times; the "
+                r"same page is now fetched from cpl 0",
+                re.M,
+            ),
+            re.compile(
+                r"^\[user\] switching to the user vspace .* at cpl 0; "
+                r"expected #PF with the instruction-fetch bit",
+                re.M,
+            ),
+            re.compile(
+                r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\)",
+                re.M,
+            ),
+            # Bit 4 of the error code: an instruction fetch, from
+            # supervisor mode, on a present page. That combination is
+            # SMEP and nothing else.
+            re.compile(
+                r"^\[trap\] cr2=0x[0-9a-f]{16}  \(supervisor instruction "
+                r"fetch protection-violation\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M8 checks passed", re.M),
+            # SMEP absent would make the scenario vacuous, and it says
+            # so rather than passing quietly.
+            re.compile(r"SMEP is not enabled", re.M),
+        ],
+    ),
+    "usersmap": Expectation(
+        name="SMAP",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(r"^\[cpu\] smep: enabled, smap: enabled", re.M),
+            # The guarded read, first and successful. It runs first
+            # because the unguarded one ends the VM -- the other order
+            # would make half the claim untestable.
+            re.compile(
+                r"^\[user\] smap: with a UserAccess guard, the kernel read "
+                r"0x[0-9a-f]{16} from 0x[0-9a-f]{16} -- succeeded",
+                re.M,
+            ),
+            re.compile(
+                r"^\[user\] smap: now reading 0x[0-9a-f]{16} with no guard",
+                re.M,
+            ),
+            re.compile(
+                r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\)",
+                re.M,
+            ),
+            # Supervisor read, protection violation: present page, right
+            # permissions, refused anyway. That is SMAP.
+            re.compile(
+                r"^\[trap\] cr2=0x[0-9a-f]{16}  \(supervisor read "
+                r"protection-violation\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"SMAP is not enabled", re.M),
+            # The unguarded read succeeding would mean SMAP protects
+            # nothing -- and every stray supervisor pointer into user
+            # memory works silently.
+            re.compile(r"without a guard and got", re.M),
+        ],
+    ),
+    "userforge": Expectation(
+        name="forged capability pointers",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # Six hostile invocations, each refused with its *own*
+            # error. Six InvalidArguments would satisfy a count and
+            # prove nothing -- the same mistake ADR 027's two half
+            # checks made, found by mutation in M7.
+            re.compile(
+                r"^\[user\] cap-forge: all 6 hostile invocations refused, "
+                r"each with its own error -- InvalidCPtr, CPtrOutOfRange, "
+                r"StaleCPtr, EmptySlot, WrongType, InvalidArgument",
+                re.M,
+            ),
+            # And the kernel survived. This is the scenario's actual
+            # claim: a kernel that panics on a bad CPtr is a kernel any
+            # user component can halt.
+            re.compile(
+                r"^\[user\] the kernel is still running; exiting normally",
+                re.M,
+            ),
+            re.compile(
+                r"^\[syscall\] [1-9]\d* calls \([1-9]\d* returned an error\)",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # A forged pointer reaching an object.
+            re.compile(r"which is not an error", re.M),
         ],
     ),
 }

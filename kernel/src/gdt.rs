@@ -11,16 +11,42 @@
 //!
 //! ```text
 //!   0  0x00  null
-//!   1  0x08  kernel code, ring 0, 64-bit
+//!   1  0x08  kernel code, ring 0, 64-bit   <- STAR[47:32] points here
 //!   2  0x10  kernel data, ring 0
 //!   3  0x18  TSS, 16 bytes -- occupies slots 3 and 4
+//!   4  0x20    (the TSS descriptor's upper half)
+//!   5  0x28  user code 32-bit, ring 3      <- STAR[63:48] points here
+//!   6  0x30  user data, ring 3
+//!   7  0x38  user code 64-bit, ring 3
 //! ```
 //!
-//! User-mode segments are deliberately absent; they arrive in M8 along with
-//! ring 3. Appending them later does not disturb the selectors above.
+//! # Why the user segments are in that order (M8)
+//!
+//! The order is not a choice. `sysret` derives both selectors from
+//! `STAR[63:48]` by fixed arithmetic:
+//!
+//! * `sysretq` loads CS from base + 16 and SS from base + 8.
+//! * `sysretl` would load CS from base + 0.
+//!
+//! So the sequence must be **user CS32, user SS, user CS64** -- the
+//! 64-bit code segment after the 32-bit one, which reads backwards until
+//! you see the arithmetic.
+//!
+//! Slot 5 is never used: this kernel never executes `sysretl`. It still
+//! holds a *valid* descriptor rather than zero, because a placeholder
+//! that happens to be invalid is a `#GP` waiting for the day somebody
+//! adds 32-bit support.
+//!
+//! Getting the order wrong is hard to diagnose -- `sysret` loads a wrong
+//! descriptor silently and the failure surfaces at the first user
+//! instruction, somewhere unrelated. The `const` assertions at the end of
+//! this file tie the indices to the arithmetic `sysret` performs, so a
+//! mistake is a build failure instead.
+//!
+//! See ADR 029.
 //!
 //! Reference: Intel SDM Vol. 3A, Chapter 3 "Protected-Mode Memory
-//! Management" and Chapter 7 "Task Management".
+//! Management" and Chapter 7 "Task Management"; Vol. 2B, "SYSRET".
 
 use core::arch::asm;
 use core::mem::size_of;
@@ -39,6 +65,45 @@ pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3;
 
 /// Selector for the TSS descriptor (GDT index 3, RPL 0).
 const TSS_SELECTOR: u16 = 3 << 3;
+
+// ---- User segments (M8) ------------------------------------------------
+
+/// GDT index of the 32-bit user code segment.
+///
+/// Unused -- this kernel never executes `sysretl` -- but the slot must
+/// exist, because `sysret` computes the other two selectors from it.
+const USER_CODE32_INDEX: u16 = 5;
+
+/// GDT index of the user data segment.
+const USER_DATA_INDEX: u16 = 6;
+
+/// GDT index of the 64-bit user code segment.
+const USER_CODE64_INDEX: u16 = 7;
+
+/// Requested privilege level 3, OR'd into a user selector.
+///
+/// A selector loaded at CPL 3 must have RPL 3, or the descriptor's own
+/// DPL check fails and the transition raises #GP.
+const RPL_USER: u16 = 3;
+
+/// Selector for the user data segment (GDT index 6, RPL 3) = `0x33`.
+pub const USER_DATA_SELECTOR: u16 = (USER_DATA_INDEX << 3) | RPL_USER;
+
+/// Selector for the 64-bit user code segment (GDT index 7, RPL 3) = `0x3b`.
+pub const USER_CODE_SELECTOR: u16 = (USER_CODE64_INDEX << 3) | RPL_USER;
+
+/// Value for `IA32_STAR[63:48]`, the base `sysret` derives from.
+///
+/// Note it is the index of the *32-bit* code segment, with RPL 3. The
+/// CPU adds 8 for SS and 16 for the 64-bit CS.
+pub const STAR_USER_BASE: u16 = (USER_CODE32_INDEX << 3) | RPL_USER;
+
+/// Value for `IA32_STAR[47:32]`, the base `syscall` derives from.
+///
+/// `syscall` loads CS from this and SS from this + 8, both forced to
+/// RPL 0 -- so the field holds the kernel code selector and the kernel
+/// data segment must sit immediately after it.
+pub const STAR_KERNEL_BASE: u16 = KERNEL_CODE_SELECTOR;
 
 /// IST slot used for the double-fault handler.
 ///
@@ -97,6 +162,67 @@ pub fn ist1_range() -> (u64, u64) {
         IST1_BOTTOM.load(Ordering::Acquire),
         IST1_TOP.load(Ordering::Acquire),
     )
+}
+
+/// Set the stack the CPU switches to when an interrupt raises the
+/// privilege level from ring 3 to ring 0.
+///
+/// Must be called on **every thread switch**, not once at boot. Each
+/// thread has its own kernel stack (M6), and `TSS.RSP0` is what the CPU
+/// reads when it takes an interrupt in ring 3.
+///
+/// # What sharing one RSP0 would do
+///
+/// Two user threads with the same RSP0 share a kernel stack. Thread A
+/// enters the kernel, writes its frame, gets preempted; thread B enters
+/// the kernel, starts writing from the *same* top, and overwrites A's
+/// frame. When A resumes, its stack is somebody else's.
+///
+/// The symptom is random corruption -- a wrong return address, a
+/// mangled local, or nothing at all, depending on which bytes were
+/// overwritten. It is not deterministic and its cause is nowhere near
+/// where it is seen. See ADR 029.
+///
+/// Note the syscall path does **not** use this: `syscall` leaves RSP
+/// alone, and the stub reads `KERNEL_RSP` instead (ADR 030). The two
+/// hold the same value and `sched` writes them together.
+///
+/// # Safety
+///
+/// `top` must be one past the last byte of a mapped, writable, 16-byte
+/// aligned kernel stack belonging to the thread about to run.
+pub unsafe fn set_rsp0(top: u64) {
+    debug_assert!(
+        top.is_multiple_of(16),
+        "RSP0 must be 16-byte aligned; the CPU does not realign it and \
+         every SSE spill in the kernel would be misaligned"
+    );
+
+    // SAFETY: The TSS is a static this module owns. The CPU only reads
+    // RSP0 when it takes an interrupt that raises the privilege level,
+    // and the caller holds the scheduler's interrupt-free region across
+    // this write (ADR 025) -- so the CPU cannot observe a half-written
+    // value. The write is a single aligned qword in any case.
+    unsafe {
+        let tss = &raw mut TSS;
+        (*tss).privilege_stack_table[0] = top;
+    }
+}
+
+/// What `TSS.RSP0` currently holds.
+///
+/// Read back by the acceptance test, which needs to show that two user
+/// threads enter the kernel on *different* stacks. A counter would not
+/// do: "RSP0 is being updated" is satisfied by an implementation that
+/// writes it once, because the first value is already correct.
+pub fn rsp0() -> u64 {
+    // SAFETY: A single aligned qword read from a static this module
+    // owns. Racing with `set_rsp0` is impossible on one CPU outside an
+    // interrupt, and the value is only reported.
+    unsafe {
+        let tss = &raw const TSS;
+        (*tss).privilege_stack_table[0]
+    }
 }
 
 /// Point IST1 at a different stack.
@@ -210,6 +336,12 @@ const ACCESS_EXECUTABLE: u8 = 1 << 3;
 /// Bit 1, RW: readable for a code segment, writable for a data segment.
 const ACCESS_RW: u8 = 1 << 1;
 
+/// Bits 6:5, DPL = 3: the segment may be used at ring 3.
+///
+/// A code segment with DPL 3 is what makes CPL 3 possible at all; a data
+/// segment with DPL 3 is what lets ring 3 load it into SS.
+const ACCESS_DPL3: u8 = 3 << 5;
+
 /// System-segment type 0b1001: 64-bit TSS, available (not busy).
 ///
 /// Reference: Intel SDM Vol. 3A, Table 3-2 "System-Segment and Gate-Descriptor
@@ -230,6 +362,13 @@ const TSS_TYPE_AVAILABLE_64: u8 = 0b1001;
 /// Reference: Intel SDM Vol. 3A, 3.4.5 "Segment Descriptors", L flag, and
 /// 5.2.1 "Code-Segment Descriptor in 64-bit Mode".
 const FLAG_LONG_MODE: u8 = 1 << 5;
+
+/// Descriptor bit 54, D/B: 32-bit default operand size.
+///
+/// Set for the 32-bit user code segment, where L must be clear. The two
+/// are mutually exclusive: L=1 means 64-bit, D=1 means 32-bit, and both
+/// set is an invalid descriptor.
+const FLAG_DB_32BIT: u8 = 1 << 6;
 
 /// Descriptor bit 55, G: granularity. With G set, the limit counts 4 KiB
 /// pages instead of bytes. Long mode ignores the limit for code and data
@@ -282,13 +421,15 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     (low, high)
 }
 
-/// The GDT itself: five 8-byte slots, the last two forming the TSS
-/// descriptor.
+/// The GDT itself: eight 8-byte slots.
+///
+/// Slots 3 and 4 form the 16-byte TSS descriptor; 5 through 7 are the
+/// user segments M8 added, in the order `sysret` dictates.
 ///
 /// `static mut` because `lgdt` makes the CPU read this memory directly, and
 /// because the TSS descriptor can only be filled in at run time (it embeds
 /// the TSS's address).
-static mut GDT: [u64; 5] = [0; 5];
+static mut GDT: [u64; 8] = [0; 8];
 
 /// Operand for `lgdt`: a 16-bit limit followed by a 64-bit base.
 ///
@@ -356,8 +497,38 @@ pub unsafe fn init() {
         GDT[3] = tss_low;
         GDT[4] = tss_high;
 
+        // ---- User segments (M8, ADR 029) ----
+        //
+        // The order is `sysret`'s, not ours: it computes SS from
+        // STAR[63:48] + 8 and the 64-bit CS from + 16. So 32-bit code,
+        // then data, then 64-bit code.
+
+        // Slot 5: 32-bit user code. Never executed -- this kernel has no
+        // `sysretl` path -- but a real descriptor rather than zero, so
+        // that adding one later does not start from a silent #GP.
+        //
+        // L clear and D set: the two are mutually exclusive, and a
+        // descriptor with both is invalid.
+        GDT[USER_CODE32_INDEX as usize] = segment_descriptor(
+            ACCESS_PRESENT | ACCESS_CODE_DATA | ACCESS_EXECUTABLE | ACCESS_RW | ACCESS_DPL3,
+            FLAG_DB_32BIT | FLAG_GRANULARITY_4K,
+        );
+
+        // Slot 6: user data. This is what SS holds at CPL 3, and what
+        // `iretq` loads from the frame.
+        GDT[USER_DATA_INDEX as usize] = segment_descriptor(
+            ACCESS_PRESENT | ACCESS_CODE_DATA | ACCESS_RW | ACCESS_DPL3,
+            FLAG_GRANULARITY_4K,
+        );
+
+        // Slot 7: 64-bit user code. The one that actually runs.
+        GDT[USER_CODE64_INDEX as usize] = segment_descriptor(
+            ACCESS_PRESENT | ACCESS_CODE_DATA | ACCESS_EXECUTABLE | ACCESS_RW | ACCESS_DPL3,
+            FLAG_LONG_MODE | FLAG_GRANULARITY_4K,
+        );
+
         let pointer = DescriptorTablePointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 8]>() - 1) as u16,
             base: &raw const GDT as u64,
         };
 
@@ -463,3 +634,63 @@ unsafe fn load_task_register() {
         asm!("ltr {:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
     }
 }
+
+// ---- The selectors `sysret` and `syscall` derive, checked at build time
+//
+// `sysret` does not read the GDT to find its selectors; it computes them
+// by adding a fixed offset to STAR[63:48]. If the user descriptors are
+// not at exactly those indices, it loads the wrong one *silently*, and
+// the failure appears at the first user instruction -- somewhere
+// unrelated to the mistake.
+//
+// These assertions reproduce the CPU's arithmetic. Moving a slot is then
+// a build failure rather than a #GP two milestones later.
+//
+// Reference: Intel SDM Vol. 2B, "SYSRET" and "SYSCALL"; ADR 029.
+
+const _: () = {
+    // `sysretq` loads SS from STAR[63:48] + 8, with RPL forced to 3.
+    assert!(
+        (STAR_USER_BASE & !3) + 8 == (USER_DATA_SELECTOR & !3),
+        "sysret would load SS from the wrong GDT slot: STAR[63:48] + 8 \
+         must be the user data segment"
+    );
+
+    // `sysretq` loads CS from STAR[63:48] + 16, with RPL forced to 3.
+    assert!(
+        (STAR_USER_BASE & !3) + 16 == (USER_CODE_SELECTOR & !3),
+        "sysret would load CS from the wrong GDT slot: STAR[63:48] + 16 \
+         must be the 64-bit user code segment"
+    );
+
+    // `syscall` loads SS from STAR[47:32] + 8, with RPL forced to 0. So
+    // the kernel data segment must sit immediately after the kernel
+    // code segment.
+    assert!(
+        STAR_KERNEL_BASE + 8 == KERNEL_DATA_SELECTOR,
+        "syscall would load SS from the wrong GDT slot: STAR[47:32] + 8 \
+         must be the kernel data segment"
+    );
+
+    // Every index named above must be inside the table.
+    assert!(
+        (USER_CODE64_INDEX as usize) < 8,
+        "a user segment index is past the end of the GDT"
+    );
+
+    // The user selectors must carry RPL 3. A user descriptor loaded with
+    // RPL 0 fails the privilege check and raises #GP -- and the check
+    // that fails is the descriptor's own DPL, so the diagnostic points
+    // at the descriptor rather than at the selector.
+    assert!(
+        USER_CODE_SELECTOR & 3 == 3 && USER_DATA_SELECTOR & 3 == 3,
+        "the user selectors must have RPL 3"
+    );
+
+    // And the TSS must not overlap them: it is 16 bytes, so it occupies
+    // two slots and the first user segment starts after both.
+    assert!(
+        (TSS_SELECTOR >> 3) + 2 <= USER_CODE32_INDEX,
+        "the TSS descriptor's upper half overlaps the first user segment"
+    );
+};

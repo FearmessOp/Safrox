@@ -3,20 +3,33 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M7 — Address spaces.** A thread can now have an
-address space of its own, built entirely out of capabilities: a root
-PageTable, the intermediate tables the caller supplies, and Frames
-mapped into the user half. Context switching reloads CR3 — but only
-when the address space actually differs.
+**Current milestone: M8 — Ring 3.** Code now runs at CPL 3, in its own
+address space, with its instructions in a page that is executable and
+not writable. It reaches the kernel through one `syscall` and comes
+back through `sysret`; the timer preempts it; its XMM registers
+survive; and it enters the kernel on a stack no other thread shares.
 
-**There is no ring 3 yet.** Threads run at CPL 0 in their own CR3, and
-the split is deliberate: reaching ring 3 and reaching a private address
-space are two separate sources of error, and doing both at once leaves
-a first `#GP` with two suspects. M7 proves the address space; M8 proves
-the privilege level.
+M7 proved the address space and deliberately stopped there — reaching
+ring 3 and reaching a private CR3 are two sources of error, and doing
+both at once leaves a first `#GP` with two suspects. That debt is now
+paid.
 
-The claim that matters is one line of the acceptance test: two threads
-read the *same* virtual address and see different bytes.
+The claim that matters is one line of the acceptance test:
+
+```
+[user] ring 3: cs = 0x003b (cpl 3), data page reads 0xa5a5a5a511111111
+```
+
+The low two bits of CS are the privilege level. Everything else in
+this milestone would pass on a kernel that ran the same code at ring 0.
+
+**The value is in the five negative scenarios.** A kernel that lets
+user code run but cannot stop it has gained nothing. `cli` from ring 3
+takes `#GP`; a read of the kernel half takes `#PF` with the USER bit;
+SMEP refuses the kernel a fetch from the *same page* ring 3 just
+executed 101 times; SMAP refuses an unguarded read; and six forged
+capability pointers come back as six distinct errors with the kernel
+still running.
 
 The design is seL4's, with three departures named in the ADRs: one
 PageTable type instead of four ([017](docs/adr/017-nesne-kumesi.md)),
@@ -86,6 +99,12 @@ cloned into `third_party/` automatically.
 | `make run-vskernel` | Mapping into the kernel half is *refused*; **must** exit 33 |
 | `make run-vsisolation` | Reaching into another VSpace → #PF; **must** exit 35 |
 | `make run-vsstale` | Revoking a VSpace in use is refused; **must** exit 35 |
+| `make run-usertest` | Ring 3 suite; **must** exit 33 |
+| `make run-userpriv` | `cli` at CPL 3 → #GP; **must** exit 35 |
+| `make run-userkread` | Ring 3 reads the kernel half → #PF; **must** exit 35 |
+| `make run-usersmep` | The kernel fetches from a user page → #PF; **must** exit 35 |
+| `make run-usersmap` | The kernel reads a user page unguarded → #PF; **must** exit 35 |
+| `make run-userforge` | Six forged CPtrs, six errors, kernel alive; **must** exit 33 |
 | `make test` | `fmt`, `clippy`, all twenty-seven scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
@@ -94,7 +113,7 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M7 acceptance criteria
+## M8 acceptance criteria
 
 Twenty-seven scenarios, all booting the **same** `kernel.elf` through
 different Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
@@ -915,6 +934,170 @@ it without telling anyone means the component is now looking at the
 kernel's memory. A protection mechanism that retreats quietly is worse
 than one that was never there — at least nobody trusts the second.
 
+### Ring 3 — `make run-usertest`, exit 33
+
+```
+[cpu] gdt: user cs=0x003b, user ss=0x0033 (ring 3, ADR 029)
+[cpu] syscall: enabled (efer.sce set), lstar 0xffffffff8001e3c0, star 0x002b00080000000
+[cpu] syscall: fmask clears IF|DF|TF|AC -- AC because `stac` is unprivileged
+[user] fmask: read back as 0x0000000000040700 from the MSR -- IF, DF, TF and AC all cleared on entry
+[user] fpu: osfxsr and osxmmexcpt set, cr0.ts clear, saved mxcsr 0x1f80
+[user] address space: code at 0x0000000000400000 -> 0x0000000000022000 r-x, stack rw-, data rw-
+[user] w^x: no page is both writable and executable
+[user] capability path: ReadRegisters from ring 3 returned 1
+[user] ring 3: cs = 0x003b (cpl 3), data page reads 0xa5a5a5a511111111, 3940 syscalls completed
+[user] kernel stacks: thread A enters at 0xffffc80000036f80, thread B at 0xffffc8000003bf80
+[user] isolation: at 0x0000000000600000, thread A reads 0xa5a5a5a5... and thread B reads 0x5a5a5a5a...
+[user] xmm: thread A holds 0xdeadbeef00001111, thread B 0xfeedface00002222;
+       204 fxsave over 204 switches -- equal, so nothing is lazy
+[user] preemption: 488 ticks while the kernel span without yielding
+[syscall] 9810054 calls (0 returned an error), 9810054 via sysret, 0 forced onto iretq
+```
+
+**CS is `0x003b`, and its low two bits are 3.** That is the milestone.
+The selector is GDT index 7 with RPL 3, and the index is not a choice:
+`sysret` computes CS from `STAR[63:48] + 16` and SS from `+ 8`, so the
+user descriptors must sit in a particular order — 32-bit code, data,
+64-bit code. A `const` assertion in [`gdt`](kernel/src/gdt.rs:1)
+reproduces that arithmetic, because getting it wrong loads a wrong
+descriptor *silently* and the failure surfaces at the first user
+instruction.
+
+**The capability path is exercised, not assumed.** User code invokes
+`ReadRegisters` on its own TCB through a CPtr the kernel resolves and
+validates. Everything else the program does goes through `Echo`, which
+resolves no capability at all — so without this line, "ring 3 reaches
+the capability system" would rest on nothing. The first run of this
+scenario reported `last capability invocation: <none yet>`, which is
+exactly that gap showing.
+
+**Two user threads enter the kernel on different stacks, each inside
+its own.** A counter would not do: "RSP0 is being updated" is satisfied
+by an implementation that writes it once, because the first value is
+already correct. So the two addresses are required to differ *and* each
+is checked against its own thread's stack bounds.
+
+**`fxsave` count equals the switch count**, which is what makes "no
+lazy switching" testable. Preservation alone proves nothing — a correct
+lazy switcher also preserves every register. See
+[ADR 031](docs/adr/031-fpu-sse-durumu.md), including what a mutation
+test showed this check *cannot* catch.
+
+**The measurement.** 2.1 million syscalls in 2×10⁹ cycles, 934 cycles
+per round trip including the user-side loop. Measured under emulation:
+QEMU's TCG interpreter does not model the pipeline flush a privilege
+transition costs on silicon, and that flush is most of what a syscall
+pays for. The number is a floor.
+
+The `iretq` fallback count is **zero**, and that is honest rather than
+good: ADR 029's canonical-RCX check is never exercised here. Filed in
+[`hardware-todo.md`](docs/hardware-todo.md) item 6.
+
+
+### Privileged instruction from ring 3 — `make run-userpriv`, exit 35
+
+```
+[user] running `cli` at cpl 3; expected #GP, error code 0
+
+*** EXCEPTION: #GP general protection (vector 13) ***
+[trap] error_code=0x0000000000000000  rip=0x0000000000400020  cs=0x003b
+[trap] rflags=0x0000000000000202  rsp=0x0000000000500ff0  ss=0x0033
+```
+
+User code runs `cli`, then `hlt`, `rdmsr` and `lgdt`. Each is
+privileged, so the **first** one faults — and `cli` is first
+deliberately, because it is the one that looks harmless.
+
+`cs=0x003b` and `rsp` in the user stack: the fault came from ring 3,
+not from somewhere else that happened to produce a `#GP`. Error code 0
+rather than a selector index, because this is a privilege violation and
+not a bad descriptor.
+
+
+### User reads the kernel half — `make run-userkread`, exit 35
+
+```
+[trap] error_code=0x0000000000000005  rip=0x000000000040002a  cs=0x003b
+[trap] cr2=0xffffc00000001000  (user read protection-violation)
+```
+
+Error code `0x5` is present (bit 0) plus **user** (bit 2). That second
+bit is the point: it distinguishes "ring 3 reached for the kernel" from
+"a kernel pointer went wrong", and the two mean entirely different
+things. The runner forbids the `supervisor read` form, which would mean
+the access happened in the kernel after all.
+
+
+### SMEP — `make run-usersmep`, exit 35
+
+```
+[user] ring 3 executed the page 101 times; the same page is now fetched from cpl 0
+[trap] error_code=0x0000000000000011  rip=0x0000000000400000  cs=0x0008
+[trap] cr2=0x0000000000400000  (supervisor instruction fetch protection-violation)
+```
+
+**SMEP has been in CR4 since M3 with nothing to protect.** This is its
+first real test, and it closes the QEMU half of
+[`hardware-todo.md`](docs/hardware-todo.md) item 4.
+
+Error code `0x11`: instruction fetch (bit 4) on a present page (bit 0),
+from supervisor mode. Nothing but SMEP produces that combination.
+
+**The same page** is used for both halves, and that is load-bearing. A
+different page would leave the fault explainable by a mapping
+difference rather than by the privilege level of the code fetching it —
+the test would then be measuring its own setup.
+
+This scenario also caught the milestone's first real bug, before it was
+written as a test. `configure_user` replaced R12 with the user entry
+point but left RIP pointing at M6's kernel trampoline, which ran
+`sti; jmp r12` — so the kernel jumped into a USER page at CPL 0. SMEP
+refused the fetch and the `#PF` named the right address with the wrong
+CS. Had SMEP been off, the user program would have run happily at ring
+0 and every check except the one that reads CS would have passed.
+
+
+### SMAP — `make run-usersmap`, exit 35
+
+```
+[user] smap: with a UserAccess guard, the kernel read 0xa5a5a5a511111111 -- succeeded
+[user] smap: now reading 0x0000000000600000 with no guard
+[trap] cr2=0x0000000000600000  (supervisor read protection-violation)
+```
+
+Both halves in one scenario, because either alone proves half the
+claim: that the guard is *necessary* and that it is *sufficient*.
+
+The guarded read runs **first**. The unguarded one ends the VM, so the
+other order would make half the claim untestable — an ordering
+constraint that is easy to get backwards and impossible to notice
+afterwards.
+
+
+### Forged capability pointers — `make run-userforge`, exit 33
+
+```
+[user] cap-forge: all 6 hostile invocations refused, each with its own
+       error -- InvalidCPtr, CPtrOutOfRange, StaleCPtr, EmptySlot,
+       WrongType, InvalidArgument
+[user] the kernel is still running; exiting normally
+[syscall] 13 calls (6 returned an error), 13 via sysret
+```
+
+The first genuinely hostile input this kernel has taken. Ring 3 invokes
+with reserved bits set, an index past the end of the root CNode, a
+stale generation, an empty slot, a real object of the wrong type, and
+an unknown method number.
+
+**Each must fail for its own reason.** Six `InvalidArgument`s would
+satisfy a count and prove nothing — which is precisely the mistake
+M7's two half-checks made, found by mutation and recorded in
+[ADR 027](docs/adr/027-vspace-modeli.md). The test asserts the specific
+error code for each case.
+
+Exit 33, not 35: a refused invocation is a *caller* error. A kernel
+that panics on a bad CPtr is a kernel any user component can halt.
+
 
 ### Deliberate panic — `make run-panic`, exit 35
 
@@ -1138,6 +1321,10 @@ M7:
 
 - [027 — VSpace: user adres uzayı bir capability](docs/adr/027-vspace-modeli.md)
 - [028 — Revoke edilmiş bir VSpace'e bağlı thread](docs/adr/028-vspace-yasam-dongusu.md)
+- [029 — Ring 3'e giriş ve çıkış: `iretq` ile gir, `sysret` ile dön](docs/adr/029-ring-3-giris-ve-cikis.md)
+- [030 — Syscall ABI: tek giriş, hiç yeni çağrı](docs/adr/030-syscall-abi.md)
+- [031 — FPU/SSE durumu: her switch'te kaydet, lazy yapma](docs/adr/031-fpu-sse-durumu.md)
+- [032 — User tarafında W^X: `EXEC` bir hak değil, bir izin](docs/adr/032-user-tarafinda-wx.md)
 
 027 iki kez düzeltildi, ikisi de koşarak bulundu: "kökü revoke et"
 hiçbir şey silmiyordu, ve "iki kontrol de test ediliyor" iddiası
@@ -1147,6 +1334,110 @@ mutasyonla yanlışlandı.
 kapatıldı** — ara tabloların serbest bırakılması sorusu çözülmedi,
 sahipliği devredildi. **[014](docs/adr/014-cpu-ozellik-bitleri.md)
 düzeltildi**: SMAP borcunu M8'e yazmıştı, M7'de geldi.
+
+## What M8 cost: a bug SMEP found, and a guard proved by its own output
+
+### SMEP caught a kernel bug before it caught a hostile one
+
+The first run of `user-test` ended in a `#PF` at the user entry point
+with `cs=0x0008` and error code `0x11` — instruction fetch, protection
+violation, from **ring 0**.
+
+`configure_user` builds on `configure`, which writes M6's kernel
+trampoline into RIP and the entry point into R12. The user version
+replaced R12 and *forgot RIP*, so the kernel trampoline ran — `sti`,
+then `jmp r12` — and the kernel jumped into a page marked USER while
+still at CPL 0.
+
+SMEP refused the fetch. The diagnosis was as direct as that mistake
+can produce: the right address, the wrong CS.
+
+What makes this worth recording is the counterfactual. With SMEP off,
+the user program would have run perfectly well at ring 0. The data
+page would have read correctly, the syscalls would have worked, the
+XMM registers would have been preserved — every check in the scenario
+would have passed **except** the one that reads CS. A protection
+mechanism that exists to stop an attacker found a bug in the code that
+set it up, two minutes after it first had anything to protect.
+
+### A guard whose only evidence was its own banner
+
+ADR 030 argues that `IA32_FMASK` must clear AC, because `stac` is
+unprivileged: user code can open an SMAP window and hand it to the
+kernel, where `UserAccess::new` reads "already set" and does nothing —
+leaving SMAP off for the whole syscall with no fault and no log.
+
+Mutation testing removed AC from the mask. The test failed, and at
+first that looked like success.
+
+It was not. The only thing that broke was this line:
+
+```
+[cpu] syscall: fmask clears IF|DF|TF|AC
+```
+
+The test's sole evidence was a sentence the kernel printed about
+itself. A commit that removed the bit would naturally also fix that
+message — it would be *wrong* otherwise — and the mutation would have
+passed unnoticed.
+
+This is the same shape as M5's `SlotNotEmpty` and M7's K1, with a new
+variant: there the two guards reported the same error, here the
+guard's evidence was under the guard author's control.
+
+The fix reads the MSR back. On the second attempt the mutation died on
+behaviour:
+
+```
+[PANIC] IA32_FMASK does not clear AC on syscall entry: ... The MSR
+        holds 0x0000000000000700.
+```
+
+ADR 023's K5 gains a clause: **a check's evidence cannot be something
+the change that removes the check could also change.**
+
+### What a counter cannot measure
+
+ADR 031 claims eager FPU switching, and the test asserts that the
+`fxsave` count equals the switch count — on the reasoning that a lazy
+implementation would save fewer times.
+
+A mutation made `save_fpu` skip every second call. Two results, and
+both were instructive.
+
+The **value** check caught it, cleanly: thread A read thread B's
+pattern out of XMM0.
+
+The **counter** check did not. The mutation incremented the counter
+while skipping the save, so the equality held. A counter cannot
+measure the correctness of the code that updates it; it can only
+measure disagreement between the two.
+
+That does not make the counter useless — an accidental skip takes the
+increment with it, and a real lazy implementation would keep an honest
+count. But it narrows what the check proves, and the ADR now says so.
+
+A third observation: the value check caught the mutation on some runs
+and not others, depending on which thread was preempted when. One
+mutation run is not evidence that a guard is tested.
+
+### Measured
+
+| | cycles |
+|---|---|
+| syscall round trip (incl. user-side loop) | 934 |
+| context switch, same address space (M7) | 2166 |
+| context switch, across address spaces (M7) | 48173 |
+
+Under emulation. QEMU's TCG interpreter does not model the pipeline
+flush a privilege transition costs, and that flush is most of what a
+real syscall pays for — so 934 is a floor, not an estimate.
+
+The `sysret`-versus-`iretq` comparison ADR 029 promised is **not**
+here: the canonical-RCX fallback was never triggered, so there is
+nothing to compare. Recorded as an unpaid debt in
+[`hardware-todo.md`](docs/hardware-todo.md) item 6 rather than left as
+a claim.
 
 ## What M7 cost: a borrowed assumption and a check that checked nothing
 
@@ -1632,10 +1923,31 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: **ring 3**
-(threads have their own address spaces but still run at CPL 0), device
-interrupts beyond the timer (the legacy PICs are masked and the IOAPIC
-is untouched), other CPUs, user space, and IPC.
+Deliberately absent, each belonging to a later milestone: **IPC** (one
+syscall exists and dispatches capability invocations, but nothing can
+send a message), device interrupts beyond the timer (the legacy PICs
+are masked and the IOAPIC is untouched), other CPUs, a loader (M8's
+user programs are assembled by hand, byte by byte, because anything
+longer would need one), and a user-space scheduler.
+
+Three things arrived in M8 as debts rather than features, and each is
+written down where it will be found:
+
+* **The syscall path assumes one CPU.** `KERNEL_RSP` and
+  `SAVED_USER_RSP` are single statics reached RIP-relative. Correct
+  today, wrong the moment a second CPU exists — the fix is `swapgs`
+  and per-CPU data, done properly rather than this made cleverer.
+  [ADR 030](docs/adr/030-syscall-abi.md) and
+  [`hardware-todo.md`](docs/hardware-todo.md) item 7.
+* **AVX is avoided rather than handled.** `fxsave` covers x87, MMX and
+  XMM0-15; CR4.OSXSAVE stays clear so the state the kernel cannot save
+  is state user code cannot reach. Untested, and silent if wrong.
+  [ADR 031](docs/adr/031-fpu-sse-durumu.md), item 8.
+* **W^X is simultaneous, not permanent.** No page is writable and
+  executable *at once*; write → unmap → remap executable is possible
+  and not prevented. [ADR 032](docs/adr/032-user-tarafinda-wx.md) says
+  so explicitly rather than letting the term imply more than it
+  delivers.
 
 Everything *present* but incomplete is in **Known gaps** above, with the
 milestone that owes it. Everything that cannot be verified under QEMU is
