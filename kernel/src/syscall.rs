@@ -236,6 +236,16 @@ fn encode_error(error: CapError) -> u64 {
         CapError::NotMapped { .. } => 19,
         CapError::VSpaceInUse { .. } => 20,
         CapError::InvalidArgument => 21,
+        // M9. Appended rather than inserted: these numbers are a
+        // user-visible ABI, and renumbering an existing one would
+        // silently change what a component thinks went wrong.
+        CapError::MessageTooLong { .. } => 22,
+        CapError::TooManyCaps { .. } => 23,
+        CapError::EndpointDead => 24,
+        CapError::NoReplyTarget => 25,
+        CapError::ReplyTargetGone => 26,
+        CapError::NotificationBusy => 27,
+        CapError::AlreadyBound => 28,
     };
     ERROR_FLAG | code
 }

@@ -7,5 +7,21 @@
 # Vendored bootloader; fetched automatically by `make`
 /third_party/
 
+# Python bytecode from scripts/.
+#
+# This was a line of its own until it got appended to the end of the
+# comment below, where git read it as prose rather than as a pattern.
+# A rule that silently stops being a rule is worth a note: nothing
+# fails, the ignored files simply start appearing.
+__pycache__/
+
+# Serial logs and scratch output from debugging runs. Written to the
+# working directory rather than build/ because a truncated terminal
+# cannot be searched, so the evidence goes to a file first.
+*.log
+
+# The question-7 probe builds its own crate.
+/scripts/m9-index-probe/target/
+
 # Cargo.lock is committed: the kernel is a binary, and a reproducible build
-# needs pinned dependency versions.__pycache__/
+# needs pinned dependency versions.

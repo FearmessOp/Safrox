@@ -200,6 +200,105 @@ koyuyor:
 > ortaya koyun. İlk öğe, artımlı bir gerçeklemenin de geçeceği tek
 > konumdur.
 
+### K6 — Test fixture'ları kaynak indeksi tahmin etmez, ihtiyacını söyler
+
+M6'da yazılan ve M9a'da ısıran bir desen:
+
+```rust
+// kök CSpace'teki 5. Untyped -- neden 5? cunku denendi ve calisti
+let untyped = boot::root_untyped(5);
+```
+
+M9a'nın IPC testi üçüncü bir işçi thread'i ekleyince bu satır
+tükenmiş bir Untyped seçti. İlk düzeltme denemem indeksi
+değiştirmekti — aynı şekilde başarısız oldu, çünkü hata indeksin
+*değerinde* değil, **indekslemenin kendisinde**.
+
+Bir indeks, test ile boot sırasının ürettiği düzen arasında yazılı
+olmayan bir anlaşma kuruyor. Boot sırası değişince anlaşma sessizce
+bozuluyor, ve belirti alakasız bir yerde çıkıyor ("retype
+NotEnoughMemory").
+
+Kural: **test, hangi kaynağı istediğini değil, kaynaktan ne
+beklediğini söylemeli.**
+
+```rust
+// ne kadar yer gerektigini soyluyor; hangisi oldugunu aramak
+// fixture'in isi
+let untyped = boot::root_untyped_with_room(16 * 4096);
+```
+
+Bulunamazsa panik mesajı üç şeyi birden taşımalı: **ne istendiği,
+kaç aday bakıldığı, en büyük adayda ne kaldığı.** Üçü birlikte "yer
+yok" ile "yanlış yere bakıldı" durumlarını ayırt ettiriyor — tek
+başına "NotEnoughMemory" ayırt ettirmiyor.
+
+M6'nın `threadtest`'i de bu kurala çevrildi. O zaten çalışıyordu,
+ama **şans eseri**: seçtiği 0–4 indeksleri tesadüfen büyük
+Untyped'lara denk geliyordu.
+
+### K7 — Makefile `apply_diff` ile düzenlenmez
+
+Bu projede dokuz kez aynı şey oldu: [`Makefile`](../../Makefile)
+üzerinde `apply_diff` kullanıldı, araç tab karakterlerini boşluğa
+çevirdi ve satır sonlarına CRLF ekledi. Make'in cevabı her seferinde
+aynı: `missing separator`.
+
+Hata kodla ilgisiz ve teşhisi ucuz ama tekrarı pahalı. Kural:
+
+- Makefile değişiklikleri [`write_to_file`](../../Makefile) ile,
+  dosyanın tamamı yazılarak yapılır.
+- Yazıldıktan sonra `make -n <hedef>` ile doğrulanır — hedefin
+  çözüldüğünü görmek, dosyanın hâlâ ayrıştırılabildiğinin kanıtı.
+
+Aynı tehlike tab'a anlam yükleyen her dosya için geçerli.
+
+### K8 — Bir test, ölçtüğü mekanizmanın zamanlamasına bağlı olmamalı
+
+M9a'nın tam suite koşusunda M6'nın `threadtest`'i düştü:
+
+```
+[PANIC] the spinning thread never ran; there is nothing to preempt
+```
+
+Ardından **on dört koşu üst üste geçti**, iterasyon sayıları 31770 ile
+316079 arasında. Yani hata gerçekti ama kararsızdı — ve kararsız bir
+test, başkasının makinesinde başarısız olacak bir testtir.
+
+Mekanizma: `switch_to` kesmeler kapalıyken çalışıyor, ve yeni
+thread'in ilk komutu trampoline'in `sti`'si. O an bekleyen bir timer
+kesmesi varsa — tüm switch boyunca maskelenmiş olan — `sti` ile `jmp`
+arasında ateşleniyor ve thread kendi ilk komutunu çalıştıramadan geri
+alınıyor. Ana thread `SPIN_ITERATIONS`'ı sıfır okuyup "hiç koşmadı"
+diyor.
+
+**Oysa koştu.** İlk `fetch_add`'inden önce preempt edildi — testin
+göstermek için var olduğu şeyin ta kendisi. Yani tek atışlık sürüm,
+mekanizmanın çalışmasını bir arıza olarak raporlayabiliyordu.
+
+Kural:
+
+> Bir testin iddiası, ölçtüğü olayın **gerçekleşip gerçekleşmediği**
+> üzerine kurulmalı; o olayın hangi anda gerçekleştiği üzerine değil.
+
+Düzeltme bir döngü, ama gevşetme değil: spinner hiç yield etmediği
+için her dönüş hâlâ "CPU ondan alındı" kanıtı. Kalkan tek varsayım,
+*ilk* dönüşün spinner ilerledikten sonra olduğuydu. Döngü bir TSC
+süresiyle sınırlı, yani gerçekten hiç koşmayan bir thread asılmak
+yerine teşhisle düşüyor.
+
+İki yan ders:
+
+- **Teşhis önce, düzeltme sonra.** İlk müdahale yalnızca panik
+  mesajını zenginleştirmekti (kaç switch oldu, TCB'nin kendi sayacı
+  ne, kuyrukta kaç thread var). Mesaj değişince test geçti — bu da
+  arızanın kararsız olduğunu, dolayısıyla bir yarış olduğunu
+  söyledi. Mesaj kalıcı: bir dahaki sefere sebep ilk koşuda görünür.
+- **Tek yeşil koşu kanıt değil.** Kararsız bir arızadan sonra
+  "düzelttim" demek için tek bir geçiş yetmez; burada on dört koşu
+  bakıldı ve düşük iterasyon sayıları (31770) yarışın hâlâ gerçek
+  olduğunu, sadece artık yakalandığını gösterdi.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -227,7 +326,15 @@ başarısız oldu.
 - **K4:** Negatif testler beklenen olay gerçekleşmediğinde bunu
   söylemeli.
 - **K5:** Her milestone'da en az bir test, test ettiği şeyi bozarak
-  doğrulanmalı ve bu rapora yazılmalı.
+  doğrulanmalı ve bu rapora yazılmalı. Genişletilmiş hali: her `Err`
+  yolu en az bir kez tetiklenmeli.
+- **K6:** Fixture'lar kaynak indeksi tahmin etmez; ihtiyacı
+  bildirilir, arama fixture'ın işidir. Bulunamazsa panik mesajı
+  istenen/bakılan/en iyi adayı birlikte yazar.
+- **K7:** Makefile `apply_diff` ile düzenlenmez; tam yazılır ve
+  `make -n` ile doğrulanır.
+- **K8:** Bir test, ölçtüğü olayın gerçekleşmesine dayanmalı, o olayın
+  zamanlamasına değil. Kararsız bir arıza tek yeşil koşuyla kapanmaz.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten

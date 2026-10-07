@@ -549,7 +549,7 @@ pub unsafe fn leaf_cnode(root_index: usize) -> CNode {
         root_index
     );
     // SAFETY: The capability says how many slots the object has.
-    unsafe { CNode::new(slot.object().0, slot.extra() as u8) }
+    unsafe { CNode::new(slot.object().0, slot.as_radix()) }
 }
 
 /// Borrow a root Untyped's slot by index.
@@ -568,6 +568,87 @@ pub unsafe fn root_untyped(index: usize) -> &'static mut Slot {
     );
     // SAFETY: Index checked.
     unsafe { cnode.slot(index) }
+}
+/// The first root Untyped with at least `bytes` left in it.
+///
+/// # Why this exists
+///
+/// Test fixtures used to name a root Untyped by index — `root_untyped(0)`,
+/// `root_untyped(1)` — and that worked for as long as the indices chosen
+/// happened to be large ones. M6's thread tests pick 0 and 1, which are
+/// 4 MiB here; M9's IPC tests needed a third thread, picked index 1
+/// again, and ran it dry partway through a stack:
+///
+/// ```text
+/// [PANIC] could not retype the stack frames:
+///         NotEnoughMemory { remaining: 10240, needed: 18432 }
+/// ```
+///
+/// The first fix was to pick different indices, and it failed the same
+/// way with different numbers — because the mistake was not *which*
+/// index but that there was an index at all. A fixture that names a
+/// resource by position is asserting something about the memory map it
+/// has no business knowing, and it keeps working by luck until the day
+/// somebody adds one more object.
+///
+/// So fixtures say what they need and this finds it. ADR 023 records
+/// the rule.
+///
+/// # The panic
+///
+/// Deliberately verbose, because "there is no room" and "I looked in
+/// the wrong place" are different failures and the difference is not
+/// visible from a bare `NotEnoughMemory`. The message carries the
+/// request, how many Untypeds were examined, and the largest amount
+/// any of them had left — so a reader can tell exhaustion from a
+/// lookup that never saw the big ones.
+///
+/// # Safety
+///
+/// As [`leaf_cnode`]: `init_from_regions` must have run.
+pub unsafe fn root_untyped_with_room(bytes: u64) -> &'static mut Slot {
+    let count = root_untyped_count();
+    let mut largest_remaining = 0u64;
+    let mut found: Option<usize> = None;
+
+    for index in 0..count {
+        // SAFETY: Index below the count, and the caller guarantees the
+        // CSpace is built.
+        let slot = unsafe { root_untyped(index) };
+        // SAFETY: A root slot holds a live Untyped capability.
+        let Ok(untyped) = (unsafe { super::untyped::Untyped::from_slot(slot) }) else {
+            continue;
+        };
+
+        let remaining = untyped.remaining();
+        if remaining > largest_remaining {
+            largest_remaining = remaining;
+        }
+        if remaining >= bytes && found.is_none() {
+            found = Some(index);
+            // Not breaking: the loop also computes `largest_remaining`
+            // for the panic below, and a scan of ~100 slots at fixture
+            // time costs nothing. Returning early would make the
+            // diagnostic worse in exchange for microseconds nobody is
+            // waiting on.
+        }
+    }
+
+    match found {
+        // SAFETY: Index came from the loop above, so it is in range.
+        Some(index) => unsafe { root_untyped(index) },
+        None => panic!(
+            "no root Untyped has {} bytes free: {} were examined and the \
+             most any of them had left was {}. Either the request is \
+             larger than a root Untyped can be (the largest is 2^{} = \
+             {} bytes) or earlier fixtures have used the memory up",
+            bytes,
+            count,
+            largest_remaining,
+            MAX_ROOT_UNTYPED_BITS,
+            1u64 << MAX_ROOT_UNTYPED_BITS
+        ),
+    }
 }
 
 const _: () = {

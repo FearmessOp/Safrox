@@ -61,6 +61,7 @@ mod heaptest;
 mod idt;
 mod interrupts;
 mod io;
+mod ipctest;
 mod memory;
 mod memtest;
 mod panic;
@@ -801,7 +802,25 @@ extern "C" fn kmain() -> ! {
         usertest::run();
     }
 
-    println!("[boot] M8 checks passed");
+    // M9a IPC scenarios. Longest token first, as above: `contains`
+    // does not care about word boundaries and every token here
+    // begins "ipc-".
+    if cmdline.contains("ipc-endpoint-revoked") {
+        println!("[boot] cmdline requested the revoked-endpoint test");
+        ipctest::run_endpoint_revoked();
+    }
+
+    if cmdline.contains("ipc-cancel-cost") {
+        println!("[boot] cmdline requested the cancellation cost measurement");
+        ipctest::run_cancel_cost();
+    }
+
+    if cmdline.contains("ipc-test") {
+        println!("[boot] cmdline requested the IPC tests");
+        ipctest::run();
+    }
+
+    println!("[boot] M9a checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

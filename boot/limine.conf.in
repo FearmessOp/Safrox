@@ -30,6 +30,9 @@
 #  31 -> SMEP               build/pythos-usersmep.iso   exit 35
 #  32 -> SMAP               build/pythos-usersmap.iso   exit 35
 #  33 -> forged capability  build/pythos-userforge.iso  exit 33 (refused, not fatal)
+#  34 -> IPC rendezvous     build/pythos-ipctest.iso    exit 33
+#  35 -> cancellation cost  build/pythos-ipccancel.iso  exit 33 (measurement)
+#  36 -> revoked endpoint   build/pythos-ipcrevoked.iso exit 33 (woken, not fatal)
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -322,3 +325,50 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: user-cap-forge
+
+/PythOS (IPC rendezvous)
+    comment: M9a. Two threads meet on an endpoint, in both orders: a
+    comment: sender that arrives first blocks until somebody receives,
+    comment: and a receiver that arrives first blocks until somebody
+    comment: sends. The message survives the sender being descheduled,
+    comment: which is what ADR 033 means by "the message lives in the
+    comment: sender's TCB" -- an endpoint holds no storage at all.
+    comment: Also: 0, 3 and 128-word messages, every tag field the
+    comment: sender controls refused by its own check, and three
+    comment: queued senders delivered in the order they arrived.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-test
+
+/PythOS (cancellation cost)
+    comment: M9a's real result. Removing one waiter from a queue of 50
+    comment: and then from a queue of 500, timed both times. One figure
+    comment: would say nothing; two figures ten times apart, agreeing,
+    comment: are what shows the cost does not depend on the length.
+    comment: ADR 033 originally specified a singly linked queue -- as
+    comment: M6's ready queue is -- and was corrected before any code
+    comment: was written, because an endpoint's queue length is an
+    comment: *adversary's* thread count and the walk happens with
+    comment: interrupts disabled. This is that correction, measured.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-cancel-cost
+
+/PythOS (revoked endpoint)
+    comment: Three threads wait on an endpoint; its capability is
+    comment: deleted. All three must wake with EndpointDead, and the
+    comment: kernel must still be running -- so this exits 33, not 35.
+    comment: Woken rather than the delete being refused, and the
+    comment: reasoning is ADR 039's rather than ADR 026's: there,
+    comment: refusing was safe because the thread's own owner could
+    comment: suspend it first. Here the waiters may belong to other
+    comment: components, so refusing would let any of them make an
+    comment: endpoint un-revokable.
+    comment: This is also what proves cancel_ipc is wired into
+    comment: cnode::delete at all -- without the call, the scenario
+    comment: hangs. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-endpoint-revoked

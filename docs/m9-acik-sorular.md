@@ -1,5 +1,25 @@
 # M9 architect pass — karara bağlanamayanlar
 
+> **Durum: yedisi de cevaplandı** (M9 uygulama öncesi). Her sorunun
+> altında **Karar** başlığı var; belge, kararların *nasıl*
+> alındığının kaydı olarak duruyor. Kararların kendileri ilgili
+> ADR'lere işlendi.
+>
+> | # | Konu | Verilen karar | ADR |
+> |---|---|---|---|
+> | 1 | Üç word mü dört mü | **(b)** her iki yönde üç | 034 düzeltildi |
+> | 2 | `Reply` cap asimetrisi | **(a)**, gerekçe değişti | 035 düzeltildi |
+> | 3 | Notification önceliği | **(c)** dönüşümlü, şimdi | 038 düzeltildi |
+> | 4 | Badge 32 bit | **(a)** + ham `extra()` yasak | 037 düzeltildi |
+> | 5 | `NBSend` yokluğu | **(a)+(c)** Notification ile | 033 düzeltildi |
+> | 6 | `cancel_ipc` maliyeti | **(b)** çift yönlü, şimdi | 033 düzeltildi |
+> | 7 | Tamponun ilk word'leri | ölçüldü → **(a)** | 034'e yazıldı |
+>
+> **Eğilimimin değiştiği iki yer, ikisi de gerekçe düzeyinde:**
+> soru 2'de savunmanın *türü* (politika değil yapı), soru 3'te
+> "ölçmeden ekleme" kuralının *sınırı* (garanti ölçülmez). Üçü
+> (1, 6, 7) eğilimimi doğruladı, ikisi (4, 5) kabul edildi.
+
 Aşağıdaki yedi nokta ya sizin kararınızı gerektiriyor ya da tek
 başıma verdiğim kararın gözden geçirilmesini istiyorum. Her biri
 için seçenekler ve benim eğilimim yazılı; **M9 uygulamasına
@@ -55,6 +75,21 @@ maliyeti ölçülebilir — `label` maskeleme bir `and` komutu.
 **Sorum:** (b) ile sadeleştireyim mi, yoksa dördüncü word o kadar
 değerli mi?
 
+### Karar: **(b)** — her iki yönde üç word
+
+Asimetri kabul edilmedi. Gerekçe, eğilimimle aynı: "kaç word
+register'da" sorusunun tek bir cevabı olmalı.
+
+Sonradan fark ettiğim bir ayrıntı bu kararı güçlendiriyor:
+asimetrik bir ABI'de `mr[3]`'ü okuyan bir kod `Reply` yolunda
+çalışır, `Send` yolunda sessizce çöp okur. ADR 023'ün K5'i bunu
+yakalayamaz — iki yol da "çalışıyor" görünür. Hata, yalnızca
+değerin anlamlı olması gereken bir yerde ortaya çıkar, ve o yer
+testten uzakta olabilir.
+
+ADR 034 düzeltildi: başlık, kısıt bölümü, dönüş düzeni, elenen
+alternatifler ve sonuç.
+
 ---
 
 ## Soru 2 — `Reply`'nin cap taşımasındaki asimetri
@@ -98,6 +133,32 @@ hak bitinin anlamını ikiye böler. Ama emin değilim.
 **Sorum:** Bir sunucunun istemciye istenmeyen cap göndermesi bir
 sorun mu, yoksa `SetReceiveSlots` yeterli savunma mı?
 
+### Karar: **(a)**, ama **gerekçe değişti**
+
+Sonuç aynı, akıl yürütme farklı — ve fark önemli.
+
+Benim gerekçem "`SetReceiveSlots` yeterli savunma" idi. Bu zayıf:
+bir savunma *aşılabilir*, ve "yeterli" demek onu ölçmek gerektirir.
+
+Doğru gerekçe: **yetkiyi almak bir eylem.** Cap, alıcının önceden
+açtığı bir slot'a düşer. Slot açılmamışsa cap gelmez — sunucunun
+elinde onu zorlayacak bir mekanizma *yok.*
+
+| | Ne söylüyor | Nasıl bozulur |
+|---|---|---|
+| "Varsayılan güvenli" | bir ayar | yanlış kurulabilir, unutulabilir |
+| "Yapısal olarak zorlanamaz" | bir imkânsızlık | bozulamaz |
+
+Kodda da farklı görünüyor: bu bir `if count == 0 { drop }` değil,
+transfer döngüsünün hiç dönmemesi. Hedef yoksa yazılacak yer de
+yok.
+
+Üçüncü bir hak biti (`GRANTREPLY`'ye ikinci anlam) bu yüzden
+gereksiz: koruyacağı şey zaten korunuyor.
+
+ADR 035 düzeltildi: "Receive slot ayarlanmamışsa" bölümü, asimetri
+bölümü, elenen alternatifler ve sonuç.
+
 ---
 
 ## Soru 3 — Bağlı Notification'ın önceliği ve açlık
@@ -136,6 +197,34 @@ kadar beklediği ölçülebilir.
 **Sorum:** (c)'yi şimdi mi ekleyelim, yoksa M12'de ölçüp mü karar
 verelim? Sonradan eklemek ABI'yi değiştirmiyor, yalnızca
 davranışı.
+
+### Karar: **(c) dönüşümlü, şimdi**
+
+Eğilimim doğrulandı, ve ADR'ye (a) yazmamın gerekçesi **kategori
+hatası** olarak teşhis edildi:
+
+> Optimizasyon ölçülür, açlık garantisi ölçülmez — ya vardır ya
+> yoktur.
+
+ADR 040'ın "ölçmeden ekleme" kuralı optimizasyonlar için yazıldı.
+Bir ilerleme garantisine uygulamak, "kilidin gerekli olduğunu
+ölçelim" demeye benziyor: veri yarışı ölçümde görünmeyebilir, ve
+görünmemesi yokluğunu kanıtlamaz.
+
+İkinci bir hata daha vardı: "M12'de kesme hızı sınırlı" bir
+*varsayım*. Sınırı donanım koyuyor — yani bir sürücü hatası ya da
+kasıtlı bir kesme fırtınası onu kaldırabilir. ADR 030'un "kernel
+user'a güvenmiyor" kuralı burada da geçerli.
+
+Maliyet: bir bit, bir dal.
+
+**Ve açlığın imkânsızlığı test ediliyor** (`ipc-test` 9). Garanti
+ölçülmez ama imkânsızlık gösterilebilir: karar geri alınırsa test
+geçmez, *asılır.* Sonsuz bekleme, açlığın tanımı — bu yüzden
+asılarak başarısız olan bir test, sayı basarak başarılı olandan
+daha güçlü bir kanıt.
+
+ADR 038 düzeltildi.
 
 ---
 
@@ -184,6 +273,35 @@ sayısına bağlı ve o sayı henüz yok.
 **Sorum:** 32 bit badge yeterli mi, ve `extra` paylaşımı kabul
 edilebilir mi?
 
+### Karar: **(a)**, ve rahatsızlığımın ikinci yarısına bir çözüm
+
+32 bit kabul. `extra` paylaşımı da kabul — **ama ham `extra()`
+çağrısı kod tabanında yasaklanıyor.**
+
+Rahatsızlığımı doğru teşhis etmemiştim. Sorun üç anlamın varlığı
+değil; tip bilgisi slot'ta duruyor, yani hangi anlamın geçerli
+olduğu her zaman belirli. Sorun, alanın **ayırt edilmeden
+okunabilmesi**: bir `slot.extra()` çağrısının ne döndürdüğü çağrı
+yerine bakılmadan anlaşılmıyor, ve bir CNode slot'undan badge okuyan
+kod derlenir, çalışır, yanlış cevap verir.
+
+Çözüm, alanı bölmek değil **erişimi tiplemek**:
+
+```rust
+slot.as_badge()      // Endpoint | Notification degilse panic
+slot.as_radix()      // CNode degilse panic
+slot.as_size_bits()  // Untyped degilse panic
+```
+
+Ham `extra()` `pub` olmaktan çıkıyor. Böylece yanlış okuma bir
+**derleme hatası** oluyor — mümkün olan en iyi hata türü, ve
+ADR 023'ün "tanımsız durum yok" kuralının bir uygulaması.
+
+Yanlış tipte `panic`, `Err` değil: bu bir kullanıcı hatası değil,
+kernel hatası.
+
+ADR 037 düzeltildi (başlık dahil: "64 bit" → "32 bit").
+
 ---
 
 ## Soru 5 — `NBSend`/`NBRecv` yokluğu M13'ü zorlar mı?
@@ -229,6 +347,26 @@ görülür.
 **Sorum:** M13'ün tasarımında `NBSend` gerektiren bir desen
 öngörüyor musunuz?
 
+### Karar: **(a) + (c)** — `NBSend` yok, sağlık kontrolü Notification ile
+
+Eğilimim onaylandı.
+
+Yazarken fark ettiğim bir şey (c)'yi yalnızca bir kaçınma olmaktan
+çıkarıyor: **`Call` ile sorulan sağlık, yanlış soruyu soruyor.**
+Cevap veren bir bileşen "çalışıyor" değil, "bu syscall'a cevap
+verebiliyor" demektir — asıl iş döngüsü takılmış olabilir ve
+`Recv`'de bekleyen thread yine de cevap verir. Periyodik bir
+sinyal ise iş döngüsünün *içinden* gelir, yani gerçekten canlılık
+ölçer.
+
+Badge'ler bunu doğal kılıyor (ADR 037): her bileşene farklı bir
+bit, tek bir `Poll` hepsini birden okur.
+
+M13'te gerekirse eklemek geriye uyumlu: yeni bir method numarası,
+mevcut hiçbir yolu değiştirmiyor.
+
+ADR 033 düzeltildi.
+
 ---
 
 ## Soru 6 — `cancel_ipc`'in O(kuyruk) maliyeti bir DoS mu?
@@ -271,6 +409,30 @@ bekletip ortadakini suspend etmek, ve süreyi ölçmek.
 
 **Sorum:** (b)'ye geçeyim mi? ADR 033'ü düzeltmem gerekir.
 
+### Karar: **(b) çift yönlü kuyruk, şimdi**
+
+Eğilimim doğrulandı, ve belirleyici olan kendi yazdığım ayrımmış:
+**burada kuyruk uzunluğu düşman kontrolünde**, M6'nın hazır
+kuyruğundan farklı olarak.
+
+"Birkaç bin çevrim küçük" argümanı ayrıca reddedildi, ve gerekçe
+benim yazdığımdan daha keskin:
+
+> O sayı 1024 tavanına dayanıyor, **ve tavanlar değişir.**
+
+Bir güvenlik özelliğini değişebilir bir sabite bağlamak, tavanı
+yükselten bir yamanın sessizce bir DoS açması demek. Maliyetin
+kuyruk uzunluğundan *bağımsız* olması, bu bağı tamamen koparıyor.
+
+TCB'ye bir `u64` (`ipc_prev`). M9 zaten birkaç alan ekliyor.
+
+**O(1) ölçülerek kanıtlanacak** (`ipc-cancel-cost`): 50 ve 500
+thread'le iki ölçüm, ikisi aynı mertebede. Tek bir sayı bunu
+kanıtlamazdı — iki sayının *eşitliği* kanıtlıyor.
+
+ADR 033 düzeltildi: kuyruk bölümü, maliyet tablosu, elenen
+alternatifler ve sonuç.
+
 ---
 
 ## Soru 7 — IPC tamponunun ilk 32 baytı israf
@@ -306,22 +468,75 @@ etmekten iyi.
 **Sorum:** Bunu uygulama sırasında ölçüp karar vermek yeterli mi,
 yoksa şimdi mi sabitleyelim?
 
+### Karar: ölçüldü, ve sonuç **(a)** — eğilimim çürüdü
+
+Yöntem onaylandı: *"`objdump` ile iki varyantı karşılaştır, fark
+yoksa `buffer[i - 3]`."* Ölçüm
+[`scripts/m9-index-probe/`](../scripts/m9-index-probe/) ile yapıldı,
+kernel'in hedefi ve optimizasyon seviyesiyle.
+
+**Fark var, ve beklediğimin tersi yönde.**
+
+| | Komut |
+|---|---|
+| `buffer[i]`, tek erişim | 13 |
+| `buffer[i-3]`, tek erişim | 17 |
+| `buffer[i]`, kopyalama döngüsü | **14** |
+| `buffer[i-3]`, kopyalama döngüsü | **40** |
+
+Tahminim şuydu: *"derleyiciler `buffer[i - 3]` için bir `lea` üretir
+ve adresleme moduna gömülür — yani sıfır ek komut olabilir."*
+Gömülmedi; sınır kontrolü (`i-3 < 128`) indeksin önceden
+düzeltilmesini gerektirdi.
+
+**Ama asıl bulgu kopyalama döngüsünde.** `buffer[i]` varyantı bir
+`memcpy` çağrısına indi; `buffer[i-3]` varyantı kırk komutluk elle
+açılmış bir döngüye. İki döngü anlamca aynı — LLVM'in idiom
+tanıyıcısı indeksteki çıkarma yüzünden deseni görmedi.
+
+Ve kopyalama döngüsü **IPC'nin sıcak yolu.** 26 komut fark, 24 bayt
+için.
+
+> Bu, "derleyici nasılsa görür" varsayımının yanlış çıkması. ADR
+> 040'ın uyardığı tam olarak bu tür bir varsayımdı, ve onu yazarken
+> kendim yapmışım. M5'in revoke tahmininin 120 kat sapmasıyla aynı
+> aile — farkı şu ki bu sefer **kod yazılmadan önce** yakalandı,
+> çünkü ölçüm bir satır komut kadar ucuzdu.
+
+Not: register kapasitesi dörtten üçe indiği için (karar 1) israf 32
+değil **24 bayt**, tampon kapasitesi 125 word. Mesaj kapasitesi
+etkilenmiyor: 3 register + 125 tampon = 128.
+
+ADR 034'ün "Ölçüm: indeks aritmetiğinin bedeli" bölümünde üretilen
+assembly yan yana duruyor. Tekrarlanabilir:
+`sh scripts/m9-index-probe/probe.sh`.
+
 ---
 
 ## Özet tablo
 
-| # | Konu | Eğilimim | Ölçülebilir | Etkilediği |
-|---|---|---|---|---|
-| 1 | Üç word mü dört mü | (b) simetri | hayır | **ABI** |
-| 2 | `Reply` cap asimetrisi | (a) böyle kalsın | hayır | güvenlik modeli |
-| 3 | Notification önceliği | (c) dönüşümlü | evet, M12'de | davranış |
-| 4 | Badge 32 bit | (a) kabul | kısmen | **slot düzeni** |
-| 5 | `NBSend` yokluğu | (a)+(c) | M13'te görülür | ABI (geriye uyumlu) |
-| 6 | `cancel_ipc` O(kuyruk) | (b) çift yönlü | **evet** | **TCB düzeni** |
-| 7 | Tamponun ilk 32 baytı | (b), ölçerek | **evet, kolay** | tampon düzeni |
+| # | Konu | Eğilimim | Verilen karar | Ölçülebilir | Etkilediği |
+|---|---|---|---|---|---|
+| 1 | Üç word mü dört mü | (b) simetri | **(b)** ✓ | hayır | **ABI** |
+| 2 | `Reply` cap asimetrisi | (a) böyle kalsın | **(a)**, gerekçe değişti | hayır | güvenlik modeli |
+| 3 | Notification önceliği | (c) dönüşümlü | **(c)**, şimdi ✓ | evet, M12'de | davranış |
+| 4 | Badge 32 bit | (a) kabul | **(a)** + `extra()` yasak | kısmen | **slot düzeni** |
+| 5 | `NBSend` yokluğu | (a)+(c) | **(a)+(c)** ✓ | M13'te görülür | ABI (geriye uyumlu) |
+| 6 | `cancel_ipc` O(kuyruk) | (b) çift yönlü | **(b)**, şimdi ✓ | **evet** | **TCB düzeni** |
+| 7 | Tamponun ilk word'leri | (b), ölçerek | ölçüldü → **(a)** ✗ | **evet, kolay** | tampon düzeni |
 
-**En acil olanlar 1, 4 ve 6** — üçü de veri yapısı ya da ABI
-değiştiriyor, yani uygulama başlamadan karara bağlanmalı.
+**Bir eğilimim çürüdü, iki gerekçe değişti.** Gerekçeler sonuçlardan
+daha önemli, çünkü bir sonraki kararda kullanılacak olan onlar:
 
-3, 5 ve 7 sonradan değiştirilebilir: 3 davranış, 5 yeni bir method
-numarası, 7 iç detay.
+- **Soru 2:** "varsayılan güvenli" ≠ "yapısal olarak zorlanamaz".
+  Birincisi bir ayar, ikincisi bir imkânsızlık; ayarlar yanlış
+  kurulabilir.
+- **Soru 3:** ADR 040'ın "ölçmeden ekleme" kuralının sınırı.
+  Optimizasyon ölçülür, **garanti ölçülmez** — ya vardır ya yoktur.
+- **Soru 7:** kuralın kendisi bana uygulandı. "Derleyici nasılsa
+  görür" dedim, ölçtüm, görmemiş. Üstelik yanıldığım yer tek
+  erişim değil **kopyalama döngüsü** — yani IPC'nin sıcak yolu.
+
+Soru 7'nin çürütülmesi listenin en öğretici maddesi: *ölçülebilir ve
+kolay* diye işaretlediğim bir soruyu yine de tahminle cevaplamışım.
+Ölçüm bir satır komuttu.

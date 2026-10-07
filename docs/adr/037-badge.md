@@ -1,4 +1,4 @@
-# ADR 037 — Badge: 64 bit, slot'ta, ve bir kez
+# ADR 037 — Badge: 32 bit, slot'ta, ve bir kez
 
 Status: accepted (M9 architect pass). ADR 021'in badge bölümünü
 somutlaştırıyor.
@@ -18,7 +18,7 @@ Badge bu soruyu kernel'in cevaplamasını sağlıyor: cap'e takılı bir
 etiket, mesajla birlikte alıcıya iletiliyor, ve **istemci
 değiştiremiyor**.
 
-## Karar: 64 bit, slot'ta
+## Karar: 32 bit, slot'ta
 
 ADR 021 badge'i 64 bit olarak tanımladı. Burada *nerede durduğu*
 karara bağlanıyor.
@@ -69,6 +69,55 @@ verse, 2^32 istemci sınırı pratikte sınırsız.
 kullanmak — örneğin üst 32 bit "istemci sınıfı", alt 32 bit "istemci
 numarası". 32 bitte böyle bir bölüşüm daha sıkışık olur ama yine
 mümkün (16+16).
+
+## `extra`'nın üç anlamı ve ham erişimin yasaklanması
+
+Karar (a) ile `extra` alanı üçüncü anlamını kazanıyor:
+
+| Nesne tipi | `extra`'nın anlamı | Nereden |
+|---|---|---|
+| CNode | `radix` — kaç bit indeks | ADR 018 |
+| Untyped | `size_bits` | ADR 020 |
+| Endpoint, Notification | **badge** | bu ADR |
+
+> **Karar (M9 uygulama kararı 4).** Üç anlamlı bir alan kabul
+> edildi, **ama ham `extra()` çağrısı kod tabanında yasak.**
+>
+> Ayrım şurada: üç anlam taşıyan bir alan sorun değil — tip bilgisi
+> slot'ta duruyor, yani hangi anlamın geçerli olduğu her zaman
+> belirli. Sorun, o alanın **ayırt edilmeden okunabilmesi.** Bir
+> `slot.extra()` çağrısının ne döndürdüğü, çağrı yerine bakılmadan
+> anlaşılmıyor; ve bir CNode slot'undan badge okuyan bir kod derlenir,
+> çalışır, ve yanlış cevap verir.
+>
+> Yerine **tip kontrollü erişimciler**:
+>
+> ```rust
+> slot.as_badge()      // Endpoint | Notification degilse panic
+> slot.as_radix()      // CNode degilse panic
+> slot.as_size_bits()  // Untyped degilse panic
+> ```
+>
+> Her biri tipi `assert` ediyor, ve yanlış tipte **panic** —
+> `Err` değil. Gerekçe: bu bir kullanıcı hatası değil, bir kernel
+> hatası. Yanlış tipten badge okumak, ADR 023'ün "tanımsız durum
+> yok" kuralının ihlali, ve sessizce bir sayı döndürmek o ihlali
+> gizlerdi.
+>
+> Ham `extra()` `pub` olmaktan çıkıyor; yalnızca üç erişimci ve
+> `retype`/`mint` yazıcıları görüyor. Böylece yanlış okuma bir
+> *derleme hatası* oluyor — en iyi hata türü.
+
+### Neden `Option` değil, panic
+
+`as_badge()` bir `Option<u32>` döndürebilirdi ve çağıran kontrol
+ederdi. Reddedildi: her çağrı yerine bir `unwrap` ya da bir
+`match` eklerdi, ve pratikte hepsi `unwrap` olurdu — yani aynı
+panic, daha gürültülü bir yoldan.
+
+Erişimcinin bir Endpoint slot'una uygulandığı, çağrı yerinde zaten
+biliniyor: `invoke`, tipi çözmüş durumda. Bilinmediği bir yer varsa
+orası bir tasarım hatası, ve panic onu gösteriyor.
 
 ## Badge 0 özel
 
@@ -141,7 +190,7 @@ ADR 034'ün dönüş düzeni: **RSI**.
 Recv doner:
     RDI = message tag
     RSI = badge          <- burada
-    RDX, R10, R8, R9 = mesajin ilk dort word'u
+    R10, R8, R9 = mesajin ilk uc word'u
 ```
 
 RSI, çağrıda method numarasını taşıyordu (ADR 030) ve dönüşte boşta.
@@ -194,6 +243,11 @@ değişince kimlik değişirdi — oysa kimlik bileşene ait olmalı.
 - Badge **32 bit**, capability slot'unun `extra` alanında.
   **ADR 021'in "64 bit" ifadesi düzeltildi**: slot 32 bayt ve
   64 bitlik bir alan daha sığmıyor.
+- `extra` üç anlam taşıyor (radix, `size_bits`, badge) ve bu kabul
+  edildi — **ama ham `extra()` yasak.** Yerine tipi `assert` eden
+  üç erişimci: `as_badge()`, `as_radix()`, `as_size_bits()`.
+  Yanlış tipte **panic**, çünkü bu bir kernel hatası. Üç anlamlı bir
+  alan sorun değil; ayırt edilmeden okunması sorun.
 - Dört milyar kimlik; M13'ün ihtiyacının kat kat üstünde.
   Kapattığımız kapı: badge'i geniş yapılandırılmış bir değer
   olarak kullanmak.

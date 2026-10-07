@@ -72,7 +72,7 @@ impl Untyped {
                 found: slot.cap_type(),
             });
         }
-        let size_bits = slot.extra() as u8;
+        let size_bits = slot.as_size_bits();
         if !(UNTYPED_MIN_BITS..=UNTYPED_MAX_BITS).contains(&size_bits) {
             return Err(CapError::InvalidArgument);
         }

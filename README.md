@@ -3,15 +3,37 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M9 — IPC (architect pass).** No code: the
-semantics of synchronous IPC, the message format and the IPC half of
-the syscall ABI are now fixed, in eight ADRs
-([033](docs/adr/033-rendezvous-semantigi.md)–[040](docs/adr/040-hizli-yol-yok.md)).
-The shape of the thing is in [docs/ipc.md](docs/ipc.md); what could
-not be settled is in
-[docs/m9-acik-sorular.md](docs/m9-acik-sorular.md).
+**Current milestone: M9a — synchronous rendezvous.** Two threads can
+now meet on an Endpoint: `Send`, `Recv`, a doubly linked wait queue,
+and cancellation. No capability transfer, no `Call`/`Reply`, no
+Notification — those are M9b and M9c, written and type-checked but
+behind `#[allow(dead_code)]` rather than claimed.
 
-**Last milestone with code: M8 — Ring 3.** Code runs at CPL 3, in its
+M9 is landing in three parts because one attempt at all eleven
+acceptance criteria produced code that did not compile and was never
+run. Worth stating plainly: the discipline here is that an untested
+claim is not a claim.
+
+The result that carries the milestone is a measurement, and it needs
+two figures rather than one:
+
+```
+[ipc] cancel-cost: 42 cycles with 50 waiting, 42 cycles with 500 waiting
+```
+
+A single figure would not show O(1); the *equality of two* does. A
+singly linked queue — which [ADR 033](docs/adr/033-rendezvous-semantigi.md)
+originally specified and corrected before implementation — would have
+shown about ten times the cost at the longer queue. That matters
+because an endpoint's queue length is *an adversary's* thread count,
+and the walk happens with interrupts disabled.
+
+The semantics are fixed in eight ADRs
+([033](docs/adr/033-rendezvous-semantigi.md)–[040](docs/adr/040-hizli-yol-yok.md));
+the shape of the whole thing, with M9a marked off from what is still
+specification, is in [docs/ipc.md](docs/ipc.md).
+
+**M8 — Ring 3.** Code runs at CPL 3, in its
 own address space, with its instructions in a page that is executable
 and not writable. It reaches the kernel through one `syscall` and comes
 back through `sysret`; the timer preempts it; its XMM registers
@@ -120,6 +142,130 @@ cloned into `third_party/` automatically.
 | `make toolchain-check` | Report tool availability |
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
+
+## M9a acceptance criteria
+
+Three scenarios, all exiting 33. `make test` runs them with the other
+thirty-four.
+
+### 1. `make run-ipctest` — the rendezvous works, in both orders
+
+```
+[ipc] sizes: Endpoint 32 B, TCB 2048 B with M9's new fields -- ADR 017's ceilings unchanged
+[ipc] rendezvous: both orders work -- 3 senders and 5 receivers had to block, 8 rendezvous completed
+[ipc] lengths: 0, 3 and 128 words all delivered intact; the receiver checked every word of the longest
+[ipc] tag: all 5 invalid fields refused, each by its own check
+[ipc] fifo: three senders queued and were delivered 0, 1, 2 -- in the order they arrived
+```
+
+Both orders matter separately. A sender arriving first has to park
+its message somewhere, and an endpoint holds no storage
+([ADR 033](docs/adr/033-rendezvous-semantigi.md)) — so the message
+waits in the *sender's own TCB* and must survive that thread being
+descheduled. A receiver arriving first exercises the other half.
+Requiring both counters to be non-zero is what rules out a kernel
+where only one direction works.
+
+The 128-word case is checked word by word by the receiver, out of its
+own buffer, so only a correct copy passes. The five tag validations
+are each triggered by their own case — [ADR 023](docs/adr/023-test-disiplini.md)'s
+K5: a check nothing reaches is indistinguishable from its own absence.
+
+### 2. `make run-ipccancel` — cancellation is O(1), shown at two lengths
+
+```
+[ipc] cancel-cost: 42 cycles with 50 waiting, 42 cycles with 500 waiting
+```
+
+**The measurement that carries the milestone**, and it took three
+attempts to make it mean anything.
+
+The first timed a single removal and reported 108066 cycles for a
+queue of 50 against 336 for a queue of 500 — the short queue
+appearing three hundred times *slower*. A warm-up brought it to
+24696 against 198; re-running the same binary gave 101094 against
+546. None of those numbers measure `Endpoint::remove`. They measure
+the first touch of memory `retype` has just zeroed, plus whatever the
+emulator's virtual TSC felt like reporting.
+
+The fix is the standard one: **the minimum over sixteen samples**.
+Noise only ever adds, so the smallest observation is the closest to
+the real cost; an average is dominated by exactly the outliers that
+went wrong above.
+
+Worth recording that the broken experiment failed in the direction
+nobody inspects — a ratio of one-to-three-hundred reads as a
+spectacular result rather than a mistake. Only the assertion being
+**symmetric** (`max/min` rather than `long/short`) caught it. A
+one-sided check would have passed and the figure would have gone into
+an ADR.
+
+The absolute number moves between runs (66 on one, 42 on the next);
+the *equality* does not, and the equality is the claim.
+
+### 3. `make run-ipcrevoked` — waiters are woken, not stranded
+
+```
+[ipc] endpoint at 0x... deleted with 3 thread(s) waiting; all woken with EndpointDead
+[ipc] endpoint-revoked: all 3 waiters woke with EndpointDead and none received a message
+```
+
+What proves `cancel_ipc` is wired in at all. Three threads block on
+an endpoint, its capability is deleted, and all three must wake. If
+the call were missing from `cnode::delete` the scenario would hang —
+which is the right failure: a queue holding threads nobody can reach
+is not a thing to report politely.
+
+Woken rather than the delete being refused, and the reasoning is
+[ADR 039](docs/adr/039-ipc-olum-ve-iptal.md)'s rather than ADR 026's.
+There, refusing to revoke a busy TCB was safe because the thread's
+owner could always suspend it first. Here the waiters may belong to
+*other components*, so refusing would let any of them make an
+endpoint un-revokable — a denial of service against whoever owns it.
+
+### K5: what was broken, and what broke
+
+[ADR 023](docs/adr/023-test-disiplini.md)'s K5 asks for at least one
+test per milestone verified by breaking the thing it tests. M9a got
+three, and two of them were not deliberate.
+
+**Deliberate.** `Endpoint::remove`'s `prev` link replaced by a walk
+from `queue_head` — the singly linked queue ADR 033 first specified:
+
+```
+[ipc] cancel-cost: 294 cycles with 50 waiting, 2478 cycles with 500 waiting
+[PANIC] ... a factor of 8. That is a linear walk, not the O(1) ADR 033 requires
+```
+
+42/42 became 294 against 2478. The scenario failed and named the
+cause, which is the point: this is the one check that distinguishes
+the doubly linked queue from the one it replaced, and the figures it
+reports are only meaningful because breaking the queue moves them.
+
+**Not deliberate, and more useful.** The first `recv` called
+`sched::suspend` on itself. Suspend saw `BlockedOnEndpoint`, did what
+ADR 039 tells it to — called `cancel_ipc` — and unqueued the receiver
+it had been asked to park. Two threads then waited for each other with
+neither in a queue.
+
+**Nothing was corrupted**, which is what made it hard: no dangling
+pointer, no inconsistent queue, no assertion tripped. The two
+operations cancelled exactly. The only symptom was a thirty-second
+timeout, and a timeout names no line.
+
+The fix is a split — [`sched::block_current()`](kernel/src/sched.rs:1079)
+for "I am waiting", `suspend` for "stop waiting" — with each one
+*naming* the other's misuse. Same shape as M3 splitting `TlbFlush` out
+of `map` and M7 splitting `UserAccess` out of a plain read: two
+operations that look alike and mean different things should not share
+a name. ADR 039 records the contract table.
+
+**Also not deliberate.** The full suite caught M6's `threadtest`
+failing with "the spinning thread never ran" — then passed fourteen
+times in a row. A race: the timer can fire between the entry
+trampoline's `sti` and its `jmp`, so the spinner is preempted before
+its first instruction. It *did* run, and the one-shot test reported
+the mechanism working as a failure. Now ADR 023's K8.
 
 ## M8 acceptance criteria
 

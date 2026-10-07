@@ -84,16 +84,27 @@ Alternatif, bütün TCB'leri tarayıp `reply_to == tcb` olanı bulmaktı
 birden boş. Bir `debug_assert` bunu her ikisine dokunan yerde
 kontrol edecek.
 
-### Kuyruktan çıkarma O(kuyruk uzunluğu)
+### Kuyruktan çıkarma O(1)
 
-ADR 033 bunu kabul etmişti: tek yönlü liste, belirli bir thread'i
-çıkarmak dolaşmayı gerektiriyor.
+> **Düzeltme (M9a).** Bu bölüm ilk yazıldığında "O(kuyruk uzunluğu),
+> çünkü iptal nadir bir işlem" diyordu ve ADR 033'ün o zamanki tek
+> yönlü listesine dayanıyordu. ADR 033 bu kararı kendi "M9 uygulama
+> kararı 6" düzeltmesiyle geri aldı; burası o düzeltmeyle
+> hizalanıyor. Eski gerekçenin kusuru şuydu: **"nadir" ile "ucuz"
+> aynı şey değil.** Kuyruk uzunluğu burada bir düşmanın thread
+> sayısı, ve dolaşma kesmeler kapalıyken yapılıyor.
 
-Burada tekrar meşrulaştırılıyor: iptal **nadir** bir işlem. Bir
-thread'in öldürülmesi ya da suspend edilmesi sıcak yolda değil.
+Liste çift yönlü (`ipc_next`, `ipc_prev`), yani bir thread'i
+çıkarmak komşularını birbirine bağlamak demek — dolaşma yok.
 
-Sınır: kuyruk uzunluğu ≤ sistemdeki thread sayısı, ve 1024'te
-`panic` (ADR 033).
+Ölçüldü: `ipc-cancel-cost`, 50 ve 500 bekleyenle **aynı** maliyeti
+raporluyor. Testin iddiası iki ölçümün oranı üzerine kurulu, mutlak
+bir sayı üzerine değil; mutlak sayı koşudan koşuya değişiyor, oran
+değişmiyor.
+
+Kuyruk uzunluğu yine de ≤ sistemdeki thread sayısı ve 1024'te
+`panic` (ADR 033) — ama bu artık bir maliyet sınırı değil, bir
+döngü-tespit koruması.
 
 ## Dört senaryo
 
@@ -222,6 +233,104 @@ yarım çıkarılmış bir kuyruğu dolaşabilir. `remove_from_queue`
 sırasında `head`, `tail` ve bir `next` alanı tutarsız olabiliyor.
 
 M6'nın `remove_from_queue`'su aynı kararı verdi.
+
+## `suspend` ve `block_current` neden iki ayrı işlem
+
+Bu bölüm M9a'nın gerçeklemesi sırasında eklendi. ADR'nin asıl
+pass'inde yoktu, çünkü sorun ancak kod yazılınca göründü.
+
+### Hata
+
+`recv`'in ilk sürümü şunu yapıyordu:
+
+```
+recv(ep):
+    kendini ep'nin kuyruguna ekle
+    state = BlockedOnEndpoint
+    sched::suspend(kendisi)      <- YANLIS
+```
+
+Üç satır da tek tek doğru görünüyor. Beraberce yaptıkları şu:
+`suspend`, yukarıdaki satır 1015'te, thread'in durumunun
+`BlockedOnEndpoint` olduğunu görüyor ve **bu ADR'nin emrettiği şeyi**
+yapıyor — `cancel_ipc` çağırıyor. Yani bir satır önce kuyruğa
+eklenen alıcı, kuyruktan çıkarılıyor.
+
+Sonuç: endpoint tekrar boş. Ardından gelen gönderici de bekleyen
+kimseyi bulamayıp bloke oluyor. İki thread birbirini bekliyor,
+hiçbiri kuyrukta değil.
+
+### Belirtinin neden hiçbir şey söylemediği
+
+**Hiçbir şey bozulmadı.** Sarkan işaretçi yok, tutarsız kuyruk yok,
+`debug_assert` tetiklenmedi. İki işlem birbirini tam olarak
+götürdü — kuyruk, hiç dokunulmamış haliyle, geçerli.
+
+Bu yüzden tek belirti otuz saniyelik bir zaman aşımıydı, ve zaman
+aşımı hiçbir satır numarası vermez. Bu kod tabanındaki en kötü
+teşhis türü: bozulma, kendi yokluğundan ayırt edilemiyor.
+
+İlk tahminim `InterruptGuard`'lardı — yani koda bakmadan verilmiş
+bir cevap. Asıl neden koddaydı ve okunabilirdi.
+
+### Kök neden: iki farklı işlem, tek isim
+
+| | `suspend` | `block_current` |
+|---|---|---|
+| Kim istiyor | başkası, TCB cap'i ile | thread'in kendisi |
+| Anlamı | "beklemeyi bırak" | "bekliyorum, gelince uyandır" |
+| IPC kuyrukları | **çıkarır** (`cancel_ipc`) | **içinde bırakır** |
+| Thread durumu | `Suspended` yapar | çağıranın bıraktığı gibi bırakır |
+| Kim çağırır | `Suspend` invocation, `revoke` | `send`, `recv` |
+
+Satırların hepsi zıt. Aynı isim altında toplanmaları, "ikisi de
+thread'i durduruyor" benzerliğindendi — ve bu benzerlik tuzağın
+kendisi.
+
+**Bu, bu projede üçüncü kez görülen desen:**
+
+- M3: `map` içindeki örtük TLB geçersizleştirmesi → `TlbFlush` ayrı
+  bir tip oldu ([ADR 012](012-tlb-gecersizlestirme.md)).
+- M7: user belleğine düz okuma → `UserAccess` ayrı bir tip oldu.
+- M9a: `suspend` → `block_current` ayrıldı.
+
+Üçünde de kural aynı: **birbirine benzeyen ama farklı şey ifade
+eden iki işlem aynı ismi paylaşmamalı.**
+
+### İki taraflı koruma
+
+Ayrım, yalnızca iki fonksiyon yazarak değil, her birinin yanlış
+kullanımını *isimlendirerek* kuruldu:
+
+```
+suspend:        assert!(!(is_current && state.is_blocked_on_ipc()))
+                "bir thread kendini IPC beklemesinden suspend edemez;
+                 sched::block_current() kullanin"
+
+block_current:  debug_assert!(state.is_blocked_on_ipc())
+                "cagiran once kuyruga eklemeli ve durumu ayarlamali,
+                 yoksa bu thread'i hicbir sey uyandiramaz"
+```
+
+İkisi birbirinin aynası: biri "bu işlem burada yanlış" diyor, diğeri
+"bu işlemin ön koşulu tutmuyor". Her iki yanlış kullanım da artık
+otuz saniyelik sessizlik yerine bir satır numarası üretiyor.
+
+`suspend` tarafındaki `assert!`, `debug_assert!` değil — release
+derlemesinde de kalıyor. Gerekçe: bu hata sessizce bir kilitlenme
+üretiyor, yani en pahalı başarısızlık biçimi, ve kontrol zaten sıcak
+yolda değil.
+
+### `block_current`'ın kilitlenmeyi isimlendirmesi
+
+Çalıştırılacak thread kalmadığında `block_current` panik ediyor:
+
+> every thread is blocked on IPC and there is nothing left to run.
+> This is a deadlock -- some component is waiting for a message that
+> only a blocked thread could send
+
+Sistemin asılı kalmasına izin verilmiyor. Master prompt'un crash-only
+kuralı: **bir kilitlenme bir teşhistir, zaman aşımı değildir.**
 
 ## Hata kodları
 

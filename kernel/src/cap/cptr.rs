@@ -191,7 +191,7 @@ pub unsafe fn resolve(space: &CSpace, cptr: CPtr) -> Result<&'static mut Slot, C
         return Err(CapError::RootSlotMustBeCNode);
     }
 
-    let radix = inner.extra() as u8;
+    let radix = inner.as_radix();
     let leaf_slots = 1usize << radix;
     let l0_index = cptr.l0_index();
     if l0_index >= leaf_slots {
@@ -257,7 +257,7 @@ pub unsafe fn address_of(space: &CSpace, l1_index: usize, l0_index: usize) -> Op
         return None;
     }
 
-    let radix = inner.extra() as u8;
+    let radix = inner.as_radix();
     if l0_index >= (1usize << radix) {
         return None;
     }

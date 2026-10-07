@@ -60,6 +60,11 @@ const GENERATION_MASK: u64 = 0xFF;
 /// Badge/size lives in the top 32 bits: a badge for Endpoint and
 /// Notification, `size_bits` for Untyped, `radix` for CNode. They never
 /// coexist, so one field serves all three.
+///
+/// Three meanings in one field is not the hazard; the slot carries its
+/// type, so which meaning applies is always determined. The hazard is
+/// reading it *without* saying which -- see [`Slot::extra`] and the three
+/// typed accessors beside it (ADR 037).
 const EXTRA_SHIFT: u32 = 32;
 
 const _: () = {
@@ -108,10 +113,87 @@ impl Slot {
         ((self.packed >> GENERATION_SHIFT) & GENERATION_MASK) as u8
     }
 
-    /// Badge (Endpoint, Notification), `size_bits` (Untyped) or `radix`
-    /// (CNode), depending on the type.
-    pub fn extra(&self) -> u32 {
+    /// The raw `extra` field, **without** asking what it means.
+    ///
+    /// Private, and that is ADR 037's decision rather than an accident of
+    /// visibility. The field holds a badge, a `radix` or a `size_bits`
+    /// depending on the slot's type, and a call site that reads it
+    /// unqualified is indistinguishable from one that reads it wrongly:
+    /// `slot.extra()` on a CNode compiles, runs, and returns a number
+    /// that is not a badge.
+    ///
+    /// Callers use [`Slot::as_badge`], [`Slot::as_radix`] or
+    /// [`Slot::as_size_bits`], each of which asserts the type. Keeping
+    /// this one private turns the wrong read into a *compile* error,
+    /// which is the best kind.
+    ///
+    /// The two exceptions inside this module are `copy`, which carries
+    /// the field across without interpreting it, and `mint`, which
+    /// overwrites it.
+    fn extra(&self) -> u32 {
         (self.packed >> EXTRA_SHIFT) as u32
+    }
+
+    /// The badge on an Endpoint or Notification capability (ADR 037).
+    ///
+    /// # Panics
+    ///
+    /// If the slot holds anything else. A panic rather than an `Err`
+    /// because this is not something a *caller* can get wrong -- the
+    /// type has been resolved by the time an invocation reaches here, so
+    /// a mismatch means the kernel asked the wrong question. ADR 023
+    /// does not allow that to be answered with a plausible number.
+    pub fn as_badge(&self) -> u32 {
+        let found = self.cap_type();
+        assert!(
+            matches!(found, CapType::Endpoint | CapType::Notification),
+            "as_badge() on a {} capability: `extra` holds a badge only for \
+             Endpoint and Notification (ADR 037). Reading it here would \
+             return this object's {} as though it were a client identity.",
+            found,
+            match found {
+                CapType::CNode => "radix",
+                CapType::Untyped => "size_bits",
+                _ => "unused extra field",
+            }
+        );
+        self.extra()
+    }
+
+    /// The radix of a CNode capability: it names `1 << radix` slots.
+    ///
+    /// # Panics
+    ///
+    /// If the slot holds anything else. See [`Slot::as_badge`].
+    pub fn as_radix(&self) -> u8 {
+        let found = self.cap_type();
+        assert!(
+            found == CapType::CNode,
+            "as_radix() on a {} capability: only a CNode has a radix \
+             (ADR 037). A wrong value here would size a slot array, so \
+             every index into it would be unchecked in the one way that \
+             matters.",
+            found
+        );
+        self.extra() as u8
+    }
+
+    /// The `size_bits` of an Untyped capability: it covers `1 << bits`
+    /// bytes.
+    ///
+    /// # Panics
+    ///
+    /// If the slot holds anything else. See [`Slot::as_badge`].
+    pub fn as_size_bits(&self) -> u8 {
+        let found = self.cap_type();
+        assert!(
+            found == CapType::Untyped,
+            "as_size_bits() on a {} capability: only an Untyped has a \
+             size (ADR 037). A wrong value here would set the bound \
+             retype checks allocations against.",
+            found
+        );
+        self.extra() as u8
     }
 
     pub fn object(&self) -> ObjectRef {
@@ -409,6 +491,12 @@ pub unsafe fn mint(
     }
     // A badge is written once. Re-badging would let a holder forge a
     // different client's identity.
+    //
+    // `extra()` rather than `as_badge()`: this check runs before the
+    // type is known to be an Endpoint, and on a CNode the field holds a
+    // radix. The comparison is still the right one -- a non-zero field
+    // of any meaning must not be overwritten -- but it is reading the
+    // storage, not a badge, so the typed accessor would be a lie.
     if src.extra() != 0 && badge != src.extra() {
         return Err(CapError::InvalidArgument);
     }
@@ -445,6 +533,11 @@ pub unsafe fn delete(slot: &mut Slot) -> Result<(), CapError> {
         return Err(CapError::EmptySlot);
     }
 
+    // SAFETY: Interrupts are disabled and the slot is live.
+    unsafe {
+        release_ipc_references(slot);
+    }
+
     // SAFETY: Caller's guarantee; the slot is in a list because every
     // non-empty slot is.
     unsafe {
@@ -453,6 +546,66 @@ pub unsafe fn delete(slot: &mut Slot) -> Result<(), CapError> {
     slot.clear();
 
     Ok(())
+}
+
+/// Let go of anything the IPC layer is holding on this object's behalf
+/// (ADR 039).
+///
+/// Called from both `delete` and `revoke`, because a capability can
+/// stop existing either way and the consequence is the same: whatever
+/// was waiting on the object it named must be told.
+///
+/// Two cases, and they are different in a way worth stating:
+///
+/// * **An Endpoint.** Every thread queued on it is woken with
+///   `EndpointDead`. Not refused — the waiters may belong to *other
+///   components*, so refusing to revoke would let any of them make the
+///   endpoint immortal. That reasoning is ADR 039's and it is
+///   deliberately *not* ADR 026's, where refusing was safe because the
+///   thread's own owner could always suspend it first.
+/// * **A TCB.** If the thread is parked in an IPC queue, it comes out.
+///   Leaving it there would be a dangling reference of the worst kind:
+///   the endpoint would eventually hand a message to a thread whose
+///   memory has been recycled.
+///
+/// This function is the whole of "ADR 039 is implemented rather than
+/// written down". Without it, `ipc-endpoint-revoked` hangs.
+///
+/// # Safety
+///
+/// `slot` must be live and interrupts must be disabled.
+unsafe fn release_ipc_references(slot: &Slot) {
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    match slot.cap_type() {
+        CapType::Endpoint => {
+            // SAFETY: The slot holds a live Endpoint, and interrupts
+            // are disabled so nothing can queue on it meanwhile.
+            let endpoint = unsafe { crate::cap::ipc::endpoint_at(slot.object()) };
+            // SAFETY: As above.
+            let woken = unsafe { crate::cap::ipc::cancel_all_waiters(endpoint) };
+            if woken > 0 {
+                crate::println!(
+                    "[ipc] endpoint at {} deleted with {} thread(s) waiting; \
+                     all woken with EndpointDead (ADR 039)",
+                    slot.object(),
+                    woken
+                );
+            }
+        }
+        CapType::Tcb => {
+            // SAFETY: The slot holds a live TCB and nothing else
+            // borrows it here.
+            let thread = unsafe { crate::cap::tcb::tcb_at(slot.object()) };
+            if thread.state().is_blocked_on_ipc() {
+                // SAFETY: Interrupts disabled; the thread is live.
+                unsafe {
+                    crate::cap::ipc::cancel_ipc(thread);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// How much work a revoke did.
@@ -517,6 +670,21 @@ pub unsafe fn revoke(slot: &mut Slot) -> Result<RevokeReport, CapError> {
         }
 
         let next = current.mdb_next;
+
+        // The same obligation `delete` has: a capability about to stop
+        // existing must release whatever the IPC layer is holding on
+        // its behalf (ADR 039).
+        //
+        // SAFETY: `current` is live. Interrupts are *enabled* here --
+        // `revoke` runs under a PreemptGuard rather than a cli region,
+        // because it can take seconds and losing device interrupts was
+        // refused in ADR 019. `release_ipc_references` needs them off,
+        // so it gets its own short region rather than widening this
+        // one.
+        unsafe {
+            let _interrupts = crate::sched::InterruptGuard::new();
+            release_ipc_references(current);
+        }
 
         // SAFETY: `current` is live and in the list.
         unsafe {

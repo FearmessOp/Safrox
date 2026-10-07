@@ -3,8 +3,46 @@
 Bu belge ADR 033–040'ın birlikte ne anlama geldiğini tek yerde
 topluyor. Kararların gerekçesi ADR'lerde; burada **ne olduğu** var.
 
-Güncelleme: M9 architect pass. **Kod henüz yazılmadı** — bu belge
-yazılacak şeyin şartnamesi.
+Güncelleme: **M9a uygulandı.** Belge hem şartname hem de artık
+çalışan kodun tarifi; ikisinin ayrımı aşağıdaki tabloda.
+
+## Kapsam: ne çalışıyor, ne yazıldı ama kapalı
+
+M9 üç parçada iniyor. Bunun sebebi, on bir kabul kriterinin hepsine
+tek seferde girişmenin derlenmeyen ve hiç çalıştırılmamış kod
+üretmiş olması — açıkça yazılıyor, çünkü buradaki disiplinin
+tamamı "denenmemiş iddia iddia değildir" üzerine kurulu.
+
+| Parça | İçerik | Durum |
+|---|---|---|
+| **M9a** | Endpoint, `Send`, `Recv`, bekleme kuyruğu, iptal | **çalışıyor, test ediliyor** |
+| M9b | `Call`, `Reply`, `ReplyRecv`, badge, cevap doğrulama | yazıldı, `dead_code` |
+| M9c | Capability transferi, Notification, bağlı bekleme | yazıldı, `dead_code` |
+
+Sonraki parçalar yorum satırına alınmadı, silinmedi:
+`#[allow(dead_code)]` ile duruyorlar. Yorumlamak derleyicinin
+denetimini keserdi; silmek, olduğu kadarıyla doğru olan işi çöpe
+atardı. Böylece her parça her derlemede tip denetiminden geçiyor ve
+bir attribute silinerek açılıyor — ve **hiçbir şey test edilmediği
+halde test edilmiş gibi durmuyor.**
+
+Bu belgedeki M9b/M9c bölümleri dolayısıyla hâlâ şartname. M9a'nın
+bölümleri ise ölçülmüş: kabul testleri `ipc-test`,
+`ipc-cancel-cost` ve `ipc-endpoint-revoked`.
+
+### M9a'nın iki taşıyıcı sonucu
+
+- **İptal O(1).** `ipc-cancel-cost` tek bir kuyruk işlemini 50 ve
+  500 bekleyenle ölçüyor ve iki rakamın **eşit** olmasını şart
+  koşuyor. Tek bir rakam O(1)'i göstermez; ikisinin eşitliği
+  gösterir, ve kuyruk tek yönlü olsaydı ikincisi yaklaşık on katı
+  çıkardı. Ölçüm 16 örneğin **minimumunu** alıyor — gürültü hep
+  ekler, yani en küçük gözlem gerçeğe en yakın olanıdır.
+- **Bekleyenler uyandırılıyor.** `ipc-endpoint-revoked` üç thread'i
+  bir endpoint'te bloke edip capability'yi siliyor; üçü de
+  `EndpointDead` ile uyanmalı. `cancel_ipc` bağlı olmasaydı senaryo
+  asılırdı — ki doğru arıza biçimi budur: kimsenin erişemediği
+  thread'ler tutan bir kuyruk kibarca raporlanacak bir şey değil.
 
 ---
 

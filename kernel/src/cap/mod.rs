@@ -18,6 +18,7 @@
 pub mod boot;
 pub mod cnode;
 pub mod cptr;
+pub mod ipc;
 pub mod tcb;
 pub mod untyped;
 pub mod vspace;
@@ -372,6 +373,37 @@ pub enum CapError {
     /// always terminates.
     VSpaceInUse { root: u64 },
 
+    // ---- M9: IPC (ADR 033-039) ----
+    /// A message claimed more than 128 words (ADR 034).
+    MessageTooLong { length: usize },
+    /// A message claimed more than four capabilities (ADR 035).
+    TooManyCaps { caps: usize },
+    /// The endpoint was revoked while this thread waited on it, or the
+    /// wait was cancelled some other way (ADR 039).
+    ///
+    /// Waiters are woken rather than the revoke being refused, and the
+    /// reasoning differs from ADR 026's: the waiters may belong to
+    /// other components, so refusing would let any of them make an
+    /// endpoint un-revokable.
+    EndpointDead,
+    /// `Reply` found nobody waiting for one.
+    NoReplyTarget,
+    /// The thread that called is gone, or is no longer waiting
+    /// (ADR 036).
+    ///
+    /// Distinct from [`CapError::NoReplyTarget`], and the distinction
+    /// is the point: that one means "nobody ever called", this one
+    /// means "somebody did and is no longer there". Collapsing them
+    /// would make the generation check -- the thing that stops a reply
+    /// reaching a *different* thread at the same address -- impossible
+    /// to test for on its own.
+    ReplyTargetGone,
+    /// A Notification already has a waiter, or is already bound
+    /// (ADR 038).
+    NotificationBusy,
+    /// The thread or the notification is already bound to something.
+    AlreadyBound,
+
     /// Size, alignment or type combination is not valid.
     InvalidArgument,
 }
@@ -446,6 +478,42 @@ impl fmt::Display for CapError {
                  running thread elsewhere first -- ADR 028)",
                 root
             ),
+            CapError::MessageTooLong { length } => write!(
+                f,
+                "MessageTooLong ({} words; the IPC buffer holds {} -- \
+                 ADR 034)",
+                length,
+                ipc::MAX_MESSAGE_WORDS
+            ),
+            CapError::TooManyCaps { caps } => write!(
+                f,
+                "TooManyCaps ({}; at most {} travel in one message -- \
+                 ADR 035)",
+                caps,
+                ipc::MAX_TRANSFER_CAPS
+            ),
+            CapError::EndpointDead => write!(
+                f,
+                "EndpointDead (the endpoint was revoked while this thread \
+                 waited on it -- ADR 039)"
+            ),
+            CapError::NoReplyTarget => {
+                write!(f, "NoReplyTarget (nobody is waiting for a reply)")
+            }
+            CapError::ReplyTargetGone => write!(
+                f,
+                "ReplyTargetGone (the caller is gone or no longer waiting; \
+                 the generation check refused a reply to whatever occupies \
+                 its memory now -- ADR 036)"
+            ),
+            CapError::NotificationBusy => write!(
+                f,
+                "NotificationBusy (a Notification takes one waiter -- \
+                 ADR 038)"
+            ),
+            CapError::AlreadyBound => {
+                write!(f, "AlreadyBound (ADR 038)")
+            }
             CapError::InvalidArgument => write!(f, "InvalidArgument"),
         }
     }

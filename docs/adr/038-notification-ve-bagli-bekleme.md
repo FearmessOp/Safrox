@@ -146,20 +146,73 @@ alıcının zaten okuduğu bir register'da.
 ADR 034'ün `reserved` alanı 12 bitti; artık 11 bit (31:21) ve bir
 bit kullanımda. ADR 034 buna göre güncellenecek.
 
-### Bağlı Notification'ın önceliği
+### Bağlı Notification'ın önceliği: **dönüşümlü**
 
 İkisi aynı anda hazırsa — Endpoint'te bir gönderen *ve* bağlı
 Notification'da bir sinyal — hangisi?
 
-**Notification önce.** Gerekçe: sinyal zaten birikmiş durumda ve
-onu teslim etmek bir randevu gerektirmiyor; gönderen beklemeye
-devam edebilir. Tersi olsaydı, sinyal bir sonraki `Recv`'e kadar
-beklerdi ve o `Recv` hiç gelmeyebilirdi.
+**Dönüşümlü (alternating).** TCB'de bir bit: en son hangisi teslim
+edildi. Bu sefer diğeri.
 
-Bu bir açlık (starvation) riski: sürekli sinyal gelen bir
-Notification, Endpoint'teki istekleri aç bırakabilir. M12'nin
-sürücüsünde kesme hızı sınırlı olduğu için pratik değil, ama
-**açık sorulara yazıldı.**
+```
+Recv(endpoint) uyandirilirken, ikisi de hazirsa:
+    son teslim Notification ise  -> Endpoint'i teslim et
+    son teslim Endpoint ise      -> Notification'i teslim et
+    bit'i cevir
+```
+
+Yalnızca biri hazırsa bit'e bakılmıyor: hazır olan teslim edilir ve
+bit ona göre güncellenir.
+
+> **Düzeltme (M9 uygulama kararı 3).** Bu ADR ilk yazıldığında
+> **"Notification önce"** diyordu, ve açlık riskini bir açık soru
+> olarak bırakıyordu: "M12'nin sürücüsünde kesme hızı sınırlı olduğu
+> için pratik değil."
+>
+> Açık soru 3'te eğilimimi (c) dönüşümlü olarak yazmış ama ADR'ye
+> (a)'yı koymuştum — gerekçem, "ölçmeden eklemek erken optimizasyon
+> gibi geldi" idi.
+>
+> **Bu gerekçe kategori hatasıydı.** Dönüşümlü teslim bir
+> optimizasyon değil, bir **doğruluk garantisi.** Ve ikisi farklı
+> şekilde doğrulanır:
+>
+> | | Nasıl doğrulanır |
+> |---|---|
+> | Optimizasyon | **ölçülür** — ne kadar hızlandı |
+> | Açlık garantisi | **ölçülmez** — ya vardır ya yoktur |
+>
+> ADR 040'ın "ölçmeden ekleme" kuralı birincisi için yazıldı.
+> İkincisine uygulamak, "kilidin gerekli olduğunu ölçelim" demeye
+> benziyor: veri yarışı ölçümde görünmeyebilir, ve görünmemesi
+> yokluğunu kanıtlamaz.
+>
+> "M12'de kesme hızı sınırlı" bir varsayımdı. Sınırı kim koyuyor?
+> Donanım — yani bir sürücü hatası, kötü yapılandırılmış bir aygıt,
+> ya da kasıtlı bir kesme fırtınası o sınırı kaldırabilir. Bir
+> ilerleme garantisini donanımın iyi davranmasına bağlamak, ADR
+> 030'un "kernel user'a güvenmiyor" kuralının ihlali.
+>
+> Maliyeti **bir bit ve bir dal.**
+
+### Açlığın imkânsızlığı test ediliyor
+
+Garanti ölçülmez, ama **imkânsızlık gösterilebilir.** `ipc-test`
+senaryo 9:
+
+```
+Notification'a kesintisiz sinyal gonderilirken
+Endpoint'e bir istek geliyor.
+Istegin kac sinyal icinde teslim edildigini bas.
+```
+
+Dönüşümlü teslimle bu sayı **küçük ve sınırlı**. "Notification önce"
+olsaydı test **sonsuza kadar beklerdi** — yani bu, ADR 023'ün K5'ini
+karşılayan türden bir test: kararı geri alırsanız test geçmez,
+*asılır*.
+
+Bir açlık testinin asılarak başarısız olması, sayı basarak başarılı
+olmasından daha güçlü bir kanıt: sonsuz bekleme, açlığın tanımı.
 
 ### Bir thread kaç Notification'a bağlanabilir
 
@@ -212,6 +265,15 @@ uzantısı.
 **Bağlı bekleme olmadan, iki thread.** Sürücünün durumu paylaşılır,
 kilitleme gerekir. Tek CPU'da bile preemption var.
 
+**Notification her zaman önce.** Bu ADR'nin ilk kararıydı. Açlık
+üretiyor: sürekli sinyal gelen bir Notification, Endpoint'teki
+istekleri sonsuza kadar bekletir. Yukarıdaki düzeltme notu.
+
+**Endpoint her zaman önce.** Sinyal birikimli olduğu için kaybolmaz,
+bir sonraki `Recv`'de görülür — **ama o `Recv` hiç gelmeyebilir.**
+Sürekli istek gelen bir Endpoint bu sefer kesmeleri aç bırakır. Aynı
+hata, ters yönde.
+
 **Endpoint ve Notification'ı tek tipte birleştirmek.** ADR 017
 reddetti: her IPC'de "bu senkron mu asenkron mu" dalı.
 
@@ -237,8 +299,13 @@ taşmanın sessizce bilgi kaybetmesi.
   M13'ün sürücüsü için gerekli, ve şimdi karara bağlandı.
 - Ayırt etme: tag'de **bit 20 = `IS_NOTIFICATION`**, kernel yazar.
   ADR 034'ün `reserved` alanı 12 bitten 11 bite indi.
-- İkisi aynı anda hazırsa **Notification önce**. Açlık riski
-  teorik; açık sorulara yazıldı.
+- İkisi aynı anda hazırsa **dönüşümlü teslim**: TCB'de bir bit, en
+  son hangisinin teslim edildiğini tutuyor. Bir bit, bir dal.
+- Gerekçe: bu bir optimizasyon değil **doğruluk garantisi**, ve
+  garantiler ölçülmez — ya vardır ya yoktur. "Kesme hızı sınırlı"
+  varsayımı donanımın iyi davranmasına güvenmek olurdu.
+- **Açlığın imkânsızlığı test ediliyor** (`ipc-test` 9). Karar geri
+  alınırsa test geçmez, *asılır* — sonsuz bekleme açlığın tanımı.
 - Bir thread **bir** Notification'a bağlanabilir; birden çok kaynak
   için badge bitleri kullanılır (ADR 037).
 - `Poll` var, `NBRecv` yok: Notification zaten bloke olmayan bir

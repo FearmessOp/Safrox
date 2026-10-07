@@ -69,6 +69,10 @@ ISO_USERKREAD := $(BUILD_DIR)/pythos-userkread.iso
 ISO_USERSMEP := $(BUILD_DIR)/pythos-usersmep.iso
 ISO_USERSMAP := $(BUILD_DIR)/pythos-usersmap.iso
 ISO_USERFORGE := $(BUILD_DIR)/pythos-userforge.iso
+# M9a IPC images.
+ISO_IPCTEST := $(BUILD_DIR)/pythos-ipctest.iso
+ISO_IPCCANCEL := $(BUILD_DIR)/pythos-ipccancel.iso
+ISO_IPCREVOKED := $(BUILD_DIR)/pythos-ipcrevoked.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -81,7 +85,8 @@ ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_VSPACETEST) $(ISO_VSKERNEL) $(ISO_VSISOLATION) \
                $(ISO_VSSTALE) \
                $(ISO_USERTEST) $(ISO_USERPRIV) $(ISO_USERKREAD) \
-               $(ISO_USERSMEP) $(ISO_USERSMAP) $(ISO_USERFORGE)
+               $(ISO_USERSMEP) $(ISO_USERSMAP) $(ISO_USERFORGE) \
+               $(ISO_IPCTEST) $(ISO_IPCCANCEL) $(ISO_IPCREVOKED)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -143,6 +148,7 @@ QEMU_FLAGS := \
         run-vspacetest run-vskernel run-vsisolation run-vsstale \
         run-usertest run-userpriv run-userkread run-usersmep \
         run-usersmap run-userforge \
+        run-ipctest run-ipccancel run-ipcrevoked \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -394,10 +400,11 @@ test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
       run-threadtest run-threadovf run-threadintalloc run-threadkill \
       run-vspacetest run-vskernel run-vsisolation run-vsstale \
       run-usertest run-userpriv run-userkread run-usersmep \
-      run-usersmap run-userforge
+      run-usersmap run-userforge \
+      run-ipctest run-ipccancel run-ipcrevoked
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 	--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M8: all acceptance tests passed"
+	@echo "M9a: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"
@@ -499,3 +506,31 @@ run-usersmap: $(ISO_USERSMAP)
 
 run-userforge: $(ISO_USERFORGE)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_USERFORGE) --expect userforge -- $(QEMU_FLAGS)
+
+
+# ---- M9a IPC images ----------------------------------------------------
+
+$(ISO_IPCTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,34)
+
+$(ISO_IPCCANCEL): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,35)
+
+$(ISO_IPCREVOKED): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,36)
+
+# M9a IPC scenarios. All three exit 33, and the last one is the
+# interesting case: three threads wake with an error and the kernel
+# carries on, which is a caller-visible outcome rather than a fault.
+# A kernel that died there would be worse than one that refused the
+# delete -- it would be a denial of service reachable from any
+# component that can park a thread on an endpoint.
+
+run-ipctest: $(ISO_IPCTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCTEST) --expect ipctest -- $(QEMU_FLAGS)
+
+run-ipccancel: $(ISO_IPCCANCEL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCCANCEL) --expect ipccancel -- $(QEMU_FLAGS)
+
+run-ipcrevoked: $(ISO_IPCREVOKED)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCREVOKED) --expect ipcrevoked -- $(QEMU_FLAGS)

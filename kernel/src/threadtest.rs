@@ -108,21 +108,46 @@ fn object_cnode() -> CNode {
     unsafe { boot::leaf_cnode(boot::ROOT_SLOT_OBJECTS) }
 }
 
+/// Bytes one test thread costs: a TCB plus the frames for its stack.
+///
+/// Rounded up to a power of two, because alignment can push the real
+/// figure a little past the sum and an Untyped that cannot spare
+/// 32 KiB cannot reliably spare 18.
+const THREAD_BYTES: u64 = 32 * 1024;
+
 /// Retype a TCB, map it a stack, and point it at an entry function.
 ///
 /// The stack's frames come from the same Untyped as the TCB: ADR 026
 /// says a thread's stack is charged to whoever created the thread, not
 /// to the kernel. The intermediate page tables come from the same
 /// place, which is the lesson ADR 022 learned in the heap.
+///
+/// # Why there is no Untyped index here any more
+///
+/// There used to be, and these tests passed with it — by luck. The
+/// indices they named (0 through 4) happen to be large Untypeds on
+/// this machine, so nobody noticed that the fixture was asserting
+/// something about the memory map.
+///
+/// M9's IPC tests needed a third thread, named an index that was
+/// smaller, and ran it dry partway through a stack. The first fix
+/// there was to name different indices; it failed the same way with
+/// different numbers, which is what showed the mistake was the
+/// indexing rather than the index.
+///
+/// So the fixture says what it needs and `root_untyped_with_room`
+/// finds it. Changed here as well as in M9 even though nothing was
+/// failing, because "it works today" is not the property worth
+/// keeping — ADR 023 records the rule.
 fn create_thread(
-    untyped_slot_index: usize,
     tcb_slot_index: usize,
     stack_slot: u64,
     entry: extern "C" fn() -> !,
 ) -> TestThread {
     let cnode = object_cnode();
-    // SAFETY: Index below the count boot reported.
-    let parent = unsafe { boot::root_untyped(untyped_slot_index) };
+    // SAFETY: The CSpace is built. Panics with a diagnosis rather
+    // than handing back an Untyped that is too small.
+    let parent = unsafe { boot::root_untyped_with_room(THREAD_BYTES) };
 
     // SAFETY: Live Untyped and CNode; the destination slot is empty.
     unsafe { untyped::retype(parent, CapType::Tcb, 0, 1, &cnode, tcb_slot_index) }
@@ -467,8 +492,9 @@ fn check_interrupt_flag_discipline() {
     // Observed rather than asserted in the abstract. A `cli` added to
     // revoke by mistake would make this line change.
     let cnode = object_cnode();
-    // SAFETY: Index below the count boot reported.
-    let parent = unsafe { boot::root_untyped(1) };
+    // SAFETY: The CSpace is built; an Endpoint is 32 bytes and the
+    // request asks for room rather than naming a position.
+    let parent = unsafe { boot::root_untyped_with_room(4096) };
     // SAFETY: Live Untyped and CNode; slot 200 is unused by the thread
     // test's fixtures.
     unsafe { untyped::retype(parent, CapType::Endpoint, 0, 1, &cnode, 200) }
@@ -503,8 +529,8 @@ fn check_cooperative_switch() -> (TestThread, TestThread) {
     RSP_B.store(0, Ordering::Release);
     STACK_OVERLAP.store(false, Ordering::Release);
 
-    let a = create_thread(2, 0, THREAD_A_SLOT, thread_a);
-    let b = create_thread(2, 8, THREAD_B_SLOT, thread_b);
+    let a = create_thread(0, THREAD_A_SLOT, thread_a);
+    let b = create_thread(8, THREAD_B_SLOT, thread_b);
 
     // The two stacks must not overlap. Checked here from the outside
     // as well as from inside the threads: the inside check proves the
@@ -690,7 +716,7 @@ fn check_preemption() {
     SPIN_STOP.store(false, Ordering::Release);
     SPIN_IF_AT_ENTRY.store(0, Ordering::Release);
 
-    let spinner = create_thread(3, 16, 4, thread_spin);
+    let spinner = create_thread(16, 4, thread_spin);
 
     let switches_before = sched::switch_count();
     let ticks_before = sched::tick_count();
@@ -703,15 +729,74 @@ fn check_preemption() {
     // Hand the CPU to the spinner. It will never give it back
     // voluntarily -- so if this call ever returns, something took the
     // CPU away from it, and the only thing that can is the timer.
-    sched::yield_now();
+    //
+    // **Why this is a loop and not one `yield_now`.**
+    //
+    // One call was enough until M9's run caught it failing, and the
+    // failure was not deterministic: six consecutive runs afterwards
+    // passed, with iteration counts between 146k and 316k. A test that
+    // depends on how a timer lands is a test that will fail on
+    // somebody else's machine instead of here.
+    //
+    // The race: `switch_to` runs with IF clear, and the entry
+    // trampoline's first instruction is `sti`. If a timer interrupt is
+    // already pending at that moment -- it has been masked for the
+    // whole switch -- it fires between the `sti` and the `jmp`, before
+    // the spinner has executed a single instruction of its own. The
+    // tick switches back here, and the main thread then reads
+    // `SPIN_ITERATIONS` as zero and concludes the thread never ran.
+    //
+    // It *did* run; it was preempted before its first `fetch_add`,
+    // which is the very thing this check exists to demonstrate. So the
+    // one-shot version could report the mechanism working as a
+    // failure.
+    //
+    // Yielding again is sound: the spinner never yields, so each
+    // return is still proof that something took the CPU from it. What
+    // the loop removes is the assumption that the *first* return
+    // happened after the spinner had made progress.
+    //
+    // Bounded by a TSC deadline, so a spinner that genuinely never
+    // runs fails with the diagnosis below rather than hanging.
+    let deadline = read_tsc() + 20_000_000_000;
+    while SPIN_ITERATIONS.load(Ordering::Acquire) == 0 && read_tsc() < deadline {
+        sched::yield_now();
+    }
 
     let iterations = SPIN_ITERATIONS.load(Ordering::Acquire);
     let switches = sched::switch_count() - switches_before;
     let ticks = sched::tick_count() - ticks_before;
 
+    // "Never ran" has several causes and they need different fixes, so
+    // the message separates them rather than stating the symptom:
+    //
+    // * `switches == 0` -- the yield found nothing to switch to, so the
+    //   enqueue did not take.
+    // * switches happened but this TCB's own count is zero -- the
+    //   scheduler ran *something else*, which means the queue holds a
+    //   thread that is not the one we put in it.
+    // * the TCB ran but the counter is zero -- it resumed somewhere
+    //   other than its entry point, i.e. a stale context.
+    //
+    // SAFETY: Live TCB; no other borrow held here.
+    let (spin_state, spin_switches) = unsafe {
+        let tcb = tcb_of(&spinner);
+        (tcb.state(), tcb.switch_count())
+    };
     assert!(
         iterations > 0,
-        "the spinning thread never ran; there is nothing to preempt"
+        "the spinning thread never ran; there is nothing to preempt. \
+         After the yield: {} switches happened, the spinner's own switch \
+         count is {}, its state is {}, {} threads are ready, and the \
+         ping-pong counter is {} (it was 200 when check 3 finished -- a \
+         higher value here means the yield reached one of *those* \
+         threads, so the queue is holding a TCB that is not the one this \
+         check enqueued)",
+        switches,
+        spin_switches,
+        spin_state.name(),
+        sched::ready_count(),
+        ROUNDS.load(Ordering::Acquire)
     );
 
     // Checked before the tick count, because it explains it. A thread
@@ -1000,7 +1085,7 @@ fn measure_switch_cost() {
     // A second thread to switch with. The pair must both be ready, so
     // that each `yield_now` is a real switch rather than a no-op.
     ROUNDS.store(0, Ordering::Release);
-    let partner = create_thread(4, 32, 5, thread_yield_forever);
+    let partner = create_thread(32, 5, thread_yield_forever);
 
     // SAFETY: Live TCB, not queued.
     unsafe {
@@ -1064,7 +1149,7 @@ extern "C" fn thread_yield_forever() -> ! {
 pub fn run_stack_overflow() -> ! {
     println!("[thread] stack overflow test: a thread will run off its own stack");
 
-    let victim = create_thread(2, 0, THREAD_A_SLOT, thread_overflow);
+    let victim = create_thread(0, THREAD_A_SLOT, thread_overflow);
 
     println!(
         "[thread] victim: tcb slot {}, stack {} .. {}, guard page below {}",
@@ -1219,7 +1304,7 @@ pub fn run_kill_running() -> ! {
     println!("[thread] revoking a running thread's TCB");
 
     ROUNDS.store(0, Ordering::Release);
-    let victim = create_thread(2, 0, THREAD_A_SLOT, thread_yield_forever);
+    let victim = create_thread(0, THREAD_A_SLOT, thread_yield_forever);
 
     // SAFETY: Live TCB, not queued.
     unsafe {

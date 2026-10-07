@@ -58,8 +58,9 @@ boyut mesaj sayısıyla büyümemeli.
 
 ## Bekleyen kuyruğu: TCB'de bağlantı, Endpoint'te uçlar
 
-Kuyruk, M6'nın hazır kuyruğuyla aynı desende: **intrusive**, TCB'nin
-içinde bir `next` alanı, Endpoint'te baş ve kuyruk işaretçileri.
+Kuyruk **intrusive** — TCB'nin içinde bağlantı alanları, Endpoint'te
+baş ve kuyruk işaretçileri. M6'nın hazır kuyruğundan bir farkla:
+burada liste **çift yönlü** (aşağıda, "Kuyruk işlemleri sınırlı mı").
 
 ```
 Endpoint (32 bayt):
@@ -119,22 +120,41 @@ not.
 |---|---|---|
 | Kuyruğa ekle (sona) | O(1) | `tail` işaretçisi var |
 | Kuyruktan al (baştan) | O(1) | `head` işaretçisi var |
-| Belirli bir thread'i çıkar | **O(kuyruk uzunluğu)** | tek yönlü liste |
+| Belirli bir thread'i çıkar | **O(1)** | çift yönlü liste |
 
-Üçüncüsü sınırlı değil ve bu bilinçli bir kabul. Ne zaman gerekiyor:
-bekleyen bir thread suspend edilirse ya da TCB'si revoke edilirse
-(ADR 039). Her ikisi de nadir — sıcak yolda değil.
+Üçüncüsü, **çift yönlü liste kararının tek sebebi.** TCB'de iki alan
+tutuluyor: `ipc_next` ve `ipc_prev`. Bir thread'i çıkarmak komşularını
+birbirine bağlamak demek — kuyruğu dolaşmak gerekmiyor.
 
-M6'nın `remove_from_queue`'su aynı tercihi yaptı ve aynı gerekçeyle:
-çift yönlü liste O(1) yapardı, TCB'ye bir alan daha eklerdi.
-**Fark şu ki orada kuyruk uzunluğu thread sayısıyla sınırlıydı;
-burada da öyle** — bir Endpoint'te bekleyen her thread'in bir TCB'si
-var, ve TCB'ler Untyped'dan geliyor. Sınır, sistemdeki toplam thread
-sayısı.
+> **Düzeltme (M9 uygulama kararı 6).** Bu ADR ilk yazıldığında liste
+> tek yönlüydü ve çıkarma O(kuyruk uzunluğu)'ydu. Gerekçem şuydu:
+> "M6'nın `remove_from_queue`'su aynı tercihi yaptı, ve kuyruk
+> uzunluğu thread sayısıyla sınırlı."
+>
+> **Bu gerekçe yanlıştı, ve kendi yazdığım ayrım yanlışlığını
+> gösteriyor:** M6'nın hazır kuyruğunda uzunluk *sistemin* thread
+> sayısı; burada **bir düşmanın** thread sayısı. Yeterli Untyped'ı
+> olan bir bileşen yüzlerce thread yaratıp hepsini tek bir Endpoint'e
+> sıraya sokabilir, ve sonra her suspend işlemi o kuyruğu dolaşır —
+> kesmeler kapalıyken (ADR 025).
+>
+> "Birkaç bin çevrim küçük" demiştim. O sayı 1024 tavanına
+> dayanıyordu, **ve tavanlar değişir.** Bir güvenlik özelliğini
+> değişebilir bir sabite bağlamak, ADR 023'ün K5'inin ruhuna aykırı:
+> tavanı yükselten bir yama, sessizce bir DoS açar.
+>
+> TCB'ye bir `u64` daha. M9 zaten yedi alan ekliyor; sekizincisi
+> bedava, ve karşılığında maliyet kuyruk uzunluğundan **bağımsız**
+> oluyor.
 
-Yine de bir tavan konuyor: kuyruk 1024'ten uzunsa `panic`. M6'nın
-`ready_count`'u aynı tavanı kullanıyor, ve gerekçesi aynı: bu
-uzunluk bir döngü (cycle) belirtisi, yani bir kernel hatası.
+Tavan yine de duruyor: kuyruk 1024'ten uzunsa `panic`. Ama artık bir
+performans sınırı değil, bir **tutarlılık denetimi** — bu uzunluk bir
+döngü (cycle) belirtisi, yani bir kernel hatası. M6'nın
+`ready_count`'u aynı tavanı aynı gerekçeyle kullanıyor.
+
+O(1) olduğu **ölçülerek** kanıtlanacak: `ipc-cancel-cost` testi 50 ve
+500 thread'le iki ölçüm yapıyor, ve ikisi aynı mertebede olmalı. Bir
+tek sayı bunu kanıtlamazdı — iki sayının *eşitliği* kanıtlıyor.
 
 ## Randevu anında ne oluyor
 
@@ -201,10 +221,37 @@ thread'in TCB'si revoke edilebilir; ne olacağı ADR 039'da.
 
 `NBSend` ve `NBRecv` (bloke olmayan varyantlar) **yok.** seL4'te
 varlar ve kullanışlılar, ama her biri yeni bir method numarası ve
-yeni bir kod yolu. M13'e kadar gerekmediği gösterilebilir:
-ateşle-unut `Notification`, yoklamalı alım ise bir tasarım hatası
-işareti. **Kapattığımız kapı:** bir sunucunun "istek var mı" diye
-bakıp yoksa başka iş yapması. Açık sorulara yazıldı.
+yeni bir kod yolu. **Kapattığımız kapı:** bir sunucunun "istek var
+mı" diye bakıp yoksa başka iş yapması.
+
+> **Karar (M9 uygulama kararı 5).** Açık soru 5'te M13'ün sağlık
+> kontrolü döngüsünün `NBSend` gerektirip gerektirmediğini
+> sormuştum:
+>
+> ```
+> loop { her bilesenin saglik durumunu sor; cevap gelmeyenleri isaretle }
+> ```
+>
+> `Call` kullanılamaz — bir bileşen takılırsa init sistemi de
+> takılır.
+>
+> **`NBSend` eklenmiyor. Sağlık kontrolü `Notification` ile
+> yapılacak:** her bileşen periyodik olarak bir Notification'a
+> sinyal gönderir, init sistemi `Poll` ile bakar. Sinyal gelmeyen
+> bileşen ölü sayılır.
+>
+> Bu yalnızca bir kaçınma değil, **doğru desen**: sağlık kontrolü
+> bir istek-cevap değil, bir *canlılık sinyali.* `Call` ile
+> sorulduğunda cevap veren bir bileşen "çalışıyor" değil "bu
+> syscall'a cevap verebiliyor" demektir — asıl işi yapan thread'i
+> takılmış olabilir. Periyodik bir sinyal ise iş döngüsünün içinden
+> gelir.
+>
+> Badge'ler bunu doğal kılıyor (ADR 037): her bileşene farklı bir
+> bit, tek bir `Poll` hepsini birden okur.
+>
+> M13'te yine de gerekirse, eklemek **geriye uyumlu**: yeni bir
+> method numarası, mevcut hiçbir yolu değiştirmiyor.
 
 ## Elenen alternatifler
 
@@ -214,8 +261,14 @@ sahibi olmalı, ve kernel bellek ayıramaz.
 **Endpoint'te iki ayrı kuyruk (gönderenler / alıcılar).** 32 bayta
 sığmaz, ve gerekmiyor: ikisi aynı anda dolu olamaz.
 
-**Çift yönlü kuyruk.** Belirli bir thread'i çıkarmayı O(1) yapardı.
-TCB'ye 8 bayt daha, ve o işlem sıcak yolda değil.
+**Tek yönlü kuyruk.** TCB'de 8 bayt kazandırırdı. Reddedildi:
+çıkarma maliyetini düşman kontrolündeki bir sayıya bağlardı
+(yukarıdaki düzeltme notu).
+
+**Endpoint başına kuyruk uzunluğu sınırı.** Tek yönlü listeyi
+kurtarmanın diğer yolu: kuyruk N'den uzunsa `Send` hata dönsün. Yeni
+bir hata kodu, yeni bir kontrol, ve **yeni bir soru** — N kaç? Çift
+yönlü liste bu soruyu hiç sormuyor.
 
 **Öncelikli kuyruk.** Ekleme sınırsız olurdu. Sabit seviyeli
 kuyruklar Endpoint'i büyütürdü. M10'a ertelendi.
@@ -230,19 +283,24 @@ bağlardı; ADR 017 tamponun TCB'de olmasına zaten karar vermişti.
   (ADR 022).
 - Mesaj gönderenin TCB'sindeki 1 KiB tamponda (ADR 017); Endpoint
   32 bayt ve mesaj tutmuyor.
-- Bekleyen kuyruğu **intrusive**: TCB'de `next`, Endpoint'te baş ve
-  kuyruk. Allocation yok.
+- Bekleyen kuyruğu **intrusive ve çift yönlü**: TCB'de `ipc_next` ve
+  `ipc_prev`, Endpoint'te baş ve kuyruk. Allocation yok.
 - **Tek kuyruk, bir durum alanı.** Gönderen ve alıcı aynı anda
   bekleyemez, yani iki kuyruğa gerek yok — ve 32 bayta sığmazdı.
 - **FIFO.** Öncelikli ekleme sınırsız iş olurdu; öncelik M10'a kadar
   zaten yalnızca saklanan bir sayı (ADR 024). Kapattığımız kapı:
   öncelik tersine çevirme.
-- Kuyruk ekleme/çıkarma O(1); **belirli bir thread'i çıkarma
-  O(uzunluk)** ve bu kabul ediliyor — yalnızca suspend ve revoke
-  yollarında, sıcak yolda değil.
+- **Her üç kuyruk işlemi de O(1)**, belirli bir thread'i çıkarmak
+  dahil. Çift yönlü liste kararının tek sebebi bu: kuyruk uzunluğu
+  burada **düşman kontrolünde**, M6'nın hazır kuyruğundan farklı
+  olarak. 1024 tavanı duruyor ama artık bir performans sınırı değil,
+  bir döngü denetimi.
 - İki yeni thread durumu: `BlockedOnEndpoint` (kuyrukta),
   `BlockedOnReply` (hiçbir kuyrukta değil). İkisi de `is_busy`
   değil.
 - Transfer boyunca kesmeler kapalı (ADR 025); maliyeti ölçülecek
   (ADR 040).
-- `NBSend`/`NBRecv` yok. Kapattığımız kapı: yoklamalı sunucu.
+- `NBSend`/`NBRecv` yok. Sağlık kontrolü gibi "cevap bekleyemem"
+  desenleri **Notification + `Poll`** ile — ki zaten doğru desen:
+  canlılık bir sinyal, bir istek-cevap değil. Gerekirse eklemek
+  geriye uyumlu. Kapattığımız kapı: yoklamalı sunucu.

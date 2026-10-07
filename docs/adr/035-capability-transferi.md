@@ -90,7 +90,25 @@ dolu olduğunu anlar. Bu bilgi zaten onun.
 ### Receive slot ayarlanmamışsa
 
 `SetReceiveSlots` hiç çağrılmamışsa `count = 0`, yani **hiçbir cap
-alınmaz.** Varsayılan güvenli: bir thread istemeden yetki almaz.
+alınmaz.**
+
+Bu, "varsayılan güvenli" demekten daha güçlü bir şey — ve ayrım
+önemli olduğu için açıkça yazılıyor:
+
+> **Yetkiyi almak bir eylemdir.** Bir cap, alıcının *önceden açtığı*
+> bir slot'a düşer. Slot açılmamışsa cap gelmez; bu bir politika
+> tercihi değil, mekanizmanın yapısı.
+
+"Varsayılan güvenli" bir ayardır: değiştirilebilir, unutulabilir,
+yanlış kurulabilir. Burada ise gönderenin elinde **hiçbir zaman**
+alıcıya cap dayatacak bir araç yok — hedef adresini alıcı yazıyor,
+gönderen o alanı göremiyor bile.
+
+Pratikteki sonucu, aşağıdaki (asimetri) bölümünde: bir sunucu
+istemciye istenmeyen bir cap — örneğin bütçesini karıştıracak bir
+Untyped — gönderemez. Gönderebileceğini sanabilir, `Reply`'sinde
+`caps = 1` yazar, ve **o cap sessizce düşer.** İstemci kabul etmeye
+hazır değilse gelmez.
 
 ## Transferin kuralları
 
@@ -158,17 +176,46 @@ cap'i değil (ADR 036). Yani sunucu, elindeki cap'i gönderebiliyorsa
 gönderir.
 
 Bu bir asimetri ve farkında olarak bırakılıyor: `Call` yapan `GRANT`
-ister, `Reply` yapan istemez. Gerekçe: reply hakkı zaten istemci
-tarafından verilmiş (`GRANTREPLY`), ve o hak "bana cevap ver"
-demek. Cevabın içeriğini kısıtlamak ikinci bir hak biti gerektirirdi.
+ister, `Reply` yapan istemez.
 
-**Açık soruya yazıldı** — bu asimetrinin bir sömürü yolu olup
-olmadığından emin değilim.
+> **Karar (M9 uygulama kararı 2).** Açık soru 5'te bu asimetrinin bir
+> sömürü yolu olup olmadığını sormuştum: `GRANTREPLY` veren bir
+> istemci "bana cevap ver" diyor, "bana istediğin cap'i ver"
+> demiyor. Bir sunucu istemciye istenmeyen bir Untyped gönderip
+> bütçesini karıştırabilir mi?
+>
+> **Hayır, ve gerekçe `SetReceiveSlots`'un bir savunma olması
+> değil** — ilk cevabım buydu ve zayıftı. Bir savunma aşılabilir;
+> burada aşılacak bir şey yok.
+>
+> Yetkiyi almak bir **eylem**. Cap, alıcının önceden açtığı bir
+> slot'a düşer. İstemci `SetReceiveSlots` çağırmadıysa sunucunun
+> gönderdiği cap hiçbir yere gitmez — sunucunun elinde onu
+> zorlayacak bir mekanizma yok. Mesele "varsayılan kapalı" değil,
+> **yapısal olarak zorlanamaz.**
+>
+> Fark şurada görünüyor: bir varsayılan, yanlış kurulabilir. Bir
+> yapı, kurulamaz. Alıcı slot açmadıysa transfer edilecek bir hedef
+> *yoktur*, ve kodda bu bir `if count == 0 { drop }` değil, döngünün
+> hiç dönmemesi.
+>
+> İkinci bir hak biti (`GRANTREPLY`'ye "cevapta cap kabul ederim"
+> anlamı eklemek) bu yüzden gereksiz: bir hak bitinin anlamını ikiye
+> bölerdi, ve koruduğu şey zaten korunuyor.
+>
+> Ve `SetReceiveSlots` çağıran bir istemci, cap kabul etmeye **hazır
+> olduğunu söylemiş** oluyor. Ne geldiğine `caps` alanından bakar,
+> istemiyorsa `delete` eder. Bu noktada bilinçli bir kabul var.
 
 ## Elenen alternatifler
 
 **Cap hedeflerini mesajda taşımak.** Yukarıda: gönderene alıcının
 CSpace'ini tarama imkânı verir.
+
+**`Reply` için üçüncü bir hak biti.** `GRANTREPLY`'ye "cevapta cap
+kabul ederim" anlamı eklemek, ya da yeni bir bit. Reddedildi:
+koruyacağı şeyi slot mekanizması zaten koruyor, ve bir hak bitinin
+anlamını ikiye bölmek onu okunamaz yapardı.
 
 **Dolu slot'ta hata dönmek.** Aynı tarama sorunu, gönderene
 dönerse. Alıcıya dönmek gereksiz çünkü bilgi zaten onda.
@@ -189,7 +236,10 @@ kabul edilebilir.
 - Hedef **alıcının seçtiği** ardışık slotlar (`SetReceiveSlots`).
   Gönderen hedef seçemez — seçebilseydi alıcının CSpace'ini
   tarayabilirdi.
-- Ayarlanmamışsa hiçbir cap alınmaz. Varsayılan güvenli.
+- Ayarlanmamışsa hiçbir cap alınmaz. Bu bir varsayılan değil, bir
+  **yapı**: yetkiyi almak bir eylem, ve gönderenin elinde onu
+  dayatacak bir araç yok. Varsayılanlar yanlış kurulabilir; bu
+  kurulamaz.
 - Beş kontrol, her biri **sessizce düşürüyor**: CPtr geçersiz,
   `GRANT` yok, hedef dolu, derinlik aşıldı. Bir cap'in düşmesi
   diğerlerini etkilemiyor.
@@ -200,4 +250,6 @@ kabul edilebilir.
   ederse gider. Derinlik sınırı 8 (ADR 019) burada da geçerli.
   Kapattığımız kapı: uzun delegasyon zincirleri.
 - `Reply` cap taşıyabilir ve `GRANT` kontrolü sunucunun kendi
-  cap'inde. **Bu asimetri açık sorulara yazıldı.**
+  cap'inde. Asimetri **kabul edildi**: sunucu istemciye cap
+  dayatamaz, çünkü hedef slot'u istemci açar. Üçüncü bir hak biti
+  gereksiz.

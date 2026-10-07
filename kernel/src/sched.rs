@@ -967,10 +967,55 @@ pub unsafe fn suspend(thread: &mut tcb::Tcb) {
     let phys = unsafe { tcb::tcb_phys(thread) }.0;
     let is_current = phys == CURRENT.load(Ordering::Acquire);
 
+    // A thread may not suspend *itself* out of an IPC wait, and this
+    // is the one misuse worth paying a runtime check for.
+    //
+    // M9a's first `recv` did exactly that: queue on the endpoint, set
+    // `BlockedOnEndpoint`, call `suspend`. Suspend then saw the state
+    // it had just been given, concluded the thread no longer wanted
+    // to wait, and called `cancel_ipc` -- unqueueing the receiver it
+    // had been asked to park. The endpoint went back to empty, the
+    // sender blocked too, and the scenario timed out after thirty
+    // seconds.
+    //
+    // **Nothing was corrupted, which is what made it hard to find.**
+    // There was no bad pointer and no broken invariant; the two
+    // halves simply cancelled out. A thirty-second timeout naming
+    // nothing is the worst diagnosis in this codebase, so the misuse
+    // gets a name here instead.
+    //
+    // Use [`block_current`] to park the running thread on a queue it
+    // has already joined.
+    assert!(
+        !(is_current && thread.state().is_blocked_on_ipc()),
+        "a thread cannot suspend itself out of an IPC wait (state {}): \
+         suspend means \"this thread is no longer waiting\" and cancels \
+         the wait, which is the opposite of what a blocking Send or \
+         Recv needs. Use sched::block_current()",
+        thread.state().name()
+    );
+
     if thread.state() == ThreadState::Ready {
         // SAFETY: Interrupts are disabled.
         unsafe {
             remove_from_queue(phys);
+        }
+    }
+
+    // M9: a thread waiting on an endpoint is not on the ready queue
+    // but it *is* in a queue, and leaving it there would be the worst
+    // kind of dangling reference -- the endpoint would hand a message
+    // to a thread that is no longer willing to receive one, and the
+    // delivery would be parked for a thread that never collects it.
+    //
+    // This is the link that makes ADR 039 real rather than written
+    // down: without it, `Suspend` on a blocked thread would appear to
+    // work and corrupt the queue. The `ipc-endpoint-revoked` scenario
+    // is what proves the call is here.
+    if thread.state().is_blocked_on_ipc() {
+        // SAFETY: Interrupts are disabled and the thread is live.
+        unsafe {
+            crate::cap::ipc::cancel_ipc(thread);
         }
     }
 
@@ -998,6 +1043,83 @@ pub unsafe fn suspend(thread: &mut tcb::Tcb) {
     }
 
     drop(guard);
+}
+
+/// Park the running thread and hand the CPU to the next ready one.
+///
+/// # How this differs from [`suspend`], and why they are separate
+///
+/// Both stop a thread, and that similarity is exactly the trap. Their
+/// contracts are opposites:
+///
+/// | | [`suspend`] | `block_current` |
+/// |---|---|---|
+/// | Who asks | somebody else, through a TCB capability | the thread itself |
+/// | Meaning | "stop waiting for whatever you are waiting for" | "I am waiting; wake me when it arrives" |
+/// | IPC queues | **leaves them** (`cancel_ipc`) | **stays in them** |
+/// | Thread state | sets `Suspended` | leaves it as the caller set it |
+///
+/// Calling the wrong one does not corrupt anything. It simply undoes
+/// the work the caller just did, which is why M9a's first rendezvous
+/// hung for thirty seconds with nothing in the log. The pair is split
+/// here for the same reason M3 split `TlbFlush` out of `map` and M7
+/// split `UserAccess` out of a plain read: two operations that look
+/// alike and mean different things should not share a name.
+///
+/// # Contract
+///
+/// The caller must **already** have put the thread on the queue it is
+/// waiting on and set its state to one of the blocked-on-IPC states.
+/// This function changes neither; it only gives up the CPU.
+///
+/// # Safety
+///
+/// Interrupts must be disabled, the current thread must be queued
+/// wherever it expects to be woken from, and its state must say so.
+pub unsafe fn block_current() {
+    debug_assert!(
+        !interrupts_enabled(),
+        "block_current with interrupts enabled: the caller is partway \
+         through a rendezvous and a timer tick could run a third thread \
+         into the same endpoint (ADR 025)"
+    );
+
+    let phys = CURRENT.load(Ordering::Acquire);
+    assert!(phys != 0, "block_current() before sched::init()");
+
+    // SAFETY: CURRENT names a live TCB.
+    let current = unsafe { tcb::tcb_at(crate::cap::ObjectRef(PhysAddr(phys))) };
+
+    // The caller's half of the contract. If this fires, the thread is
+    // about to sleep with nothing holding a reference to it -- nobody
+    // could ever wake it, and the failure would surface as a hang
+    // rather than as this line.
+    debug_assert!(
+        current.state().is_blocked_on_ipc(),
+        "block_current on a thread whose state is {}; the caller must \
+         queue the thread and set BlockedOnEndpoint or BlockedOnReply \
+         *before* giving up the CPU, or nothing will ever wake it",
+        current.state().name()
+    );
+
+    // SAFETY: Interrupts are disabled by the caller's guard.
+    let Some(next) = (unsafe { dequeue() }) else {
+        // Every thread in the system is waiting for a message, and
+        // messages come from threads. Named rather than left as a
+        // hang: a deadlock is a diagnosis, a timeout is not.
+        panic!(
+            "every thread is blocked on IPC and there is nothing left to \
+             run. This is a deadlock -- some component is waiting for a \
+             message that only a blocked thread could send"
+        );
+    };
+
+    // SAFETY: Interrupts disabled, `next` is off the ready queue, and
+    // the current thread is parked on an IPC queue rather than the
+    // ready one -- so `switch_to` will not put it back.
+    unsafe {
+        switch_to(next);
+    }
 }
 
 /// Put a suspended thread back on the ready queue.

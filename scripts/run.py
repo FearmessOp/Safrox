@@ -282,7 +282,7 @@ EXPECTATIONS = {
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
             *CAP_INIT_LINES,
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -301,7 +301,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M8 checks passed", re.M)],
+        forbidden=[re.compile(r"M9a checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -318,7 +318,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -337,7 +337,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M8 checks passed", re.M)],
+        forbidden=[re.compile(r"M9a checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -356,7 +356,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -415,7 +415,7 @@ EXPECTATIONS = {
             # frames -- it panicked with "could not find 2 contiguous
             # frames for a CNode" when this ran to completion. Requiring
             # the line's *absence* keeps the two facts tied together.
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
         ],
     ),
     "doublefree": Expectation(
@@ -435,7 +435,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -483,7 +483,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -528,7 +528,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -557,7 +557,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -613,7 +613,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
@@ -698,7 +698,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -732,7 +732,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             # A null return instead of a panic: out of memory must be loud.
             re.compile(r"returned null instead of panicking", re.M),
             # The heap handing out more than its limit would mean the bound
@@ -761,7 +761,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the heap's upper guard page did not fault", re.M),
         ],
     ),
@@ -920,7 +920,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[captest\] all capability tests passed", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             # Every invariant above is an assert, so a violation is a
@@ -985,7 +985,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the ADR 022 tripwire is not working", re.M),
         ],
     ),
@@ -1007,7 +1007,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the ADR 022 retirement check is not working", re.M),
         ],
     ),
@@ -1147,7 +1147,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[thread\] all thread tests passed", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -1183,7 +1183,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
             re.compile(r"the thread returned from an infinite recursion", re.M),
         ],
@@ -1214,7 +1214,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"does not work on the path that matters", re.M),
             re.compile(r"no timer interrupt arrived within the deadline", re.M),
         ],
@@ -1250,7 +1250,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"instead of ThreadBusy", re.M),
         ],
     ),
@@ -1360,7 +1360,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[vspace\] all address space tests passed", re.M),
-            re.compile(r"^\[boot\] M8 checks passed", re.M),
+            re.compile(r"^\[boot\] M9a checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -1407,7 +1407,7 @@ EXPECTATIONS = {
             # The kernel is still standing afterwards, which is the
             # whole reason this scenario exits 33.
             #
-            # It does not reach "M8 checks passed": the scenario calls
+            # It does not reach "M9a checks passed": the scenario calls
             # `qemu::exit` itself rather than returning to `kmain`,
             # because the point is made as soon as the four refusals
             # have happened and the heap is still readable. Requiring
@@ -1458,7 +1458,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"the two VSpaces are not isolated", re.M),
         ],
     ),
@@ -1519,7 +1519,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             # The failure this scenario exists to rule out: the
             # scheduler switching into a thread whose page tables have
             # been handed back to their Untyped.
@@ -1664,6 +1664,12 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[user\] all ring 3 tests passed", re.M),
+            # `usertest::run()` is `-> !` and exits through `qemu::exit`
+            # itself, so it never returns to `kmain` and never reaches
+            # the milestone banner. Its own banner is the end of this
+            # scenario, and requiring the other one would be requiring
+            # M8's test to be rewritten for no reason -- the same
+            # argument already recorded for `vskernel`.
             re.compile(r"^\[boot\] M8 checks passed", re.M),
         ],
         forbidden=[
@@ -1698,7 +1704,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             # The failure this exists to rule out.
             re.compile(r"without faulting", re.M),
         ],
@@ -1725,7 +1731,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"without faulting", re.M),
             # A supervisor-mode fault here would mean the read happened
             # in the kernel rather than in ring 3.
@@ -1771,7 +1777,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             # SMEP absent would make the scenario vacuous, and it says
             # so rather than passing quietly.
             re.compile(r"SMEP is not enabled", re.M),
@@ -1810,7 +1816,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M8 checks passed", re.M),
+            re.compile(r"M9a checks passed", re.M),
             re.compile(r"SMAP is not enabled", re.M),
             # The unguarded read succeeding would mean SMAP protects
             # nothing -- and every stray supervisor pointer into user
@@ -1853,6 +1859,145 @@ EXPECTATIONS = {
             POISON_IN_REGISTERS,
             # A forged pointer reaching an object.
             re.compile(r"which is not an error", re.M),
+        ],
+    ),
+    # ---- M9a: synchronous rendezvous -----------------------------------
+    #
+    # Three scenarios, all exiting 33. The second is the milestone's
+    # real result and the third is what proves `cancel_ipc` is wired in
+    # at all -- without the call in `cnode::delete`, it hangs.
+    "ipctest": Expectation(
+        name="IPC rendezvous",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # 1. The objects are the size ADR 017 budgeted, *after*
+            #    M9 added nine fields to the TCB. The ceiling is a
+            #    build-time assertion too, but a figure in the log is
+            #    what makes it checkable against the ADR's table.
+            re.compile(
+                r"^\[ipc\] sizes: Endpoint 32 B, TCB 2048 B with M9's new "
+                r"fields -- ADR 017's ceilings unchanged",
+                re.M,
+            ),
+            # The register/buffer split, and the note that the wasted
+            # words were measured rather than guessed (ADR 034).
+            re.compile(
+                r"^\[ipc\] message: 3 words in registers, 128 total "
+                r"\(1024 B\); the buffer's first 3 words are unused, which "
+                r"was measured rather than assumed",
+                re.M,
+            ),
+            # 2-3. Both orders, with non-zero counts on both sides.
+            #      A kernel where only one order worked would still
+            #      produce a line here, so both figures must move.
+            re.compile(
+                r"^\[ipc\] rendezvous: both orders work -- [1-9]\d* senders "
+                r"and [1-9]\d* receivers had to block, [1-9]\d* rendezvous "
+                r"completed",
+                re.M,
+            ),
+            # 4. Three lengths, including both boundaries. The
+            #    128-word case is checked word by word by the
+            #    receiver, out of its own buffer.
+            re.compile(
+                r"^\[ipc\] lengths: 0, 3 and 128 words all delivered "
+                r"intact; the receiver checked every word of the longest",
+                re.M,
+            ),
+            # Every tag field the sender controls, each refused by its
+            # own check (ADR 023's K5).
+            re.compile(
+                r"^\[ipc\] tag: all 5 invalid fields refused, each by its "
+                r"own check",
+                re.M,
+            ),
+            # 5. FIFO, with the order stated rather than implied.
+            re.compile(
+                r"^\[ipc\] fifo: three senders queued and were delivered "
+                r"0, 1, 2 -- in the order they arrived",
+                re.M,
+            ),
+            re.compile(r"^\[ipc\] all M9a IPC tests passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+    "ipccancel": Expectation(
+        name="cancellation cost (measurement)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # Both figures, both from a real queue. Requiring the two
+            # lengths by name rules out a run that measured the same
+            # queue twice.
+            re.compile(
+                r"^\[ipc\] cancel-cost: \d+ cycles with 50 waiting, \d+ "
+                r"cycles with 500 waiting",
+                re.M,
+            ),
+            # And the conclusion, with the ratio in it. The kernel
+            # asserts the ratio as well; this is the outside check on
+            # the same claim.
+            re.compile(
+                r"^\[ipc\] cancel-cost: the two figures agree within a "
+                r"factor of \d+, so the cost does not depend on the "
+                r"queue's length",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            # The failure this scenario exists to catch: a linear walk
+            # would trip the kernel's own assertion, which says this.
+            re.compile(r"That is a linear walk", re.M),
+        ],
+    ),
+    "ipcrevoked": Expectation(
+        name="revoked endpoint",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The kernel says so from inside `delete`, which is where
+            # the call actually lives. Requiring this line is how the
+            # wiring itself is tested rather than its effect.
+            re.compile(
+                r"^\[ipc\] endpoint at .* deleted with 3 thread\(s\) "
+                r"waiting; all woken with EndpointDead",
+                re.M,
+            ),
+            # All three, and none of them received a message. The
+            # second half matters: a waiter that got a message from a
+            # deleted endpoint would be reading an object that no
+            # longer exists.
+            re.compile(
+                r"^\[ipc\] endpoint-revoked: all 3 waiters woke with "
+                r"EndpointDead and none received a message; [1-9]\d* "
+                r"cancellations recorded",
+                re.M,
+            ),
+            # And the reasoning, which is not ADR 026's.
+            re.compile(
+                r"^\[ipc\] endpoint-revoked: the kernel is still running",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
         ],
     ),
 }

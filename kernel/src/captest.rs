@@ -453,7 +453,7 @@ fn check_retype() {
     // SAFETY: Slot 0 holds a CNode whose radix is in `extra`.
     let inner = unsafe {
         let s = cnode.slot(0);
-        CNode::new(s.object().0, s.extra() as u8)
+        CNode::new(s.object().0, s.as_radix())
     };
     assert_eq!(
         inner.len(),

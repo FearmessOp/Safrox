@@ -88,7 +88,7 @@ const _: () = {
     );
 };
 
-/// Where a thread is in its lifecycle (ADR 026).
+/// Where a thread is in its lifecycle (ADR 026, extended by ADR 033).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum ThreadState {
@@ -101,6 +101,17 @@ pub enum ThreadState {
     /// Taken off the queue by `Suspend`. Context is meaningful and the
     /// thread resumes exactly where it stopped.
     Suspended = 3,
+    /// Waiting for a rendezvous on an endpoint (ADR 033).
+    ///
+    /// **In that endpoint's queue**, which is what distinguishes it
+    /// from the state below and what `cancel_ipc` needs to know.
+    BlockedOnEndpoint = 4,
+    /// Made a `Call` and is waiting for the reply (ADR 036).
+    ///
+    /// **In no queue at all.** The right to reply lives in the
+    /// *server's* TCB, not in a structure the caller is parked on --
+    /// which is why waking this thread needs no queue walk.
+    BlockedOnReply = 5,
 }
 
 impl ThreadState {
@@ -110,6 +121,8 @@ impl ThreadState {
             1 => Some(ThreadState::Ready),
             2 => Some(ThreadState::Running),
             3 => Some(ThreadState::Suspended),
+            4 => Some(ThreadState::BlockedOnEndpoint),
+            5 => Some(ThreadState::BlockedOnReply),
             _ => None,
         }
     }
@@ -120,6 +133,8 @@ impl ThreadState {
             ThreadState::Ready => "Ready",
             ThreadState::Running => "Running",
             ThreadState::Suspended => "Suspended",
+            ThreadState::BlockedOnEndpoint => "BlockedOnEndpoint",
+            ThreadState::BlockedOnReply => "BlockedOnReply",
         }
     }
 
@@ -127,8 +142,23 @@ impl ThreadState {
     ///
     /// ADR 026: a thread in one of these states cannot have its TCB
     /// revoked, because the queue or the CPU is still pointing at it.
+    ///
+    /// The two IPC states are deliberately **not** busy, and ADR 039
+    /// settled the question ADR 026 left open. A blocked thread is not
+    /// held by the scheduler; it is held by an endpoint, and an
+    /// endpoint can be told to let go. Refusing to revoke it would make
+    /// a thread immortal for as long as nobody sends it a message --
+    /// and whether anybody does is up to another component.
     pub const fn is_busy(self) -> bool {
         matches!(self, ThreadState::Ready | ThreadState::Running)
+    }
+
+    /// Whether this thread is waiting on an IPC operation.
+    pub const fn is_blocked_on_ipc(self) -> bool {
+        matches!(
+            self,
+            ThreadState::BlockedOnEndpoint | ThreadState::BlockedOnReply
+        )
     }
 }
 
@@ -150,6 +180,21 @@ pub const IPC_BUFFER_OFFSET: usize = 1024;
 /// than the first available multiple (144) so the scheduler's fields
 /// have room to grow without moving this.
 pub const FXSAVE_OFFSET: usize = 256;
+
+/// Where M9's IPC fields begin inside the TCB.
+///
+/// M8 left a gap between the scheduler's state (which ended at 136) and
+/// the fxsave area at 256, specifically so that fields added later would
+/// not move anything the assembly reads. M9 is what that gap was for.
+pub const IPC_FIELDS_START: usize = 136;
+
+/// Where they end. Nine fields, 72 bytes.
+///
+/// Named rather than written as a literal because the reserved array
+/// below is sized from it: get this wrong and the TCB changes size,
+/// which the `const` assertion turns into a build failure instead of a
+/// misaligned fxsave area at runtime.
+pub const IPC_FIELDS_END: usize = 208;
 
 /// Size of an `fxsave` area: fixed by the architecture.
 ///
@@ -179,6 +224,132 @@ const X87_CW_DEFAULT: u16 = 0x037F;
 /// FXRSTOR Memory Region".
 const FXSAVE_FCW_OFFSET: usize = 0;
 const FXSAVE_MXCSR_OFFSET: usize = 24;
+
+/// Where a reply must be sent, and the proof it is still the same
+/// thread (ADR 036).
+///
+/// The two fields travel together everywhere, and keeping them apart
+/// was how `set_pending_send` grew to eight parameters. They are not
+/// two pieces of data but one: **an address plus the generation that
+/// makes it checkable** — the idiom ADR 018 established for CPtrs and
+/// ADR 028 reused for VSpaces. An address on its own is exactly the
+/// thing that goes stale silently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReplySlot {
+    /// Physical address of the slot holding the caller's TCB
+    /// capability.
+    pub slot: PhysAddr,
+    /// The generation that slot had when the reply right was recorded.
+    pub generation: u8,
+}
+
+impl ReplySlot {
+    /// No reply expected.
+    pub const NONE: ReplySlot = ReplySlot {
+        slot: PhysAddr(0),
+        generation: 0,
+    };
+}
+
+/// How a blocked sender's wait ended (ADR 039).
+///
+/// Three outcomes and no fourth: the message was taken, the wait was
+/// cancelled, or nothing has happened yet. "Undefined" is not among
+/// them — the master prompt's rule applied to a state machine rather
+/// than to a value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum SendOutcome {
+    /// Still queued; nothing has happened.
+    Pending = 0,
+    /// A receiver took the message.
+    Delivered = 1,
+    /// The endpoint was revoked, or this thread was taken out of the
+    /// queue by `Suspend` (ADR 039).
+    Cancelled = 2,
+}
+
+impl SendOutcome {
+    const fn from_bits(bits: u8) -> SendOutcome {
+        match bits {
+            1 => SendOutcome::Delivered,
+            2 => SendOutcome::Cancelled,
+            // Anything else reads as "nothing has happened", which is
+            // the only safe interpretation: it leaves the thread
+            // waiting rather than inventing a completion it never had.
+            _ => SendOutcome::Pending,
+        }
+    }
+
+    #[allow(dead_code)] // used by the M9b/M9c diagnostics
+    pub const fn name(self) -> &'static str {
+        match self {
+            SendOutcome::Pending => "Pending",
+            SendOutcome::Delivered => "Delivered",
+            SendOutcome::Cancelled => "Cancelled",
+        }
+    }
+}
+
+/// The message a thread is blocked trying to send.
+///
+/// A blocked sender is not executing, so its message cannot stay in
+/// registers; and an endpoint holds no storage (ADR 033), so it cannot
+/// go there either. It waits here, in the sender's own TCB — which is
+/// precisely what ADR 033 means by "the message lives in the sender's
+/// TCB".
+///
+/// `#[repr(C)]` so the layout is written out rather than inferred. No
+/// assembly reads it, but the TCB's padding is computed from its size
+/// and an inferred layout would make that arithmetic a guess.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PendingSend {
+    /// The message tag.
+    tag: u64,
+    /// The first three message words. The rest are already in the IPC
+    /// buffer, where the sender wrote them.
+    registers: [u64; 3],
+    /// The badge on the capability the sender used (ADR 037).
+    badge: u32,
+    /// A [`SendOutcome`].
+    outcome: u8,
+    /// Whether this is a `Call`, so a reply target must be recorded.
+    wants_reply: u8,
+    /// Generation of the sender's own TCB slot, for that reply target.
+    reply_generation: u8,
+    _pad: u8,
+    /// Physical address of the slot holding the sender's own TCB
+    /// capability, so a reply can be checked for staleness (ADR 036).
+    reply_slot: u64,
+    /// The capability pointers the message carries — at most four
+    /// (ADR 035). How many are meaningful is in the tag.
+    caps: [u64; 4],
+}
+
+const _: () = {
+    // 8 (tag) + 24 (registers) + 4 (badge) + 4 (four bytes of flags)
+    // + 8 (reply_slot) + 32 (caps) = 80.
+    assert!(
+        core::mem::size_of::<PendingSend>() == 80,
+        "PendingSend changed size; the TCB's reserved padding is \
+         computed from it and would no longer add up"
+    );
+};
+
+impl PendingSend {
+    const EMPTY: PendingSend = PendingSend {
+        tag: 0,
+        registers: [0; 3],
+        badge: 0,
+        outcome: SendOutcome::Pending as u8,
+        wants_reply: 0,
+        reply_generation: 0,
+        _pad: 0,
+        reply_slot: 0,
+        caps: [0; 4],
+    };
+}
 
 /// The thread control block itself.
 ///
@@ -261,10 +432,101 @@ pub struct Tcb {
     /// the field's position is part of a layout the `const` assertions
     /// below pin down.
     user_mode: u8,
-    _pad2: [u8; 6],
+
+    // ---- M9: IPC (ADR 033, 035, 036, 038) --------------------------
+    //
+    // Nine fields, 72 bytes, placed in the gap M8 left between the
+    // scheduler's state and the fxsave area. ADR 017's 2048-byte
+    // ceiling is unchanged and the assertion below still holds it.
+    /// Whether the last bound-notification decision delivered the
+    /// notification. Flipped on every delivery (ADR 038).
+    ///
+    /// **This single bit is the starvation guarantee.** With it, a
+    /// thread waiting on both an endpoint and a bound notification
+    /// alternates between them; without it, whichever source is chosen
+    /// unconditionally can starve the other forever. A bit and a
+    /// branch.
+    ///
+    /// ADR 038 originally said "notification first" and left the
+    /// starvation risk as an open question to be measured in M12. That
+    /// was a category error: a progress guarantee is not an
+    /// optimisation, and it is not measured -- it either holds or it
+    /// does not.
+    last_delivery_was_notification: u8,
+    _pad2: [u8; 5],
+
+    /// Next thread in an endpoint's wait queue, or zero.
+    ipc_next: u64,
+
+    /// Previous thread in that queue, or zero.
+    ///
+    /// The field that makes cancellation O(1). M6's ready queue has no
+    /// equivalent and removal there walks the list -- defensible,
+    /// because that length is the *system's* thread count. An
+    /// endpoint's queue length is an *adversary's* thread count, so the
+    /// same cost would be a denial of service with interrupts disabled
+    /// (ADR 033, corrected before implementation).
+    ipc_prev: u64,
+
+    /// The endpoint this thread is queued on, or zero.
+    ///
+    /// Recorded so that cancelling a wait can reach the queue directly.
+    /// Without it, "take this thread off whichever endpoint holds it"
+    /// would mean examining every endpoint in the system -- unbounded
+    /// work on a path ADR 039 requires to be bounded, and the O(1)
+    /// doubly linked list would have bought nothing.
+    blocked_on_endpoint: u64,
+
+    /// Physical address of the thread that is waiting for this thread
+    /// to reply, or zero (ADR 036).
+    ///
+    /// Lives in the *server's* TCB rather than the caller's, and the
+    /// moment it is written is load-bearing: at rendezvous, not when
+    /// `Recv` returns. Written later, a second receiver arriving on the
+    /// same endpoint could steal the caller.
+    reply_to: u64,
+
+    /// The generation `reply_to`'s TCB slot had at rendezvous.
+    ///
+    /// Address plus generation, the idiom ADR 018 established for
+    /// CPtrs and ADR 028 reused for VSpaces. Without it, a caller whose
+    /// TCB was revoked and whose memory was retyped into a *new* TCB at
+    /// the same address would receive a reply meant for a thread that
+    /// no longer exists. `ipc-stale-reply` is that scenario.
+    reply_generation: u8,
+    _pad3: [u8; 7],
+
+    /// Physical address of the slot holding the caller's TCB
+    /// capability, so the generation can be re-read later.
+    reply_slot: u64,
+
+    /// Where incoming capabilities may land: the CNode's base address,
+    /// or zero if `SetReceiveSlots` was never called (ADR 035).
+    ///
+    /// Zero is not "a safe default" but the *absence of a
+    /// destination*. A sender cannot name a slot in another thread's
+    /// CSpace -- if it could, the full/empty distinction would let it
+    /// scan -- so with no receive slots open there is nowhere for a
+    /// capability to go. Taking authority is an action.
+    receive_cnode: u64,
+
+    /// First slot of the receive window, and how many.
+    receive_index: u16,
+    receive_count: u16,
+    /// Radix of the receive CNode, so the window can be bounds-checked
+    /// without resolving a capability at transfer time.
+    receive_radix: u8,
+    _pad4: [u8; 3],
+
+    /// The Notification bound to this thread, or zero (ADR 038).
+    ///
+    /// While set, a `Recv` on any endpoint can also be woken by this
+    /// notification. M13's driver needs exactly that: one thread, two
+    /// sources -- a client request and an interrupt.
+    bound_notification: u64,
 
     /// Reserved. Brings the fixed part to FXSAVE_OFFSET.
-    _reserved: [u8; FXSAVE_OFFSET - 136],
+    _reserved: [u8; FXSAVE_OFFSET - IPC_FIELDS_END],
 
     /// FPU/SSE state, saved and restored on **every** switch (ADR 031).
     ///
@@ -278,11 +540,39 @@ pub struct Tcb {
     /// the `const` assertion below checks that rather than trusting it.
     fpu_state: [u8; FXSAVE_SIZE],
 
-    /// Reserved. Brings the fixed part to IPC_BUFFER_OFFSET.
-    _reserved2: [u8; IPC_BUFFER_OFFSET - FXSAVE_OFFSET - FXSAVE_SIZE],
+    /// What this thread is in the middle of sending, while it is
+    /// blocked on an endpoint (ADR 033).
+    ///
+    /// A blocked sender is not executing, so its message cannot stay
+    /// in registers; and the endpoint holds no storage, so it cannot
+    /// go there either. It stays in the sender's own TCB, which is
+    /// exactly what ADR 033 said the message does.
+    ///
+    /// Placed after the fxsave area rather than in the 136..256 gap
+    /// because it is **not** on the hot path: a rendezvous that
+    /// happens immediately never touches it.
+    pending: PendingSend,
 
-    /// The IPC buffer. Untouched until M9.
-    _ipc_buffer: [u8; super::TCB_SIZE - IPC_BUFFER_OFFSET],
+    /// Reserved. Brings the fixed part to IPC_BUFFER_OFFSET.
+    _reserved2:
+        [u8; IPC_BUFFER_OFFSET - FXSAVE_OFFSET - FXSAVE_SIZE - core::mem::size_of::<PendingSend>()],
+
+    /// The IPC buffer: 128 message words (ADR 017, ADR 034).
+    ///
+    /// Words `0..3` are **never used**: a message's first three words
+    /// travel in registers, and the buffer is indexed `[i]` rather than
+    /// `[i - 3]` so that the index needs no adjustment.
+    ///
+    /// That wastes 24 bytes and it was measured rather than assumed.
+    /// `[i - 3]` costs four instructions on a single access, and --
+    /// the finding that actually decided it -- prevents LLVM from
+    /// recognising the copy loop as a `memcpy`, turning 14 instructions
+    /// into 40. The copy loop is IPC's hot path. See ADR 034's
+    /// measurement section and scripts/m9-index-probe.
+    ///
+    /// `[u64; 128]` rather than bytes because every access is
+    /// word-sized and a byte array would need a cast at each one.
+    ipc_buffer: [u64; super::IPC_BUFFER_SIZE / 8],
 }
 
 const _: () = {
@@ -317,6 +607,58 @@ const _: () = {
     assert!(
         FXSAVE_OFFSET + FXSAVE_SIZE <= IPC_BUFFER_OFFSET,
         "the fxsave area runs into the IPC buffer"
+    );
+
+    // M9: the IPC fields sit in the gap M8 left between the
+    // scheduler's state and the fxsave area.
+    //
+    // Pinned as *relationships* rather than as absolute offsets. The
+    // absolute numbers depend on padding the compiler inserts for
+    // alignment, so writing them out would make a build failure out of
+    // a harmless change -- but the ordering and adjacency are what the
+    // reserved array's size depends on, and those are checked.
+    assert!(
+        core::mem::offset_of!(Tcb, ipc_next) >= IPC_FIELDS_START,
+        "the IPC fields start before the gap M8 left for them"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, ipc_prev) == core::mem::offset_of!(Tcb, ipc_next) + 8,
+        "ipc_prev must follow ipc_next: the queue code reads them as a \
+         pair and a gap between them wastes a cache line on the one \
+         structure IPC touches most"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, blocked_on_endpoint) == core::mem::offset_of!(Tcb, ipc_prev) + 8,
+        "blocked_on_endpoint must follow the queue links"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, reply_to) > core::mem::offset_of!(Tcb, blocked_on_endpoint),
+        "reply_to and blocked_on_endpoint swapped places"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, receive_cnode) > core::mem::offset_of!(Tcb, reply_to),
+        "receive_cnode and reply_to swapped places"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, bound_notification) + 8 == IPC_FIELDS_END,
+        "bound_notification is not the last IPC field, or IPC_FIELDS_END \
+         is wrong; the reserved array below is sized from it"
+    );
+    assert!(
+        IPC_FIELDS_END <= FXSAVE_OFFSET,
+        "the IPC fields run into the fxsave area"
+    );
+
+    // The buffer really is at the offset ADR 017 fixed, and really is
+    // 128 words. ADR 034's length check is written against this.
+    assert!(
+        core::mem::offset_of!(Tcb, ipc_buffer) == IPC_BUFFER_OFFSET,
+        "the IPC buffer is not at IPC_BUFFER_OFFSET"
+    );
+    assert!(
+        super::IPC_BUFFER_SIZE / 8 == 128,
+        "the IPC buffer is not 128 words; ADR 034's MAX_MESSAGE_WORDS \
+         disagrees with ADR 017's buffer size"
     );
 };
 
@@ -517,6 +859,296 @@ impl Tcb {
         self.next_ready = next;
     }
 
+    // ---- M9: IPC ---------------------------------------------------
+
+    /// The message buffer: 128 words, of which `0..3` are never used.
+    ///
+    /// See the field's own documentation for why those three are
+    /// wasted — it is a measured decision, not an oversight.
+    pub fn ipc_buffer(&self) -> &[u64; super::IPC_BUFFER_SIZE / 8] {
+        &self.ipc_buffer
+    }
+
+    pub fn ipc_buffer_mut(&mut self) -> &mut [u64; super::IPC_BUFFER_SIZE / 8] {
+        &mut self.ipc_buffer
+    }
+
+    pub(crate) fn ipc_next(&self) -> u64 {
+        self.ipc_next
+    }
+
+    pub(crate) fn set_ipc_next(&mut self, next: u64) {
+        self.ipc_next = next;
+    }
+
+    pub(crate) fn ipc_prev(&self) -> u64 {
+        self.ipc_prev
+    }
+
+    /// The queue links, for `ipc-cancel-cost` to touch before it
+    /// starts the clock.
+    ///
+    /// The measurement times `Endpoint::remove`, which reads both
+    /// links and writes to both neighbours. Reaching them for the
+    /// first time costs a page walk and three cache misses — real
+    /// costs, but not the one being measured, and large enough to
+    /// swamp it: the first attempt reported a 50-thread queue as
+    /// three hundred times *slower* than a 500-thread one, which is
+    /// the warm-up and nothing else.
+    pub fn ipc_prev_for_measurement(&self) -> u64 {
+        self.ipc_prev
+    }
+
+    /// As [`Tcb::ipc_prev_for_measurement`].
+    pub fn ipc_next_for_measurement(&self) -> u64 {
+        self.ipc_next
+    }
+
+    pub(crate) fn set_ipc_prev(&mut self, prev: u64) {
+        self.ipc_prev = prev;
+    }
+
+    /// Which endpoint this thread is queued on, or zero.
+    pub fn blocked_on(&self) -> u64 {
+        self.blocked_on_endpoint
+    }
+
+    pub(crate) fn set_blocked_on(&mut self, endpoint: u64) {
+        self.blocked_on_endpoint = endpoint;
+    }
+
+    /// Who is waiting for this thread to reply (ADR 036).
+    ///
+    /// The caller's TCB address, the slot its capability lives in, and
+    /// the generation that slot had at rendezvous.
+    pub fn reply_target(&self) -> Option<(u64, PhysAddr, u8)> {
+        if self.reply_to == 0 {
+            return None;
+        }
+        Some((
+            self.reply_to,
+            PhysAddr(self.reply_slot),
+            self.reply_generation,
+        ))
+    }
+
+    /// Record that `caller` is waiting for this thread's reply.
+    ///
+    /// Called **at rendezvous**, not when `Recv` returns. ADR 036 is
+    /// specific about the moment: written later, a second thread
+    /// calling `Recv` on the same endpoint could claim a caller the
+    /// first had already been matched with.
+    ///
+    /// # Safety
+    ///
+    /// `caller` must be the physical address of a live TCB entering
+    /// `BlockedOnReply`, and `slot` the address of the slot holding
+    /// its capability.
+    pub(crate) unsafe fn set_reply_target(&mut self, caller: u64, slot: PhysAddr, generation: u8) {
+        self.reply_to = caller;
+        self.reply_slot = slot.0;
+        self.reply_generation = generation;
+    }
+
+    pub(crate) fn clear_reply_target(&mut self) {
+        self.reply_to = 0;
+        self.reply_slot = 0;
+        self.reply_generation = 0;
+    }
+
+    /// Whether the recorded reply target is still the thread it was.
+    ///
+    /// Three comparisons, no loop — the shape ADR 018 established for
+    /// CPtrs and ADR 028 reused for VSpaces:
+    ///
+    /// * the slot still holds a TCB capability,
+    /// * it still names the same object,
+    /// * its generation has not moved.
+    ///
+    /// The third is the one that matters. Revoking a TCB returns its
+    /// memory to an Untyped and resets the watermark, so the next
+    /// retype is likely to place a **new** TCB at exactly the old
+    /// address. An address-only check would deliver the reply to a
+    /// stranger, silently. `ipc-stale-reply` arranges precisely that
+    /// and requires `ReplyTargetGone`.
+    pub fn reply_target_is_live(&self) -> bool {
+        let Some((caller, slot_addr, generation)) = self.reply_target() else {
+            return false;
+        };
+        if slot_addr.0 == 0 {
+            return false;
+        }
+
+        // SAFETY: A non-zero reply slot is the physical address of a
+        // slot inside a live CNode, recorded at rendezvous. CNodes are
+        // not freed while a capability names them, and PMAP maps all
+        // RAM.
+        let slot =
+            unsafe { &*crate::memory::phys_to_virt(slot_addr).as_ptr::<super::cnode::Slot>() };
+
+        !slot.is_empty()
+            && slot.cap_type() == CapType::Tcb
+            && slot.generation() == generation
+            && slot.object().0 .0 == caller
+    }
+
+    /// Where incoming capabilities may land (ADR 035).
+    ///
+    /// `None` when `SetReceiveSlots` was never called — and that is
+    /// not a refusal but an **absence**. A sender cannot name a slot
+    /// in another thread's CSpace, so with no window open there is
+    /// nowhere for a capability to go. Taking authority is an action.
+    pub fn receive_slots(&self) -> Option<(super::cnode::CNode, usize, usize)> {
+        if self.receive_cnode == 0 || self.receive_count == 0 {
+            return None;
+        }
+        // SAFETY: `set_receive_slots` established that the CNode is
+        // live with this radix and that the window lies inside it.
+        let cnode =
+            unsafe { super::cnode::CNode::new(PhysAddr(self.receive_cnode), self.receive_radix) };
+        Some((
+            cnode,
+            self.receive_index as usize,
+            self.receive_count as usize,
+        ))
+    }
+
+    /// # Safety
+    ///
+    /// `base` must name a live CNode of `1 << radix` slots, with
+    /// `index + count` inside it.
+    pub(crate) unsafe fn set_receive_slots(
+        &mut self,
+        base: PhysAddr,
+        radix: u8,
+        index: u16,
+        count: u16,
+    ) {
+        self.receive_cnode = base.0;
+        self.receive_radix = radix;
+        self.receive_index = index;
+        self.receive_count = count;
+    }
+
+    pub(crate) fn clear_receive_slots(&mut self) {
+        self.receive_cnode = 0;
+        self.receive_radix = 0;
+        self.receive_index = 0;
+        self.receive_count = 0;
+    }
+
+    /// The Notification bound to this thread, or zero (ADR 038).
+    pub fn bound_notification(&self) -> u64 {
+        self.bound_notification
+    }
+
+    pub(crate) fn set_bound_notification(&mut self, notification: u64) {
+        self.bound_notification = notification;
+    }
+
+    /// Whether the previous bound delivery was the notification.
+    ///
+    /// The alternation bit — ADR 038's starvation guarantee in one
+    /// byte. See the field's documentation.
+    #[allow(dead_code)] // M9c
+    pub fn last_delivery_was_notification(&self) -> bool {
+        self.last_delivery_was_notification != 0
+    }
+
+    pub(crate) fn set_last_delivery_was_notification(&mut self, value: bool) {
+        self.last_delivery_was_notification = u8::from(value);
+    }
+
+    // ---- The message a blocked sender is holding -------------------
+
+    /// Record what this thread is about to block trying to send.
+    ///
+    /// The register words go here because they are about to stop
+    /// existing: a blocked thread's registers live in a saved context,
+    /// and the three message words are not part of the callee-saved
+    /// set a context switch preserves.
+    pub(crate) fn set_pending_send(
+        &mut self,
+        tag: u64,
+        registers: [u64; 3],
+        badge: u32,
+        wants_reply: bool,
+        caps: &[u64],
+        reply: ReplySlot,
+    ) {
+        let mut stored = [0u64; 4];
+        for (dst, src) in stored.iter_mut().zip(caps.iter()) {
+            *dst = *src;
+        }
+        self.pending = PendingSend {
+            tag,
+            registers,
+            badge,
+            outcome: SendOutcome::Pending as u8,
+            wants_reply: u8::from(wants_reply),
+            reply_generation: reply.generation,
+            _pad: 0,
+            reply_slot: reply.slot.0,
+            caps: stored,
+        };
+    }
+
+    /// What this thread is blocked sending.
+    ///
+    /// Returns the tag, the register words, the badge, whether a reply
+    /// is wanted, and the capability pointers.
+    pub(crate) fn pending_send(&self) -> (u64, [u64; 3], u32, bool, [u64; 4]) {
+        (
+            self.pending.tag,
+            self.pending.registers,
+            self.pending.badge,
+            self.pending.wants_reply != 0,
+            self.pending.caps,
+        )
+    }
+
+    /// Where this thread's own TCB capability lives, for the reply
+    /// target a receiver is about to record (ADR 036).
+    pub(crate) fn pending_reply_slot(&self) -> ReplySlot {
+        ReplySlot {
+            slot: PhysAddr(self.pending.reply_slot),
+            generation: self.pending.reply_generation,
+        }
+    }
+
+    /// Say how a blocked sender's wait ended.
+    pub(crate) fn record_send_outcome(&mut self, outcome: SendOutcome) {
+        self.pending.outcome = outcome as u8;
+    }
+
+    /// How this thread's IPC wait ended, without clearing it.
+    pub(crate) fn send_outcome(&self) -> SendOutcome {
+        SendOutcome::from_bits(self.pending.outcome)
+    }
+
+    /// Read and clear the outcome.
+    ///
+    /// Clearing matters: a thread that sent once and blocked again
+    /// must not read the previous send's `Delivered` and conclude its
+    /// new message was taken.
+    pub(crate) fn take_send_outcome(&mut self) -> SendOutcome {
+        let outcome = SendOutcome::from_bits(self.pending.outcome);
+        self.pending.outcome = SendOutcome::Pending as u8;
+        outcome
+    }
+
+    /// Reset every IPC field. Part of `configure`.
+    pub(crate) fn clear_ipc_state(&mut self) {
+        self.pending = PendingSend::EMPTY;
+        self.ipc_next = 0;
+        self.ipc_prev = 0;
+        self.blocked_on_endpoint = 0;
+        self.last_delivery_was_notification = 0;
+        self.clear_reply_target();
+        self.clear_receive_slots();
+        self.bound_notification = 0;
+    }
+
     /// Give this thread a stack and an entry point, ready to run.
     ///
     /// The context is built so that the first `switch_context` into
@@ -593,6 +1225,13 @@ impl Tcb {
         self.next_ready = 0;
         self.state = ThreadState::Inactive as u8;
         self.user_mode = 0;
+
+        // M9. A thread being given a fresh entry point must not
+        // inherit a half-finished conversation: a stale `reply_to`
+        // would make the *next* `Reply` wake a thread that is no
+        // longer waiting, and stale queue links would corrupt the
+        // first endpoint this thread touches.
+        self.clear_ipc_state();
 
         // A clean FPU, not a zeroed one (ADR 031). The difference is
         // MXCSR: zero unmasks every SSE exception, so the thread's
@@ -736,6 +1375,12 @@ impl Tcb {
         self.next_ready = 0;
         // Left as Inactive; `sched::init` sets Running.
         self.state = ThreadState::Inactive as u8;
+
+        // M9: the boot thread starts with no IPC state, like any
+        // other. Retype zeroed the object, but the boot TCB is also
+        // reachable through this path after a `configure`, so the
+        // reset is written rather than assumed.
+        self.clear_ipc_state();
 
         // The boot thread is kernel code and stays kernel code.
         self.user_mode = 0;
