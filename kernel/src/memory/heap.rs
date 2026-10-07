@@ -313,7 +313,21 @@ pub fn reserve_size() -> u64 {
 /// structure needed to reach it is not a budget. The cost is ~0.2% --
 /// one table per 512 pages, three levels deep -- and the reserve is
 /// sized in whole pages anyway.
-struct ReserveFrames;
+///
+/// Public from M6, because it is the only frame source left once the
+/// allocator retires and the LAPIC mapping needs one. That makes the
+/// reserve the kernel's single post-boot source of page-table frames,
+/// which is a slight widening of its purpose -- noted here rather than
+/// left to be discovered.
+pub struct ReserveFrames;
+
+/// A frame source backed by the heap's reserve.
+///
+/// For kernel code that must map a page after the frame allocator has
+/// retired. The LAPIC's register page is the first such caller.
+pub fn reserve_frames() -> ReserveFrames {
+    ReserveFrames
+}
 
 impl FrameSource for ReserveFrames {
     fn alloc_frame(&mut self) -> Option<PhysFrame> {

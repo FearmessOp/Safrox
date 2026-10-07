@@ -464,6 +464,75 @@ pub unsafe fn init_from_regions(regions: &[MemoryRegion]) {
     );
 }
 
+/// Slot in the object CNode reserved for the boot thread's TCB.
+///
+/// Fixed rather than allocated, and high enough to stay out of the way
+/// of the test fixtures, which work upward from zero. The boot
+/// thread's TCB must outlive every test, so it cannot share a slot
+/// with anything that gets cleared.
+pub const BOOT_TCB_SLOT: usize = 255;
+
+/// Give the currently executing code a TCB.
+///
+/// The kernel is already running: it has a stack (KSTACK slot 1,
+/// mapped by `vm::init`) and a context, and what it lacks is somewhere
+/// to *save* that context when it first switches away. This retypes a
+/// TCB and fills in the stack bounds, without touching the context --
+/// which is correct, because the context is live in the CPU's
+/// registers and gets written by the first `switch_context`.
+///
+/// # Safety
+///
+/// Call once, after `init_from_regions` and before `sched::init`, on
+/// the main kernel stack.
+pub unsafe fn create_boot_tcb() -> &'static mut super::tcb::Tcb {
+    // SAFETY: Caller's guarantee that `init_from_regions` has run, and
+    // ROOT_SLOT_OBJECTS is seeded with a CNode there.
+    let cnode = unsafe { leaf_cnode(ROOT_SLOT_OBJECTS) };
+
+    // From the last root Untyped, so the test fixtures' Untypeds stay
+    // untouched. The boot TCB is permanent and must not share an
+    // Untyped with anything that gets revoked.
+    let index = root_untyped_count() - 1;
+    // SAFETY: Index below the count.
+    let parent = unsafe { root_untyped(index) };
+
+    // SAFETY: Live Untyped and CNode; the slot was zeroed at boot.
+    unsafe { super::untyped::retype(parent, CapType::Tcb, 0, 1, &cnode, BOOT_TCB_SLOT) }
+        .expect("could not retype the boot thread's TCB");
+
+    // SAFETY: Index in range.
+    let slot = unsafe { cnode.slot(BOOT_TCB_SLOT) };
+    // SAFETY: The slot holds a live TCB and nothing else borrows it.
+    let tcb = unsafe { super::tcb::from_slot(slot) }.expect("the boot TCB slot is not a TCB");
+
+    // The main stack, already mapped by vm::init. Recorded here so
+    // that a stack-overflow report can name this thread, and so the
+    // acceptance test can check that no other thread's RSP falls
+    // inside it.
+    let (_, bottom, top) =
+        crate::memory::layout::kstack_slot(crate::memory::layout::KSTACK_SLOT_MAIN);
+
+    // Not `configure`: that writes a fresh context for a thread that
+    // has never run, and this thread is running right now. Its
+    // registers are in the CPU, and the first switch away from it is
+    // what writes them here.
+    //
+    // SAFETY: The TCB was just retyped and zeroed, and nothing else
+    // refers to it yet.
+    unsafe {
+        tcb.adopt_running(top, bottom, crate::memory::layout::KSTACK_SLOT_MAIN);
+    }
+
+    println!(
+        "[cap] boot tcb: object slot {}, stack {} .. {} (the main stack, \
+         mapped by vm::init)",
+        BOOT_TCB_SLOT, bottom, top
+    );
+
+    tcb
+}
+
 /// Borrow the leaf CNode at a root index.
 ///
 /// # Safety

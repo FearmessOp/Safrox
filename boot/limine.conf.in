@@ -164,3 +164,39 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: cap-retired-allocator
+
+/PythOS (thread and scheduler tests)
+    comment: Two kernel threads on their own stacks hand off 100 times;
+    comment: the LAPIC timer fires and preempts a thread that never
+    comment: yields; suspend, resume and ReadRegisters work; and the
+    comment: interrupt flag is where ADR 025 says it is in each of the
+    comment: three kinds of protected region. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: thread-test
+
+/PythOS (thread stack overflow)
+    comment: A thread recurses off the bottom of its own stack -- one
+    comment: retyped from an Untyped and mapped for its TCB, not the
+    comment: main stack M3 tested. The report names the thread. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: thread-stack-overflow
+
+/PythOS (allocation inside a real interrupt)
+    comment: M5 tested ADR 022's tripwire by driving the depth counter
+    comment: by hand, because there were no interrupts. This calls
+    comment: allocate() from inside the timer handler the LAPIC
+    comment: dispatched to. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: thread-interrupt-alloc
+
+/PythOS (operate on a running thread)
+    comment: ADR 026: a thread the scheduler is holding cannot have its
+    comment: TCB rewritten -- ThreadBusy, not undefined behaviour. Then
+    comment: Suspend, and the same call succeeds: the refusal is a
+    comment: sequencing requirement, not a dead end. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: thread-kill-running

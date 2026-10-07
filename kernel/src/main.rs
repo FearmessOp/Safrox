@@ -51,6 +51,7 @@
 // use it. See kernel/src/memory/heap.rs.
 extern crate alloc;
 
+mod apic;
 mod cap;
 mod captest;
 mod cpu;
@@ -64,7 +65,9 @@ mod memory;
 mod memtest;
 mod panic;
 mod qemu;
+mod sched;
 mod serial;
+mod threadtest;
 mod vmtest;
 
 use limine::request::{
@@ -77,7 +80,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M5");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M6");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -569,10 +572,50 @@ extern "C" fn kmain() -> ! {
         cap::boot::init_from_regions(memmap_entries);
     }
 
+    // ---- Threads and interrupts (M6) -----------------------------------
+    //
+    // Order is forced and each step explains the next:
+    //
+    //   1. A TCB for the code already running. The first context
+    //      switch needs somewhere to save registers *from*, and that
+    //      has to exist before anything can switch.
+    //   2. The LAPIC timer, armed but not yet able to fire -- IF is
+    //      still clear.
+    //   3. `sti`. From here the assumption every line written since M2
+    //      relied on ("interrupts are disabled") stops holding, and
+    //      ADR 025's named regions take over.
+    //
+    // Doing 3 before 1 would mean a timer tick arriving with no
+    // current thread; doing 3 before 2 would mean enabling interrupts
+    // with nothing to deliver, which is harmless but pointless.
+
+    // SAFETY: First and only call, after the capability system is up.
+    unsafe {
+        let boot_tcb = cap::boot::create_boot_tcb();
+        sched::init(boot_tcb);
+    }
+
+    // SAFETY: First and only call, after the IDT is loaded and with
+    // interrupts still disabled. Maps the LAPIC page, which needs the
+    // kernel's tables and the heap's frame reserve.
+    let lapic_hz = unsafe { apic::init() };
+    let _ = lapic_hz;
+
+    // SAFETY: The IDT has handlers for every vector that can now fire,
+    // and the scheduler has a current thread.
+    unsafe {
+        sched::enable_interrupts();
+    }
+    println!(
+        "[boot] interrupts enabled; the \"IF is always clear\" assumption \
+         that held from M2 to M5 is now replaced by ADR 025's named regions"
+    );
+
     // ---- Scenarios that run on a capability-only kernel ----------------
     //
-    // Everything below sees a retired frame allocator. The heap still
-    // works, because it has its own reserve.
+    // Everything below sees a retired frame allocator and enabled
+    // interrupts. The heap still works, because it has its own
+    // reserve.
 
     // #BP is a trap, so this one returns and the kernel carries on to exit
     // successfully. That is the whole point: it proves the dispatcher's
@@ -638,7 +681,28 @@ extern "C" fn kmain() -> ! {
         captest::run();
     }
 
-    println!("[boot] M5 checks passed");
+    // M6 thread scenarios. Longest token first, as above.
+    if cmdline.contains("thread-stack-overflow") {
+        println!("[boot] cmdline requested the thread stack overflow test");
+        threadtest::run_stack_overflow();
+    }
+
+    if cmdline.contains("thread-interrupt-alloc") {
+        println!("[boot] cmdline requested the real-interrupt allocation tripwire");
+        threadtest::run_interrupt_alloc();
+    }
+
+    if cmdline.contains("thread-kill-running") {
+        println!("[boot] cmdline requested the kill-a-running-thread test");
+        threadtest::run_kill_running();
+    }
+
+    if cmdline.contains("thread-test") {
+        println!("[boot] cmdline requested the thread tests");
+        threadtest::run();
+    }
+
+    println!("[boot] M6 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

@@ -53,6 +53,10 @@ ISO_CAPTEST := $(BUILD_DIR)/pythos-captest.iso
 ISO_CAPREVOKE := $(BUILD_DIR)/pythos-caprevoke.iso
 ISO_CAPINTALLOC := $(BUILD_DIR)/pythos-capintalloc.iso
 ISO_CAPRETIRED := $(BUILD_DIR)/pythos-capretired.iso
+ISO_THREADTEST := $(BUILD_DIR)/pythos-threadtest.iso
+ISO_THREADOVF := $(BUILD_DIR)/pythos-threadovf.iso
+ISO_THREADINTALLOC := $(BUILD_DIR)/pythos-threadintalloc.iso
+ISO_THREADKILL := $(BUILD_DIR)/pythos-threadkill.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -60,7 +64,8 @@ ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_STACKOVF) \
                $(ISO_HEAPTEST) $(ISO_HEAPOOM) $(ISO_HEAPGUARD) \
                $(ISO_CAPTEST) $(ISO_CAPREVOKE) $(ISO_CAPINTALLOC) \
-               $(ISO_CAPRETIRED)
+               $(ISO_CAPRETIRED) $(ISO_THREADTEST) $(ISO_THREADOVF) \
+               $(ISO_THREADINTALLOC) $(ISO_THREADKILL)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -241,6 +246,18 @@ $(ISO_CAPINTALLOC): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 $(ISO_CAPRETIRED): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
 	$(call build_iso,$@,19)
 
+$(ISO_THREADTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,20)
+
+$(ISO_THREADOVF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,21)
+
+$(ISO_THREADINTALLOC): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,22)
+
+$(ISO_THREADKILL): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,23)
+
 # ---- Run & test --------------------------------------------------------
 
 run: $(ISO)
@@ -307,6 +324,19 @@ run-capintalloc: $(ISO_CAPINTALLOC)
 run-capretired: $(ISO_CAPRETIRED)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_CAPRETIRED) --expect capretired -- $(QEMU_FLAGS)
 
+# M6 thread scenarios. threadtest exits 33; the three negatives exit 35.
+run-threadtest: $(ISO_THREADTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_THREADTEST) --expect threadtest -- $(QEMU_FLAGS)
+
+run-threadovf: $(ISO_THREADOVF)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_THREADOVF) --expect threadovf -- $(QEMU_FLAGS)
+
+run-threadintalloc: $(ISO_THREADINTALLOC)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_THREADINTALLOC) --expect threadintalloc -- $(QEMU_FLAGS)
+
+run-threadkill: $(ISO_THREADKILL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_THREADKILL) --expect threadkill -- $(QEMU_FLAGS)
+
 # The full acceptance suite, in order:
 #
 #   fmt        formatting is consistent
@@ -339,10 +369,11 @@ run-capretired: $(ISO_CAPRETIRED)
 test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree \
       run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
       run-heaptest run-heapoom run-heapguard \
-      run-captest run-caprevoke run-capintalloc run-capretired
+      run-captest run-caprevoke run-capintalloc run-capretired \
+      run-threadtest run-threadovf run-threadintalloc run-threadkill
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M5: all acceptance tests passed"
+	@echo "M6: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"

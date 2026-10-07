@@ -16,8 +16,9 @@
 use core::arch::asm;
 use core::mem::size_of;
 
+use crate::apic::{SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::gdt::{self, KERNEL_CODE_SELECTOR};
-use crate::interrupts::{isr_table, EXCEPTION_COUNT};
+use crate::interrupts::{isr_table, EXCEPTION_COUNT, SPURIOUS_STUB_INDEX, TIMER_STUB_INDEX};
 
 /// Total number of IDT vectors the architecture defines.
 const IDT_ENTRIES: usize = 256;
@@ -153,6 +154,22 @@ pub unsafe fn init() {
             let handler = isr_table[vector] as usize as u64;
             IDT[vector] = IdtEntry::interrupt_gate(handler, ist);
         }
+
+        // M6's two external vectors. Both use the current stack: an
+        // interrupt arriving on a thread's kernel stack is handled
+        // there, which is what makes the handler's view of "which
+        // thread was interrupted" simply "the one whose stack I am on".
+        //
+        // No IST for the timer, deliberately. An IST entry switches
+        // stacks *unconditionally*, so a timer interrupt arriving
+        // inside another timer interrupt would re-use the same stack
+        // and overwrite the outer frame. Interrupt gates already
+        // prevent that by clearing IF, but relying on two mechanisms
+        // where one suffices invites the day they disagree.
+        IDT[TIMER_VECTOR as usize] =
+            IdtEntry::interrupt_gate(isr_table[TIMER_STUB_INDEX] as usize as u64, 0);
+        IDT[SPURIOUS_VECTOR as usize] =
+            IdtEntry::interrupt_gate(isr_table[SPURIOUS_STUB_INDEX] as usize as u64, 0);
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

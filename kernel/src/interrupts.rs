@@ -36,12 +36,29 @@ use crate::qemu;
 
 /// Number of CPU-reserved exception vectors.
 ///
-/// Vectors 0..=31 are architecturally defined; 32..=255 are available for
-/// external interrupts, which arrive in a later milestone.
+/// Vectors 0..=31 are architecturally defined; 32..=255 are available
+/// for external interrupts. M6 uses two of them: the LAPIC timer on 32
+/// and the spurious vector on 255.
 ///
 /// Reference: Intel SDM Vol. 3A, Table 6-1 "Protected-Mode Exceptions and
 /// Interrupts".
 pub const EXCEPTION_COUNT: usize = 32;
+
+/// Total stubs generated: the 32 exceptions plus the two M6 needs.
+///
+/// The extra two get the same treatment as an exception -- a stub that
+/// normalises the frame and jumps to the common tail -- because a
+/// handler that has to care whether it was entered from an exception
+/// or an interrupt is a handler with two shapes.
+pub const STUB_COUNT: usize = 34;
+
+/// Index into `isr_table` for the LAPIC timer. Not the vector number:
+/// the table is dense and the timer's vector (32) happens to equal its
+/// index, while the spurious vector (255) does not.
+pub const TIMER_STUB_INDEX: usize = 32;
+
+/// Index into `isr_table` for the spurious interrupt.
+pub const SPURIOUS_STUB_INDEX: usize = 33;
 
 /// Machine state at the point an exception was taken.
 ///
@@ -316,6 +333,73 @@ fn handle_double_fault(frame: &ExceptionFrame) -> ! {
 ///
 /// Called only from the assembly stubs below, with `frame` pointing at the
 /// register block they just built on the current stack.
+/// Vector the LAPIC timer is configured to deliver on.
+///
+/// Duplicated from `apic` rather than imported, because the dispatcher
+/// must not depend on the APIC being initialised -- and a `const`
+/// assertion below keeps the two in step.
+const TIMER_VECTOR: u64 = 32;
+
+/// Vector the LAPIC uses for spurious interrupts.
+const SPURIOUS_VECTOR: u64 = 255;
+
+const _: () = {
+    assert!(
+        TIMER_VECTOR == crate::apic::TIMER_VECTOR as u64,
+        "the dispatcher and the APIC disagree about the timer vector"
+    );
+    assert!(
+        SPURIOUS_VECTOR == crate::apic::SPURIOUS_VECTOR as u64,
+        "the dispatcher and the APIC disagree about the spurious vector"
+    );
+};
+
+/// Handle the periodic timer.
+///
+/// Three things, in this order, and the order matters:
+///
+/// 1. Count the tick.
+/// 2. Acknowledge the LAPIC. Until EOI is written no further interrupt
+///    at this priority is delivered, so a handler that switches threads
+///    *before* acknowledging stops the timer for as long as the other
+///    thread runs -- which, if that thread never yields, is forever.
+/// 3. Let the scheduler decide whether to switch.
+///
+/// Step 3 may not return for a long time: it switches to another thread
+/// and comes back only when something switches here again.
+///
+/// # Safety
+///
+/// Called from the timer stub, with IF clear (interrupt gate).
+unsafe fn handle_timer() {
+    // SAFETY: Called once per timer interrupt, from its handler.
+    unsafe {
+        crate::apic::count_and_acknowledge();
+    }
+
+    // The `thread-interrupt-alloc` scenario arms a hook here. It does
+    // nothing unless armed, and when armed it panics -- which is the
+    // point: ADR 022's tripwire has never been exercised from a real
+    // interrupt handler before M6, because there were no interrupts.
+    crate::threadtest::allocate_from_handler_if_armed();
+
+    // SAFETY: We are in the timer handler with interrupts disabled.
+    unsafe {
+        crate::sched::tick();
+    }
+}
+
+/// Common dispatcher. Every stub ends up here.
+///
+/// Returning from this function makes the stub pop the saved registers and
+/// execute `iretq`, which resumes the interrupted code. For anything that is
+/// not a trap we never return: we report and exit instead, because M1 has no
+/// mechanism for resuming from a fault.
+///
+/// # Safety
+///
+/// Called only from the assembly stubs below, with `frame` pointing at the
+/// register block they just built on the current stack.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     // SAFETY: The stubs pass a pointer to the frame they pushed on the
@@ -326,9 +410,35 @@ unsafe extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     // reference: nothing here mutates the saved state.
     let frame = unsafe { &*frame };
 
+    // Every entry through this path is interrupt context, and ADR 022's
+    // rule is that interrupt context does not allocate. In M5 this
+    // counter was incremented only by a test; from M6 it is maintained
+    // for real, which is what makes the tripwire a protection rather
+    // than a gesture.
+    //
+    // Paired with `exit_interrupt` on every path out -- including the
+    // ones that never return, where it does not matter because the
+    // machine is stopping.
+    crate::memory::frame_allocator::enter_interrupt();
+
     match frame.vector {
         3 => handle_breakpoint(frame),
         8 => handle_double_fault(frame),
+        TIMER_VECTOR => {
+            // SAFETY: Entered through an interrupt gate, so IF is clear.
+            unsafe {
+                handle_timer();
+            }
+        }
+        SPURIOUS_VECTOR => {
+            // The LAPIC delivers this when an interrupt is withdrawn
+            // between being raised and being dispatched. It needs no
+            // EOI -- that is the one thing the spurious vector is
+            // specified not to want.
+            //
+            // Reference: Intel SDM Vol. 3A, 11.9 "Spurious Interrupt".
+            crate::apic::count_spurious();
+        }
         _ => {
             report(frame);
             // No fault-recovery machinery exists yet, and resuming would
@@ -342,14 +452,18 @@ unsafe extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
             );
         }
     }
+
+    crate::memory::frame_allocator::exit_interrupt();
 }
 
-// Addresses of the 32 stubs, indexed by vector. Defined by the assembly
-// below; read by `idt::init` to populate the gate descriptors.
+// Addresses of the stubs. Defined by the assembly below; read by
+// `idt::init` to populate the gate descriptors.
 // (Plain comments: rustdoc does not document items in extern blocks.)
 unsafe extern "C" {
-    // `isr_table[v]` is the entry point for vector `v`.
-    pub static isr_table: [unsafe extern "C" fn(); EXCEPTION_COUNT];
+    // `isr_table[i]` is the entry point for stub `i`. For i < 32 that
+    // is exception vector i; 32 and 33 are the timer and the spurious
+    // vector, whose actual vector numbers come from `apic`.
+    pub static isr_table: [unsafe extern "C" fn(); STUB_COUNT];
 }
 
 // ---- The stubs ---------------------------------------------------------
@@ -499,10 +613,30 @@ global_asm!(
     isr_with_error_code!(29),
     isr_with_error_code!(30),
     isr_no_error_code!(31),
+    // ---- external interrupts (M6) --------------------------------------
+    //
+    // Same shape as an exception stub: push a dummy error code, push
+    // the vector, jump to the common tail. The dispatcher then cannot
+    // tell -- and should not care -- whether it was entered from a
+    // fault or from the LAPIC.
+    //
+    // The vector numbers are written literally rather than through the
+    // macro, because the macro derives the label from the number and
+    // these two are not at their table index (255 is at index 33).
+    ".align 16",
+    "isr_stub_timer:",
+    "    push 0",
+    "    push 32",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_spurious:",
+    "    push 0",
+    "    push 255",
+    "    jmp isr_common",
     // ---- the table -----------------------------------------------------
     //
-    // A plain array of 32 absolute addresses, so Rust can index it instead
-    // of needing 32 separate `extern` declarations.
+    // A plain array of absolute addresses, so Rust can index it instead
+    // of needing one `extern` declaration per stub.
     ".section .rodata",
     ".align 8",
     ".global isr_table",
@@ -515,6 +649,7 @@ global_asm!(
     ".quad isr_stub_20, isr_stub_21, isr_stub_22, isr_stub_23",
     ".quad isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27",
     ".quad isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31",
+    ".quad isr_stub_timer, isr_stub_spurious",
 );
 
 /// Compile-time cross-check: the error-code classification used by the

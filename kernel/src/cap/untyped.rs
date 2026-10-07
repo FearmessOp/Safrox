@@ -204,6 +204,20 @@ pub unsafe fn retype(
     dest: &CNode,
     dest_offset: usize,
 ) -> Result<(), CapError> {
+    // Interrupts off for the whole call, not just phase 2 (ADR 025).
+    //
+    // The phase split is an *atomicity* argument: nothing is written
+    // until everything has been validated, so a failure leaves no
+    // partial state. It says nothing about concurrency. From M6 a
+    // timer interrupt can switch threads, and a thread that ran
+    // between phase 1 and phase 2 could move the watermark or fill a
+    // destination slot -- making phase 1's conclusions false exactly
+    // when phase 2 is relying on them.
+    //
+    // This was a real correction to ADR 025's first draft, which said
+    // "phase 2 only" and was wrong for this reason.
+    let _interrupts = crate::sched::InterruptGuard::new();
+
     // ================= PHASE 1: validate, touch nothing ==============
 
     if count == 0 {

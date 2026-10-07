@@ -18,6 +18,7 @@
 pub mod boot;
 pub mod cnode;
 pub mod cptr;
+pub mod tcb;
 pub mod untyped;
 
 use core::fmt;
@@ -317,6 +318,13 @@ pub enum CapError {
     /// A device Untyped was asked for something other than a Frame
     /// (ADR 017).
     DeviceUntypedFrameOnly { asked: CapType },
+    /// The operation would disturb a thread the scheduler is holding
+    /// (ADR 026). Suspend it first.
+    ///
+    /// Carries the state by name rather than as a `ThreadState`: this
+    /// enum is defined before `tcb` in the module graph, and the
+    /// caller wants to print it rather than match on it.
+    ThreadBusy { state: &'static str },
     /// Size, alignment or type combination is not valid.
     InvalidArgument,
 }
@@ -355,6 +363,11 @@ impl fmt::Display for CapError {
                 "DeviceUntypedFrameOnly (asked for {}, device memory may only \
                  become a Frame)",
                 asked
+            ),
+            CapError::ThreadBusy { state } => write!(
+                f,
+                "ThreadBusy (the thread is {}; suspend it first -- ADR 026)",
+                state
             ),
             CapError::InvalidArgument => write!(f, "InvalidArgument"),
         }

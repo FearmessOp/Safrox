@@ -334,6 +334,11 @@ unsafe fn unlink(slot: &mut Slot) {
 ///
 /// Both slots must be live and distinct.
 pub unsafe fn copy(src: &mut Slot, dest: &mut Slot, rights: Rights) -> Result<(), CapError> {
+    // The derivation list is doubly linked and `link_after` writes
+    // three slots. A thread switch partway through would leave another
+    // thread walking a half-connected list (ADR 025).
+    let _interrupts = crate::sched::InterruptGuard::new();
+
     if src.is_empty() {
         return Err(CapError::EmptySlot);
     }
@@ -433,6 +438,9 @@ pub unsafe fn mint(
 ///
 /// `slot` must be live.
 pub unsafe fn delete(slot: &mut Slot) -> Result<(), CapError> {
+    // `unlink` updates two neighbours; see `copy` (ADR 025).
+    let _interrupts = crate::sched::InterruptGuard::new();
+
     if slot.is_empty() {
         return Err(CapError::EmptySlot);
     }
@@ -473,6 +481,22 @@ pub struct RevokeReport {
 /// concurrently. The second condition holds because a syscall does not
 /// yield (ADR 019).
 pub unsafe fn revoke(slot: &mut Slot) -> Result<RevokeReport, CapError> {
+    // Preempt-disabled, **not** interrupt-disabled -- and the
+    // difference is ADR 019's decision, preserved deliberately.
+    //
+    // Revoke can take a very long time: the M5 measurement put the
+    // worst case at seconds, not milliseconds. Holding `cli` for that
+    // long would lose device interrupts, which ADR 019 explicitly
+    // refused. What actually needs protecting is the derivation list,
+    // and what would corrupt it is a *thread switch*, not an
+    // interrupt.
+    //
+    // So: interrupts keep arriving and are handled; the timer counts
+    // its tick and defers the switch. ADR 025 names this as the second
+    // kind of protected region and the acceptance test prints IF=1
+    // here to show it is the kind in use.
+    let _preempt = crate::sched::PreemptGuard::new();
+
     if slot.is_empty() {
         return Err(CapError::EmptySlot);
     }

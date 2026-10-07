@@ -3,11 +3,16 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M5 — Capabilities.** Every kernel resource is now an
-object named by a capability in a CNode slot. Untyped memory, `retype`,
-`copy`, `delete` and `revoke` all work; a CPtr resolves in a bounded
-number of steps with no loop; and at the end of boot the frame allocator
-is **retired**, so the only way to obtain memory is to retype an Untyped.
+**Current milestone: M6 — Threads and preemption.** Threads are TCB
+objects retyped from Untyped memory, each with its own kernel stack and
+guard page. A round-robin scheduler switches between them, and the LAPIC
+timer takes the CPU away from a thread that will not give it up.
+
+The change that reaches furthest is not the scheduler: **interrupts are
+enabled for the first time since M2**. Every soundness argument written
+under "the kernel runs with IF clear" stopped holding at that `sti`, and
+[ADR 025](docs/adr/025-kesme-disiplini.md) replaces the vanished
+assumption with a list of named regions.
 
 The design is seL4's, with three departures named in the ADRs: one
 PageTable type instead of four ([017](docs/adr/017-nesne-kumesi.md)),
@@ -69,7 +74,11 @@ cloned into `third_party/` automatically.
 | `make run-caprevoke` | Times a revoke over the widest, deepest tree; **must** exit 33 |
 | `make run-capintalloc` | Allocating from an interrupt is refused; **must** exit 35 |
 | `make run-capretired` | Allocating after retirement is refused; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all nineteen scenarios, runner self-test |
+| `make run-threadtest` | Thread and scheduler suite; **must** exit 33 |
+| `make run-threadovf` | A thread runs off its own stack → #DF; **must** exit 35 |
+| `make run-threadintalloc` | Allocating inside a *real* timer interrupt; **must** exit 35 |
+| `make run-threadkill` | Operating on a running thread is refused; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all twenty-three scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -77,10 +86,10 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M5 acceptance criteria
+## M6 acceptance criteria
 
-Nineteen scenarios, all booting the **same** `kernel.elf` through different
-Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
+Twenty-three scenarios, all booting the **same** `kernel.elf` through
+different Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
 
@@ -611,6 +620,123 @@ later.
 
 how far the heap has grown.
 
+### Threads and the scheduler — `make run-threadtest`, exit 33
+
+Nine checks. The TCB's shape; the interrupt flag in each kind of region;
+two threads handing off on separate stacks; the timer; preemption;
+suspend and resume; `ReadRegisters`; and ADR 026's two-step kill.
+
+```
+[sched] boot thread adopted: tcb at 0x000000000ffde800,
+        stack 0xffffc80000006000..0xffffc8000000a000
+[apic] legacy 8259 PICs masked (all 16 lines)
+[apic] lapic id 0, version 0x50014, registers at 0xffffd00000000000
+[apic] timer: 100 Hz on vector 32, divisor 16, initial count 166392
+       (calibrated to 16639200 ticks/s)
+[boot] interrupts enabled; the "IF is always clear" assumption that held
+       from M2 to M5 is now replaced by ADR 025's named regions
+
+[thread] tcb: 2048 B, 2048-byte aligned, 64 B context, 1024 B reserved
+         for the IPC buffer
+[thread] IF discipline: inside an InterruptGuard, IF=0
+[thread] IF discipline: nested guards do not re-open the outer region
+[thread] IF discipline: inside a PreemptGuard, IF=1 and preemption is off
+         -- this is what revoke uses (ADR 019)
+[thread] cooperative: 200 rounds over 300 switches; A at 0xffffc8000000efe0
+         (ran 100x, kstack slot 2), B at 0xffffc80000013fe0 (ran 100x,
+         kstack slot 3); neither RSP is in the other's stack
+[thread] timer: 100 interrupts taken, 101 ticks processed, 0 deferred by
+         preempt-disabled regions, 0 spurious
+[thread] preemption: the spinner started with IF=1, ran 263620 iterations
+         without yielding; 1 ticks and 2 switches brought control back here
+[thread] ReadRegisters: suspended thread at rip=0xffffffff800086ca,
+         rsp=0xffffc8000000efe0 (inside its own stack), 102 switches,
+         priority 42 (stored, not used -- ADR 024)
+[thread] switch cost: 10000 switches in 3282006 TSC cycles (328 cycles each)
+```
+
+**The preemption line is the only one that cannot be faked.** Every other
+check here would pass on a purely cooperative kernel. The spinning thread
+calls nothing, yields nothing, and hints nothing — so if control ever
+returns to the test, something took the CPU away from it, and the only
+thing that can is the timer. The tick count is asserted for that reason.
+
+**`revoke` runs with interrupts on.** That looks like an oversight and is
+a decision: [ADR 019](docs/adr/019-derivation-tree.md) measured revoke at
+up to 6787 ms, and dropping device interrupts for that long is not
+acceptable. What must not happen during a revoke is a *thread switch*, so
+there are two separate mechanisms —
+
+| | Interrupts taken | Threads switched |
+|---|---|---|
+| `InterruptGuard` (`cli`) | no | no |
+| `PreemptGuard` | **yes** | no |
+
+— and the test observes which one `revoke` is in, rather than asserting it
+in the abstract.
+
+### Thread stack overflow — `make run-threadovf`, exit 35
+
+M3 already overflowed a stack, but that was the kernel's main stack,
+mapped by `vm::init`. This one is retyped from an Untyped and mapped for
+a TCB: a different path to the same guard page.
+
+```
+[thread] overflowing: stack 0xffffc8000000b000..0xffffc8000000f000,
+         rsp now 0xffffc8000000efa0
+[thread] depth 88, rsp 0xffffc8000000d3d0
+
+*** EXCEPTION: #DF double fault (vector 8) ***
+[trap] IST1: ok
+```
+
+The thread names its own stack **before** overflowing. The #DF handler
+cannot do it afterwards: by then the thread's stack is unusable, and
+`sched::current()` would have to be trusted on a machine that has just
+proved it cannot be.
+
+Writing the driver for this test taught something about the rest of M6.
+The first version handed the CPU over once and expected never to get it
+back. It got it back immediately — the timer preempts the victim
+mid-recursion, long before the guard page is reached. That is preemption
+working, and the test had assumed it away.
+
+### Allocation inside a real interrupt — `make run-threadintalloc`, exit 35
+
+```
+[thread] armed; waiting for the next timer tick (must panic in the handler)
+[thread] inside the timer handler, in_interrupt=true; calling allocate()
+*** KERNEL PANIC ***
+[PANIC] frame allocation from inside an interrupt handler. Handlers must
+        not allocate: there is no sensible behaviour when memory runs out
+        in an interrupt, and the allocator is not reentrant. See ADR 022.
+```
+
+M5 tested this by driving the depth counter by hand, because there were
+no interrupts to be inside of. This is the real path: the LAPIC raises
+the interrupt, the CPU dispatches to the handler, and the allocation
+happens there. ADR 022's tripwire was written in M5 and runs for the
+first time here.
+
+### Operating on a running thread — `make run-threadkill`, exit 35
+
+```
+[thread] the victim is Ready; attempting SetRegisters
+[thread] refused with ThreadBusy(Ready), as ADR 026 requires
+[thread] after Suspend the same call succeeds: the refusal is a
+         sequencing requirement, not a dead end
+```
+
+What should happen when something tries to destroy a thread the scheduler
+is holding? Both answers are defensible —
+[ADR 026](docs/adr/026-tcb-yasam-dongusu.md) picks **refuse**, and the
+point of the ADR is that "undefined" was not on the list.
+
+Refusing is only acceptable because it cannot trap a caller. `Suspend`
+*always* succeeds, in every state, so the two-step sequence always
+terminates. The scenario shows both halves: the refusal, then the same
+call succeeding after a suspend. A refusal with no path through it would
+be a denial-of-service vector rather than a safety property.
 
 ### Deliberate panic — `make run-panic`, exit 35
 
@@ -702,10 +828,14 @@ kernel/src/cap/cnode.rs     Slot (32 B), the derivation list, copy/mint/delete/r
 kernel/src/cap/cptr.rs      CPtr resolution: two levels, two generations, no loop
 kernel/src/cap/untyped.rs   retype: two phases, atomic, always zeroes
 kernel/src/cap/boot.rs      Root Untypeds, the init CSpace, allocator retirement
+kernel/src/cap/tcb.rs       TCB: context, states, SetRegisters/ReadRegisters/SetPriority
+kernel/src/sched.rs     switch_context, round-robin, InterruptGuard, PreemptGuard
+kernel/src/apic.rs      LAPIC, timer calibrated against the TSC, legacy PIC masking
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
 kernel/src/vmtest.rs    Virtual memory acceptance tests and negative scenarios
 kernel/src/heaptest.rs  Kernel heap acceptance tests and negative scenarios
 kernel/src/captest.rs   Capability acceptance tests, the revoke measurement, two tripwires
+kernel/src/threadtest.rs  Thread and scheduler tests, the switch measurement, three scenarios
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -812,6 +942,98 @@ tasarım hatası yüzünden yeniden yazıldı (aşağıya bakın). 019'un en kö
 durum tahmini ölçüldü ve **120 kat yanlış** çıktı. 022'ye heap rezervinin
 sıralaması ve sayfa tablolarının maliyeti eklendi; 017'ye ölçülen
 boyutlar yazıldı.
+
+M6:
+
+- [024 — Zamanlayıcı kernel'de: geçici, ve çıkış planı](docs/adr/024-zamanlayici-kernelde.md)
+- [025 — IF disiplini: kesmeler ilk kez açılıyor](docs/adr/025-kesme-disiplini.md)
+- [026 — TCB yaşam döngüsü: çalışan bir thread'i yok etmek](docs/adr/026-tcb-yasam-dongusu.md)
+
+024 ve 025 ikisi de uygulama sırasında düzeltildi: 024'e ölçülen bağlam
+değiştirme maliyeti (switch başına 328 çevrim) ve testlerin artık
+deterministik olmadığı; 025'e iki ayrı kaydedilmiş hata — biri yazarken,
+biri çalıştırırken bulundu.
+
+## What M6 cost: two mistakes about where interrupts are not
+
+Both were about the same thing, found a day apart, and the second was
+the expensive one.
+
+### Writing: "phase 2 is enough" was the wrong unit
+
+ADR 025's first draft said `retype`'s second phase needs `cli` and the
+first does not, because phase 1 writes nothing. That is true and
+irrelevant.
+
+The phase split is an **atomicity** argument, not a concurrency one.
+Phase 1's job is to *prove* phase 2 cannot fail — watermark sufficient,
+destinations empty, depth within bounds — and phase 2 then writes
+without checking anything. An interrupting thread that advances the
+watermark invalidates the proof, and phase 2 never notices. What needs
+protecting is not phase 2 but **the lifetime of phase 1's proof**, which
+begins at the top of phase 1.
+
+Caught by writing the ADR. The cost was a paragraph.
+
+### Running: a thread that starts with interrupts disabled
+
+Every context switch happens inside a `cli` region, and the `sti` that
+ends it sits on the line *after* `switch_context` returns. A thread that
+has run before resumes exactly there. A thread that has **never** run
+does not: its saved RIP is its entry point, and the switch's `ret` goes
+straight there, past every `sti` on the way.
+
+Such a thread runs with IF clear for its whole life. And if it never
+yields, nothing can take the CPU back — the timer meant to preempt it is
+masked in its own RFLAGS. The scheduler was working perfectly; the
+interrupt simply never arrived.
+
+The fix is three instructions. A new thread starts at a trampoline that
+executes `sti` and jumps to the real entry point, carried in R12 so the
+ordinary context load delivers it.
+
+Two things about this are worth more than the bug.
+
+**Only one test could have found it.** The cooperative hand-off test
+passed throughout, because threads that call `yield_now` enter the
+region and so reach the `sti`. It took a thread that yields *nothing* —
+and that check exists only because the acceptance criteria demanded one.
+
+**The first attempt to test it did not work.** The obvious guard is "did
+the thread start with IF=1?", checked after control returns. Mutation
+testing showed it never ran: reaching it requires `yield_now` to return,
+and the definition of the bug is that it does not. The check was correct
+exactly when it was unnecessary.
+
+When a bug's consequence is *having no CPU left to observe it with*, no
+observation of the consequence can be a test. The invariant has to be
+checked before the CPU is handed over — on the stopped thread, through
+`ReadRegisters`, against the trampoline's address. Measured difference:
+a thirty-second silent timeout became a 0.9-second panic naming its own
+cause and the ADR that explains it.
+
+### And one flaky test, which was neither
+
+`make test` failed once in roughly twenty-eight runs on a line that had
+nothing wrong with it: the ping-pong test printed `201 rounds` where
+`run.py` demanded `200`.
+
+Each thread increments the counter and only then looks at it. The one
+that reaches 200 suspends itself — but its partner may still be on the
+ready queue, and a timer tick runs it once more before it stops too.
+With two threads the overshoot is exactly one.
+
+The tempting fix is `\d+`, which also accepts 202 — and 202 would mean a
+thread ran *after* suspending itself, the one thing `suspend` promises
+not to allow. So the bound is asserted instead, in the kernel and in the
+runner both: `rounds <= 201`, pattern `20[01]`. Sixty consecutive runs
+clean.
+
+This is M6's general tax, and it is worth stating separately from the
+bug: **until M5 every acceptance test printed identical numbers on every
+boot, because nothing could interrupt the kernel.** That is over. The
+question to ask of a printed number is no longer "is this the value?"
+but "what are its bounds, and why?"
 
 ## The object model
 
@@ -1068,8 +1290,40 @@ in [ADR 007](docs/adr/007-bitmap-frame-allocator.md); becomes wrong the
 moment a second CPU starts.
 
 **`ACPI_RECLAIMABLE` is still untouched.** The tables have not been read
-yet and M6/M7 will need them. Unchanged from
+yet. M6 did not need them — the LAPIC's base comes from the
+`IA32_APIC_BASE` MSR rather than from the MADT, which is enough for one
+CPU. **M7** needs the MADT to find the others. Unchanged from
 [ADR 008](docs/adr/008-bootloader-reclaimable-dokunulmaz.md).
+
+**The serial port has no lock.** Interrupts are enabled now, so a handler
+that printed while the kernel was mid-line would interleave with it and
+break `run.py`'s line matching. M6 is safe because the timer handler is
+silent — but that is a property of this handler, not of the driver. The
+first noisy one needs a lock. Named in
+[ADR 025](docs/adr/025-kesme-disiplini.md).
+
+**Threads have no FPU or SSE state.** Space is reserved in the TCB and
+nothing is saved. Kernel threads do not use SSE — the build passes
+`-mno-sse` — so there is nothing to lose yet. **M8's** user threads make
+this mandatory.
+
+**Every thread shares the kernel's address space.** There is no VSpace
+field in the TCB, and a context switch changes RSP and RIP but not CR3.
+**M11**.
+
+**The scheduler is policy, and policy does not belong in a microkernel.**
+Round-robin, a 10 ms quantum, and a priority field that is stored but
+never read. It is in the kernel because a user-space scheduler needs IPC
+(M9) and ring 3 (M8), and M6 has neither.
+[ADR 024](docs/adr/024-zamanlayici-kernelde.md) names the three functions
+that leave in **M10** and the mechanism that stays.
+
+**Threads cannot be destroyed, only suspended.** `Suspend` works and
+revoking a suspended thread's TCB works, but nothing unmaps the stack or
+returns the KSTACK slot — a thread's memory is reclaimed only when its
+whole Untyped is revoked. Proper teardown needs the zombie state that
+[ADR 026](docs/adr/026-tcb-yasam-dongusu.md) deferred, and the IPC
+blocking semantics that give it meaning. **M9.**
 
 **No 5-level paging (LA57).** The address map assumes 48-bit virtual
 addresses. Enabling LA57 would move the kernel half's base. Deliberate;
@@ -1085,14 +1339,10 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: external
-interrupts (the PIC is still masked as Limine left it), threads and
-scheduling, user-mode segments and ring 3, user space, and IPC.
-
-The capability object model is **designed but not implemented**: the
-eight types, the CPtr format, the derivation tree and the rights
-semantics are fixed in [docs/object-model.md](docs/object-model.md) and
-ADRs 017–023. No code exists yet; that is M5.
+Deliberately absent, each belonging to a later milestone: device
+interrupts beyond the timer (the legacy PICs are masked and the IOAPIC
+is untouched), other CPUs, user-mode segments and ring 3, user space,
+and IPC.
 
 Everything *present* but incomplete is in **Known gaps** above, with the
 milestone that owes it. Everything that cannot be verified under QEMU is

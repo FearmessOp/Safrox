@@ -210,6 +210,47 @@ CAP_INIT_LINES = [
     ),
 ]
 
+# M6 brings up threads and interrupts on every boot. Required
+# everywhere below the capability system, because from here on every
+# line of the kernel runs with interrupts enabled -- the assumption
+# that held from M2 to M5 is gone and these lines are the evidence
+# that what replaced it is in place.
+THREAD_INIT_LINES = [
+    # The boot thread gets a TCB before anything can switch. Without
+    # it the first timer tick would have nowhere to save registers.
+    re.compile(
+        r"^\[cap\] boot tcb: object slot \d+, stack 0x[0-9a-f]{16} \.\. "
+        r"0x[0-9a-f]{16} \(the main stack, mapped by vm::init\)",
+        re.M,
+    ),
+    re.compile(
+        r"^\[sched\] boot thread adopted: tcb at 0x[0-9a-f]{16}, stack "
+        r"0x[0-9a-f]{16}\.\.0x[0-9a-f]{16}",
+        re.M,
+    ),
+    # The legacy PIC must be masked before IF is set: the 8259s deliver
+    # to vectors that overlap the CPU's own exceptions, so a stray IRQ0
+    # would arrive as #DF.
+    re.compile(r"^\[apic\] legacy 8259 PICs masked \(all 16 lines\)", re.M),
+    re.compile(
+        r"^\[apic\] lapic id \d+, version 0x[0-9a-f]+, registers at "
+        r"0xffffd00000000000 \(phys 0x[0-9a-f]{16}\)",
+        re.M,
+    ),
+    # 100 Hz on vector 32. Requiring the vector rules out a timer
+    # wired to a vector the IDT does not populate, which would fault
+    # rather than tick.
+    re.compile(
+        r"^\[apic\] timer: 100 Hz on vector 32, divisor 16, initial count "
+        r"\d+ \(calibrated to \d+ ticks/s\)",
+        re.M,
+    ),
+    re.compile(
+        r"^\[boot\] interrupts enabled; the \"IF is always clear\" assumption",
+        re.M,
+    ),
+]
+
 # The poison pattern, as it appears when something follows a pointer into
 # reclaimed bootloader memory. Forbidden everywhere: 0xDE was chosen so that
 # a stale pointer produces a non-canonical address and an immediate fault
@@ -228,7 +269,7 @@ EXPECTATIONS = {
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
             *CAP_INIT_LINES,
-            re.compile(r"^\[boot\] M5 checks passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -247,7 +288,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M5 checks passed", re.M)],
+        forbidden=[re.compile(r"M6 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -264,7 +305,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M5 checks passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -283,7 +324,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M5 checks passed", re.M)],
+        forbidden=[re.compile(r"M6 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -302,7 +343,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -361,7 +402,7 @@ EXPECTATIONS = {
             # frames -- it panicked with "could not find 2 contiguous
             # frames for a CNode" when this ran to completion. Requiring
             # the line's *absence* keeps the two facts tied together.
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
         ],
     ),
     "doublefree": Expectation(
@@ -381,7 +422,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -429,7 +470,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M5 checks passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -474,7 +515,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -503,7 +544,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -559,7 +600,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
@@ -644,7 +685,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
-            re.compile(r"^\[boot\] M5 checks passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -678,7 +719,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             # A null return instead of a panic: out of memory must be loud.
             re.compile(r"returned null instead of panicking", re.M),
             # The heap handing out more than its limit would mean the bound
@@ -707,7 +748,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"the heap's upper guard page did not fault", re.M),
         ],
     ),
@@ -866,7 +907,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[captest\] all capability tests passed", re.M),
-            re.compile(r"^\[boot\] M5 checks passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant above is an assert, so a violation is a
@@ -931,7 +972,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"the ADR 022 tripwire is not working", re.M),
         ],
     ),
@@ -953,8 +994,251 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M5 checks passed", re.M),
+            re.compile(r"M6 checks passed", re.M),
             re.compile(r"the ADR 022 retirement check is not working", re.M),
+        ],
+    ),
+    # --- M6: threads and interrupts --------------------------------------
+    "threadtest": Expectation(
+        name="threads and the scheduler",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # 1. The TCB is the object ADR 017 fixed.
+            re.compile(
+                r"^\[thread\] tcb: 2048 B, 2048-byte aligned, 64 B context, "
+                r"1024 B reserved for the IPC buffer",
+                re.M,
+            ),
+            # 2. The interrupt flag, in each of the three kinds of
+            #    region ADR 025 names. The third is the one that would
+            #    be easy to get wrong by being too careful: revoke runs
+            #    with interrupts *on*.
+            re.compile(
+                r"^\[thread\] IF discipline: ordinary kernel code runs with IF=1",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] IF discipline: inside an InterruptGuard, IF=0",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] IF discipline: nested guards do not re-open the "
+                r"outer region",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] IF discipline: inside a PreemptGuard, IF=1 and "
+                r"preemption is off",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] IF discipline: revoke ran and left IF=1",
+                re.M,
+            ),
+            # 3. Two threads, two stacks, 200 handoffs. Requiring both
+            #    KSTACK slot numbers rules out two threads sharing one
+            #    stack, which every other check here would survive.
+            #
+            #    200 or 201, and the alternation is the point rather
+            #    than laziness. Each thread increments the counter and
+            #    only then looks at it, so the one that reaches 200
+            #    suspends itself while its partner may still be on the
+            #    ready queue -- a timer tick runs it once more before
+            #    it notices. With two threads the overshoot is exactly
+            #    one. `\d+` here would also accept 202, which would
+            #    mean a thread ran after suspending itself; the kernel
+            #    asserts the same bound, and this pattern is the
+            #    outside check on it.
+            #
+            #    Before M6 the figure was deterministic because nothing
+            #    could interrupt a thread between the increment and the
+            #    test. Enabling interrupts made the exact value a
+            #    timing accident -- an intermittent failure in roughly
+            #    one run in thirty, which is how this was found.
+            re.compile(
+                r"^\[thread\] cooperative: 20[01] rounds over \d+ switches; A "
+                r"at 0x[0-9a-f]{16} \(ran \d+x, kstack slot 2\), B at "
+                r"0x[0-9a-f]{16} \(ran \d+x, kstack slot 3\); neither RSP is "
+                r"in the other's stack",
+                re.M,
+            ),
+            # 4. The timer fires, and keeps firing -- a handler that
+            #    forgets its EOI delivers exactly one interrupt.
+            re.compile(
+                r"^\[thread\] timer: \d{3,} interrupts taken, \d+ ticks "
+                r"processed, \d+ deferred by preempt-disabled regions, 0 "
+                r"spurious",
+                re.M,
+            ),
+            # 5. Preemption, which is the whole reason for the timer: a
+            #    thread that never yields is still taken off the CPU.
+            #
+            #    "started with IF=1" is required text, not decoration.
+            #    A thread whose first instruction runs with interrupts
+            #    disabled can never be preempted, and if it also never
+            #    yields it holds the CPU permanently -- the timer is
+            #    masked in its own RFLAGS. That was a real bug (ADR
+            #    025): the sti that ends a switch's cli region sits on
+            #    the line after switch_context returns, which a thread
+            #    that has never run does not pass through. It showed up
+            #    as a thirty-second hang. Requiring the flag's value
+            #    here turns a repeat into a named failure.
+            re.compile(
+                r"^\[thread\] preemption: the spinner started with IF=1, ran "
+                r"\d+ iterations without yielding; \d+ ticks and \d+ switches "
+                r"brought control back here",
+                re.M,
+            ),
+            # 6. Suspend takes a thread out of the rotation.
+            re.compile(
+                r"^\[thread\] suspend/resume: a suspended thread was skipped "
+                r"by \d+ yields, then resumed and ran again",
+                re.M,
+            ),
+            # 7. ReadRegisters, with RSP checked against *that thread's*
+            #    stack -- the check that catches a switch saving the
+            #    wrong RSP.
+            re.compile(
+                r"^\[thread\] ReadRegisters: suspended thread at "
+                r"rip=0xffffffff[0-9a-f]{8}, rsp=0x[0-9a-f]{16} \(inside its "
+                r"own stack\), \d+ switches, priority 42 \(stored, not used",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] invocations: \d+ went through the capability path",
+                re.M,
+            ),
+            # 8. ADR 026's two-step kill.
+            re.compile(
+                r"^\[thread\] kill a running thread: SetRegisters and Resume "
+                r"both give ThreadBusy; Suspend always works",
+                re.M,
+            ),
+            # The measurement. M9's IPC will be compared against it, so
+            # the caveat about emulation is required text, not decoration.
+            re.compile(
+                r"^\[thread\] switch cost: \d+ switches in \d+ TSC cycles "
+                r"\(\d+ cycles each\)",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] switch cost: ~\d+ ns at 3 GHz -- measured under "
+                r"emulation, where the TSC is virtual and the figure is an "
+                r"order of magnitude, not a measurement",
+                re.M,
+            ),
+            re.compile(r"^\[thread\] all thread tests passed", re.M),
+            re.compile(r"^\[boot\] M6 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "threadovf": Expectation(
+        name="thread stack overflow",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            # The thread names its own stack before overflowing. The
+            # #DF handler cannot do it afterwards: by then the thread's
+            # stack is unusable and anything read through it is
+            # suspect.
+            re.compile(
+                r"^\[thread\] overflowing: stack 0xffffc800[0-9a-f]{8}\.\."
+                r"0xffffc800[0-9a-f]{8}, rsp now 0xffffc800[0-9a-f]{8}",
+                re.M,
+            ),
+            # RSP must actually descend. A recursion the optimiser
+            # turned into a loop would never reach the guard, and the
+            # test would hang rather than fault -- which is how M3's
+            # version of this passed for the wrong reason.
+            re.compile(r"^\[thread\] depth 8, rsp 0xffffc800[0-9a-f]{8}", re.M),
+            re.compile(r"^\[thread\] depth \d{2,}, rsp 0xffffc800[0-9a-f]{8}", re.M),
+            # And then #DF on IST1, for the same reason as M3's main
+            # stack overflow: delivering the #PF needs the stack that
+            # just ran out.
+            re.compile(r"^\*\*\* EXCEPTION: #DF double fault \(vector 8\) \*\*\*", re.M),
+            re.compile(r"^\[trap\] IST1: ok\s*$", re.M),
+            re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"IST1: NOT ACTIVE", re.M),
+            re.compile(r"the thread returned from an infinite recursion", re.M),
+        ],
+    ),
+    "threadintalloc": Expectation(
+        name="allocation inside a real interrupt",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[thread\] armed; waiting for the next timer tick",
+                re.M,
+            ),
+            # The interrupt-depth tripwire must read true *inside the
+            # handler*. M5's version of this test set the counter by
+            # hand because there were no interrupts; this is the path
+            # that matters.
+            re.compile(
+                r"^\[thread\] inside the timer handler, in_interrupt=true; "
+                r"calling allocate\(\) \(must panic\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] frame allocation from inside an interrupt handler",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"does not work on the path that matters", re.M),
+            re.compile(r"no timer interrupt arrived within the deadline", re.M),
+        ],
+    ),
+    "threadkill": Expectation(
+        name="operate on a running thread",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[thread\] the victim is (Ready|Running); attempting "
+                r"SetRegisters",
+                re.M,
+            ),
+            re.compile(
+                r"^\[thread\] refused with ThreadBusy\((Ready|Running)\), as "
+                r"ADR 026 requires",
+                re.M,
+            ),
+            # The refusal must not be a dead end: ADR 026's whole
+            # argument for choosing "refuse" over "force" rests on the
+            # second step always working.
+            re.compile(
+                r"^\[thread\] after Suspend the same call succeeds: the "
+                r"refusal is a sequencing requirement, not a dead end",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] thread-kill-running completed its checks",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"instead of ThreadBusy", re.M),
         ],
     ),
 }
