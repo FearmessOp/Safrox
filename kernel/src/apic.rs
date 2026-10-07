@@ -50,6 +50,12 @@ mod reg {
     pub const EOI: usize = 0x0B0;
     /// Spurious interrupt vector. Bit 8 is the software enable.
     pub const SPURIOUS: usize = 0x0F0;
+    /// Interrupt command register, low dword. Writing it **sends**
+    /// the IPI, so it must be written last.
+    pub const ICR_LOW: usize = 0x300;
+    /// Interrupt command register, high dword: the destination APIC
+    /// ID, in bits 56..=63 of the 64-bit register.
+    pub const ICR_HIGH: usize = 0x310;
     /// Timer's entry in the local vector table.
     pub const LVT_TIMER: usize = 0x320;
     /// Initial count: writing a non-zero value starts the timer.
@@ -76,6 +82,51 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// 32 is the first vector after the CPU's reserved range (ADR 006's
 /// 0..=31), so it cannot be confused with an exception.
 pub const TIMER_VECTOR: u8 = 32;
+
+/// First vector carrying a user-owned interrupt line (M10, ADR 042).
+///
+/// Lines are delivered on consecutive vectors starting here, so
+/// vector = `IRQ_VECTOR_BASE + irq`. A flat offset rather than a
+/// lookup table: the dispatcher runs in interrupt context and a
+/// subtraction is cheaper than a search, and with the IOAPIC in M12
+/// the redirection entry is programmed with exactly this arithmetic.
+pub const IRQ_VECTOR_BASE: u8 = 33;
+
+/// How many consecutive vectors are reserved for interrupt lines.
+///
+/// Matches `cap::irq::MAX_IRQ`, checked below. Two tables that must
+/// agree are two tables that will eventually disagree, so the build
+/// is what keeps them together.
+pub const IRQ_VECTOR_COUNT: usize = crate::cap::irq::MAX_IRQ;
+
+const _: () = {
+    assert!(
+        IRQ_VECTOR_BASE as usize > TIMER_VECTOR as usize,
+        "the IRQ vectors must not overlap the timer"
+    );
+    assert!(
+        IRQ_VECTOR_BASE as usize + IRQ_VECTOR_COUNT <= SPURIOUS_VECTOR as usize,
+        "the IRQ vector range runs into the spurious vector"
+    );
+};
+
+/// Which line a vector carries, or `None` if it is not an IRQ vector.
+pub const fn vector_to_irq(vector: u8) -> Option<u8> {
+    if vector < IRQ_VECTOR_BASE {
+        return None;
+    }
+    let irq = vector - IRQ_VECTOR_BASE;
+    if (irq as usize) < IRQ_VECTOR_COUNT {
+        Some(irq)
+    } else {
+        None
+    }
+}
+
+/// Which vector a line is delivered on.
+pub const fn irq_to_vector(irq: u8) -> u8 {
+    IRQ_VECTOR_BASE + irq
+}
 
 /// Bit 17 of the timer LVT: periodic mode.
 ///
@@ -155,6 +206,119 @@ pub unsafe fn count_and_acknowledge() {
 /// Reference: Intel SDM Vol. 3A, 11.9 "Spurious Interrupt".
 pub fn count_spurious() {
     SPURIOUS_INTERRUPTS.fetch_add(1, Ordering::AcqRel);
+}
+
+// ---- Raising an interrupt on demand (M10) ------------------------------
+//
+// M10 needs a real interrupt it can trigger at a chosen moment. The
+// alternatives were both worse:
+//
+// * A *device* interrupt arrives when the device decides. Scenario 4
+//   has to show that no second interrupt is delivered before `Ack`,
+//   and with a device the kernel does not control when the second one
+//   would have arrived -- so "none came" could mean the mask worked or
+//   merely that nothing was sent. That is ADR 023's K8 exactly: a test
+//   must not depend on the timing of the thing it measures.
+// * Calling `handle_interrupt` directly would test the function and
+//   not the path. The IDT, the stub, the dispatcher and the
+//   interrupt-depth tripwire would all be skipped, and those are
+//   where M10's mistakes would live.
+//
+// A self-IPI is a genuine CPU-delivered interrupt -- same IDT entry,
+// same stub, same dispatcher, same EOI -- that arrives exactly when
+// the kernel asks for it.
+
+/// Delivery mode 000: fixed, i.e. deliver this vector as written.
+const ICR_DELIVERY_FIXED: u32 = 0b000 << 8;
+
+/// Destination mode 0: physical (the destination field is an APIC ID).
+const ICR_DEST_PHYSICAL: u32 = 0 << 11;
+
+/// Level 1: assert. Required for every delivery mode except INIT
+/// de-assert, which this never uses.
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+
+/// Destination shorthand 01: "self". The IPI goes to the sending
+/// LAPIC, so the ICR's destination field is ignored.
+///
+/// Reference: Intel SDM Vol. 3A, Figure 11-12 "Interrupt Command
+/// Register", bits 19:18.
+const ICR_SHORTHAND_SELF: u32 = 0b01 << 18;
+
+/// Bit 12, delivery status: 1 while a previous IPI is still being
+/// sent. Read-only.
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
+
+/// Raise `vector` on this CPU, through the LAPIC.
+///
+/// Returns once the LAPIC has accepted the IPI. The interrupt itself
+/// is delivered when IF next permits it — so a caller holding an
+/// [`crate::sched::InterruptGuard`] will see it fire when the guard
+/// drops, which is what makes the delivery moment precise.
+///
+/// # Safety
+///
+/// `vector` must have an IDT entry. A vector without one raises #GP
+/// inside interrupt delivery, which is a double fault.
+pub unsafe fn send_self_ipi(vector: u8) {
+    // Wait for any previous IPI to be accepted. Bounded rather than
+    // open: an IPI that never clears means the LAPIC is wedged, and
+    // spinning on it forever would be exactly the unbounded kernel
+    // loop the master prompt forbids.
+    const MAX_SPINS: u32 = 1_000_000;
+    let mut spins = 0u32;
+    // SAFETY: ICR_LOW is readable and the APIC is enabled by `init`.
+    while unsafe { read(reg::ICR_LOW) } & ICR_DELIVERY_PENDING != 0 {
+        core::hint::spin_loop();
+        spins += 1;
+        assert!(
+            spins < MAX_SPINS,
+            "a previous IPI has been pending for {} spins; the local APIC \
+             is not accepting interrupt commands",
+            MAX_SPINS
+        );
+    }
+
+    // SAFETY: The high dword is ignored under the "self" shorthand,
+    // but it is written anyway so the register is never left holding
+    // a stale destination for some later caller that does not use a
+    // shorthand.
+    unsafe {
+        write(reg::ICR_HIGH, 0);
+    }
+
+    // The low dword **last**: writing it is what sends the IPI.
+    //
+    // SAFETY: A fixed-mode, physical, asserted, self-directed IPI on
+    // a vector the caller guarantees has an IDT entry. Every
+    // reserved bit is left zero.
+    //
+    // Reference: Intel SDM Vol. 3A, 11.6.1 "Interrupt Command
+    // Register".
+    unsafe {
+        write(
+            reg::ICR_LOW,
+            ICR_DELIVERY_FIXED
+                | ICR_DEST_PHYSICAL
+                | ICR_LEVEL_ASSERT
+                | ICR_SHORTHAND_SELF
+                | vector as u32,
+        );
+    }
+}
+
+/// Raise the interrupt for an IRQ line.
+///
+/// # Safety
+///
+/// As [`send_self_ipi`]; `irq` must be below
+/// [`crate::cap::irq::MAX_IRQ`].
+pub unsafe fn raise_irq(irq: u8) {
+    debug_assert!((irq as usize) < IRQ_VECTOR_COUNT);
+    // SAFETY: `idt::init` installs a gate for every IRQ vector.
+    unsafe {
+        send_self_ipi(irq_to_vector(irq));
+    }
 }
 
 /// Read a LAPIC register.

@@ -246,6 +246,10 @@ fn encode_error(error: CapError) -> u64 {
         CapError::ReplyTargetGone => 26,
         CapError::NotificationBusy => 27,
         CapError::AlreadyBound => 28,
+        // M10. Appended, for the same reason as M9's block above: a
+        // component that has learned what 21 means must not find it
+        // meaning something else after a kernel upgrade.
+        CapError::IrqAlreadyOwned { .. } => 29,
     };
     ERROR_FLAG | code
 }
@@ -285,6 +289,18 @@ pub enum Method {
     /// round trip works at all, and proving that with an invocation
     /// would entangle two failures.
     Echo = 3,
+    /// Block until a Notification is signalled. Takes a Notification.
+    ///
+    /// Added in M10, and it is the first invocation that **blocks**.
+    /// Everything before it answered and returned; this one parks the
+    /// calling thread until something signals, which is what lets a
+    /// ring-3 driver wait for its device rather than poll for it.
+    ///
+    /// That works without special handling because a syscall runs on
+    /// the calling thread's own kernel stack (ADR 029): blocking saves
+    /// the context there like any other switch, and the return to
+    /// ring 3 happens whenever the thread is resumed.
+    Wait = 4,
 }
 
 impl Method {
@@ -293,6 +309,7 @@ impl Method {
             1 => Some(Method::ReadRegisters),
             2 => Some(Method::SetPriority),
             3 => Some(Method::Echo),
+            4 => Some(Method::Wait),
             _ => None,
         }
     }
@@ -302,6 +319,27 @@ impl Method {
             Method::ReadRegisters => "ReadRegisters",
             Method::SetPriority => "SetPriority",
             Method::Echo => "Echo",
+            Method::Wait => "Wait",
+        }
+    }
+
+    /// What type of capability this method may be invoked on.
+    ///
+    /// A property of the method rather than a constant at the
+    /// resolution site, which is the change M10 forced: until now
+    /// every invocation took a TCB, so `resolve_typed(.., Tcb)` was
+    /// both correct and indistinguishable from a hardcoded
+    /// assumption. `Wait` takes a Notification, and the difference
+    /// has to live somewhere a new method cannot miss.
+    ///
+    /// `Echo` has no answer -- it names no capability at all -- and
+    /// returning `None` is what keeps it from being given a plausible
+    /// one.
+    fn capability_type(self) -> Option<CapType> {
+        match self {
+            Method::ReadRegisters | Method::SetPriority => Some(CapType::Tcb),
+            Method::Wait => Some(CapType::Notification),
+            Method::Echo => None,
         }
     }
 }
@@ -395,7 +433,16 @@ fn dispatch(
         // `cptr_bits` carries the channel. Echo ignores it as a
         // capability pointer, which is precisely why it is free to
         // mean something else.
-        if !crate::usertest::record_forge_result(cptr_bits, arg0) {
+        //
+        // Each test module gets first refusal on the channel, in
+        // turn, and says whether it was theirs. The channels are
+        // distinct bits (M8 uses 8, 9, 10, 16 and 17; M10 uses 20 and
+        // 21), so the order does not matter -- but asking rather than
+        // computing means a collision shows up as a report going to
+        // the wrong place rather than as a silent drop.
+        if !crate::usertest::record_forge_result(cptr_bits, arg0)
+            && !crate::irqtest::record_user_report(cptr_bits, arg0)
+        {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);
         }
 
@@ -409,12 +456,16 @@ fn dispatch(
     let cptr = CPtr(cptr_bits);
     let space = crate::cap::boot::init_cspace();
 
+    let required = method
+        .capability_type()
+        .expect("Echo is handled before resolution and names no capability");
+
     // SAFETY: The CSpace is live from boot. `resolve_typed` validates
     // every field of the CPtr -- reserved bits, both indices, both
     // generations, and that the root slot holds a CNode (ADR 018) --
     // so a forged pointer returns an error rather than reaching an
     // object. No other mutable borrow of the slot is held here.
-    let slot = unsafe { crate::cap::cptr::resolve_typed(&space, cptr, CapType::Tcb) }?;
+    let slot = unsafe { crate::cap::cptr::resolve_typed(&space, cptr, required) }?;
 
     // Which method ran, recorded for the report. A single counter
     // would say "syscalls happened"; this says which ones, and the
@@ -443,6 +494,25 @@ fn dispatch(
             // SAFETY: As above.
             unsafe { tcb::set_priority(slot, priority) }?;
             Ok(0)
+        }
+        Method::Wait => {
+            // **This does not return until something signals.**
+            //
+            // The calling thread is parked and another runs; control
+            // comes back here when a `Signal` -- from a thread or, in
+            // M10, from an interrupt handler -- wakes it. The driver
+            // loop a ring-3 component writes is built on exactly
+            // this.
+            //
+            // The mask goes back in RAX. It cannot collide with the
+            // error encoding: a badge is 32 bits (ADR 037) and
+            // ERROR_FLAG is bit 63.
+            //
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live Notification, and nothing else borrows the current
+            // TCB on this path.
+            let mask = unsafe { crate::cap::ipc::wait(slot) }?;
+            Ok(mask as u64)
         }
         // Handled above, before the capability was resolved.
         Method::Echo => unreachable!("Echo is handled before resolution"),

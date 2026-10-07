@@ -615,3 +615,86 @@ run-ipcntfnrev: $(ISO_IPCNTFNREV)
 
 run-ipccapcost: $(ISO_IPCCAPCOST)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCCAPCOST) --expect ipccapcost -- $(QEMU_FLAGS)
+
+
+# ---- M10 interrupt images ----------------------------------------------
+#
+# Appended rather than woven into the lists above, and that is K7 from
+# ADR 023: a Makefile is not edited with search-and-replace. GNU Make
+# accumulates `+=`, takes any number of `.PHONY:` lines, and lets a
+# recipe-less rule add prerequisites to an existing target -- so a
+# milestone can add itself without touching a line another milestone
+# depends on.
+
+ISO_IRQTEST := $(BUILD_DIR)/pythos-irqtest.iso
+ISO_IRQNOCAP := $(BUILD_DIR)/pythos-irqnocap.iso
+ISO_IRQREVOKED := $(BUILD_DIR)/pythos-irqrevoked.iso
+ISO_IRQALLOC := $(BUILD_DIR)/pythos-irqalloc.iso
+
+ALL_ISOS += $(ISO_IRQTEST) $(ISO_IRQNOCAP) $(ISO_IRQREVOKED) $(ISO_IRQALLOC)
+
+.PHONY: run-irqtest run-irqnocap run-irqrevoked run-irqalloc
+
+$(ISO_IRQTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,46)
+
+$(ISO_IRQNOCAP): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,47)
+
+$(ISO_IRQREVOKED): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,48)
+
+$(ISO_IRQALLOC): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,49)
+
+# M10 scenarios. irqtest exits 33; the three negatives exit 35.
+#
+# irq-no-cap and irq-revoked are 35 **by design rather than by
+# failure** -- each ends in a deliberate panic so that its checks are
+# asserted on a panic-expecting run, the arrangement `thread-kill-running`
+# established. The kernel survives both; the log is the evidence, and
+# run.py requires the lines that carry it.
+#
+# irq-alloc is 35 for the ordinary reason: it is a rule being enforced.
+
+run-irqtest: $(ISO_IRQTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQTEST) --expect irqtest -- $(QEMU_FLAGS)
+
+run-irqnocap: $(ISO_IRQNOCAP)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQNOCAP) --expect irqnocap -- $(QEMU_FLAGS)
+
+run-irqrevoked: $(ISO_IRQREVOKED)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQREVOKED) --expect irqrevoked -- $(QEMU_FLAGS)
+
+run-irqalloc: $(ISO_IRQALLOC)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQALLOC) --expect irqalloc -- $(QEMU_FLAGS)
+
+# Add M10 to the acceptance suite without editing the `test:` rule.
+#
+# A target may be named in several rules as long as only one carries a
+# recipe; the prerequisites accumulate. `test`'s recipe is above, so
+# this line adds four more runs to it and nothing else.
+test: run-irqtest run-irqnocap run-irqrevoked run-irqalloc
+
+
+# ---- M10: the ring 3 interrupt scenario --------------------------------
+#
+# Appended separately from the four above because it was written
+# after them: scenarios 1-5 and the three negatives were landed and
+# run first, and this one needed a new blocking syscall (`Wait`) to
+# exist before it could be written at all. Keeping the two additions
+# apart leaves that order visible.
+
+ISO_IRQUSER := $(BUILD_DIR)/pythos-irquser.iso
+
+ALL_ISOS += $(ISO_IRQUSER)
+
+.PHONY: run-irquser
+
+$(ISO_IRQUSER): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,50)
+
+run-irquser: $(ISO_IRQUSER)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQUSER) --expect irquser -- $(QEMU_FLAGS)
+
+test: run-irquser

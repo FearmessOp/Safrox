@@ -2492,6 +2492,276 @@ EXPECTATIONS = {
             re.compile(r"is not plausibly flat", re.M),
         ],
     ),
+    # ---- M10: interrupt handling ---------------------------------------
+    #
+    # One positive scenario and three negatives. The positive one
+    # carries the milestone's claim; the negatives are where its value
+    # is, because a kernel that delivers interrupts but cannot refuse
+    # them has gained nothing over M9.
+    "irqtest": Expectation(
+        name="interrupt handling",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The one IRQControl, seeded at boot. There is exactly one
+            # and nothing can retype a second, so a boot without this
+            # line is a boot in which no line can ever be claimed.
+            re.compile(
+                r"^\[cap\] IRQControl seeded in object slot \d+; \d+ "
+                r"interrupt lines can be claimed from it",
+                re.M,
+            ),
+            # 1. The one-owner rule, and the refusal leaving no trace.
+            #    Requiring the second claim's refusal by name is what
+            #    distinguishes this from a kernel that simply has one
+            #    handler slot.
+            re.compile(
+                r"^\[irq\] derivation: IRQ \d+ claimed and masked; a second "
+                r"claim on it gives IrqAlreadyOwned and leaves no trace; "
+                r"IRQ \d+ claimed independently",
+                re.M,
+            ),
+            # 2. Binding, and -- the load-bearing half -- the line still
+            #    masked afterwards. A SetNotification that opened the
+            #    line would make the Ack contract meaningless.
+            re.compile(
+                r"^\[irq\] binding: handler points at a Notification badged "
+                r"0x00a50000; a non-Notification gives WrongType and an "
+                r"empty slot gives EmptySlot; the line is still masked",
+                re.M,
+            ),
+            # 3. **The milestone's claim.** A real interrupt, through a
+            #    real vector, waking a thread that is not the kernel --
+            #    with the badge from its own capability, which is what
+            #    shows the path reads ADR 037's field rather than a
+            #    constant.
+            re.compile(
+                r"^\[irq\] delivery: a self-IPI on vector \d+ reached a "
+                r"thread blocked in Wait, with badge 0x00a50000; the line "
+                r"was masked before the signal",
+                re.M,
+            ),
+            # 4. **The criterion this milestone turns on**, in two
+            #    halves that must both appear.
+            #
+            #    The first is positive evidence that the interrupt
+            #    arrived and was *refused*: `while_masked` moving is
+            #    what distinguishes a working mask from an interrupt
+            #    that was never sent. A scenario that slept and then
+            #    asserted nothing had happened could not tell those
+            #    apart.
+            #
+            #    The `[1-9]` on the second figure is deliberate: the
+            #    counter must actually move. `\d+` would be satisfied
+            #    by 0 -> 0.
+            re.compile(
+                r"^\[irq\] masked: an interrupt on the shut line was "
+                r"refused \(while_masked \d+ -> [1-9]\d*\) and not "
+                r"delivered \(delivered stayed at \d+\)",
+                re.M,
+            ),
+            #    The second half rules out the opposite failure: a
+            #    kernel that masks a line permanently would pass the
+            #    first and has not isolated a driver, it has silenced
+            #    a device.
+            re.compile(
+                r"^\[irq\] ack: the identical stimulus was delivered once "
+                r"the line was reopened \(\d+ -> [1-9]\d* delivered\)\. One "
+                r"interrupt per Ack",
+                re.M,
+            ),
+            # 5. The measurement, with its caveat as required text --
+            #    the rule M6, M8 and M9 all follow. A reader taking an
+            #    emulated figure for silicon would draw the wrong
+            #    conclusion.
+            re.compile(
+                r"^\[irq\] wake latency: 32 samples, minimum [1-9]\d* "
+                r"cycles, mean \d+, maximum \d+",
+                re.M,
+            ),
+            re.compile(
+                r"^\[irq\] wake latency: .*Measured under emulation",
+                re.M | re.S,
+            ),
+            # The counters, which say what the whole run did. Orphaned
+            # and stale must be zero here: both are real conditions
+            # with their own scenarios, and seeing either in the
+            # *positive* run would mean an interrupt went somewhere
+            # unintended.
+            re.compile(
+                r"^\[irq\] refused: 0 orphaned \(no owner\), 0 stale "
+                r"notification \(capability deleted\), \d+ unbound",
+                re.M,
+            ),
+            re.compile(r"^\[irq\] all interrupt tests passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # The scenario's own diagnoses, each of which names a way
+            # the run could have proved nothing.
+            re.compile(r"the mask has not been tested", re.M),
+            re.compile(r"a second interrupt was delivered", re.M),
+        ],
+    ),
+    "irqnocap": Expectation(
+        name="claiming a line without IRQControl",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[irq\] refused with WrongType\(Endpoint\), as ADR 041 "
+                r"requires",
+                re.M,
+            ),
+            # The refusal left nothing behind. Both halves -- an
+            # unowned line and an empty slot -- because a Get that
+            # took the line but wrote no capability would be worse
+            # than one that did neither: the line would be
+            # permanently unclaimable.
+            re.compile(
+                r"^\[irq\] the line is unowned and the destination slot is "
+                r"empty; a refused Get leaves no trace",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] irq-no-cap completed its checks",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M9a checks passed", re.M),
+            re.compile(r"instead of WrongType", re.M),
+            re.compile(r"still took ownership", re.M),
+        ],
+    ),
+    "irqrevoked": Expectation(
+        name="revoked interrupt destination",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[irq\] bound and open; now deleting the capability the "
+                r"handler points at",
+                re.M,
+            ),
+            # The detection, and the delivery that did not happen.
+            # `[1-9]` on the stale counter: it must move, or the
+            # interrupt never arrived and nothing was tested.
+            re.compile(
+                r"^\[irq\] detected: stale_notification \d+ -> [1-9]\d*, "
+                r"delivered unchanged at \d+",
+                re.M,
+            ),
+            # The line stays shut. A driver that has lost its
+            # destination must not leave its device raising interrupts
+            # that are refused forever.
+            re.compile(
+                r"^\[irq\] the kernel is still running and the line is "
+                r"masked; a lost destination isolates one driver rather "
+                r"than stopping the machine",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] irq-revoked completed its checks",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M9a checks passed", re.M),
+            # The failures this scenario exists to rule out.
+            re.compile(r"delivered through a deleted capability", re.M),
+            re.compile(r"reopened after its destination vanished", re.M),
+        ],
+    ),
+    "irqalloc": Expectation(
+        name="allocation inside a device interrupt",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            re.compile(
+                r"^\[irq\] armed; raising IRQ \d+ \(must panic in the "
+                r"handler\)",
+                re.M,
+            ),
+            # `in_interrupt=true` read from inside the handler. M5
+            # drove this counter by hand and M6 reached it from the
+            # timer; this is the first time it is reached from a path
+            # a component triggers.
+            re.compile(
+                r"^\[irq\] inside the device interrupt handler, "
+                r"in_interrupt=true; calling allocate\(\) \(must panic\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] frame allocation from inside an interrupt handler",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M9a checks passed", re.M),
+            re.compile(r"does not work on the path that matters", re.M),
+            re.compile(r"the tripwire never fired", re.M),
+        ],
+    ),
+    "irquser": Expectation(
+        name="a ring 3 thread waits for an interrupt",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The thread is genuinely **blocked** before the interrupt
+            # is raised. Required text, and load-bearing: a `Wait` that
+            # returned immediately -- because the mask was already set,
+            # say -- would wake "successfully" without the interrupt
+            # path having been involved at all. The scenario checks the
+            # thread's state rather than assuming it, and this line is
+            # the outside evidence that it did.
+            re.compile(
+                r"^\[irq\] the user thread is blocked at cpl 3 inside Wait; "
+                r"raising IRQ \d+",
+                re.M,
+            ),
+            # **M10's purpose.** A device interrupt reaching a driver
+            # outside the kernel, at the lowest privilege level, with
+            # the badge its own capability carries.
+            re.compile(
+                r"^\[irq\] ring 3: a thread at cpl 3 blocked in Wait, a "
+                r"hardware interrupt on vector \d+ arrived, and the thread "
+                r"resumed with badge 0x00a50000",
+                re.M,
+            ),
+            re.compile(
+                r"^\[irq\] \d+ delivered, \d+ acks; \d+ arrived while masked",
+                re.M,
+            ),
+            re.compile(r"^\[irq\] all ring 3 interrupt checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # CPL 0 would mean the thread never left the kernel, and
+            # every other line here would read the same.
+            re.compile(r"\(cpl 0\)", re.M),
+            # The scenario's own diagnoses.
+            re.compile(r"reported but never blocked", re.M),
+            re.compile(r"never woke", re.M),
+        ],
+    ),
 }
 
 

@@ -37,7 +37,7 @@ use crate::syscall::{self, Method};
 
 /// Where user code is mapped. 4 MiB: clear of the unmapped first
 /// 64 KiB, and a round number in a fault report.
-const USER_CODE_ADDRESS: u64 = 0x0040_0000;
+pub const USER_CODE_ADDRESS: u64 = 0x0040_0000;
 
 /// Where the user stack's single page is mapped.
 const USER_STACK_ADDRESS: u64 = 0x0050_0000;
@@ -72,7 +72,7 @@ const UTHREAD_B_SLOT: u64 = 11;
 /// Rather than one long program, the pieces are separate constants
 /// assembled into the page by [`write_program`]. Each is short enough
 /// to check by eye against the encoding.
-mod program {
+pub mod program {
     /// `mov rax, cs` — read the code selector into RAX.
     ///
     /// `8c /r` is `mov r/m16, Sreg`; with REX.W it writes the full
@@ -109,7 +109,7 @@ mod program {
 }
 
 /// Encode `mov rax, imm64` (`48 b8 + 8 bytes`).
-fn mov_rax_imm(value: u64) -> [u8; 10] {
+pub fn mov_rax_imm(value: u64) -> [u8; 10] {
     let mut bytes = [0u8; 10];
     bytes[0] = 0x48;
     bytes[1] = 0xb8;
@@ -118,7 +118,7 @@ fn mov_rax_imm(value: u64) -> [u8; 10] {
 }
 
 /// Encode `mov rdi, imm64` (`48 bf + 8 bytes`).
-fn mov_rdi_imm(value: u64) -> [u8; 10] {
+pub fn mov_rdi_imm(value: u64) -> [u8; 10] {
     let mut bytes = [0u8; 10];
     bytes[0] = 0x48;
     bytes[1] = 0xbf;
@@ -127,7 +127,7 @@ fn mov_rdi_imm(value: u64) -> [u8; 10] {
 }
 
 /// Encode `mov rsi, imm64` (`48 be + 8 bytes`).
-fn mov_rsi_imm(value: u64) -> [u8; 10] {
+pub fn mov_rsi_imm(value: u64) -> [u8; 10] {
     let mut bytes = [0u8; 10];
     bytes[0] = 0x48;
     bytes[1] = 0xbe;
@@ -136,7 +136,7 @@ fn mov_rsi_imm(value: u64) -> [u8; 10] {
 }
 
 /// Encode `mov rdx, imm64` (`48 ba + 8 bytes`).
-fn mov_rdx_imm(value: u64) -> [u8; 10] {
+pub fn mov_rdx_imm(value: u64) -> [u8; 10] {
     let mut bytes = [0u8; 10];
     bytes[0] = 0x48;
     bytes[1] = 0xba;
@@ -146,20 +146,20 @@ fn mov_rdx_imm(value: u64) -> [u8; 10] {
 
 /// A buffer a user program is assembled into before being copied to a
 /// Frame.
-struct Program {
+pub struct Program {
     bytes: [u8; 512],
     length: usize,
 }
 
 impl Program {
-    fn new() -> Program {
+    pub fn new() -> Program {
         Program {
             bytes: [0; 512],
             length: 0,
         }
     }
 
-    fn emit(&mut self, code: &[u8]) -> &mut Program {
+    pub fn emit(&mut self, code: &[u8]) -> &mut Program {
         assert!(
             self.length + code.len() <= self.bytes.len(),
             "the user program does not fit in its buffer; it is meant to \
@@ -170,7 +170,7 @@ impl Program {
         self
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.length]
     }
 }
@@ -244,8 +244,8 @@ fn untyped_with_room(bytes: u64) -> usize {
 /// are here because naming them is what makes `build_user_space`
 /// readable, and because a scenario that needs to reach into a page
 /// afterwards will want them.
-struct UserSpace {
-    root_slot: usize,
+pub struct UserSpace {
+    pub root_slot: usize,
 }
 
 /// Bytes one user space costs: a root, nine tables (three levels for
@@ -333,7 +333,7 @@ fn write_data(cnode: &CNode, frame_slot: usize, value: u64) {
 ///
 /// `base_slot` is the first of 16 consecutive object-CNode slots this
 /// space occupies.
-fn build_user_space(base_slot: usize, program: &[u8], data: u64) -> UserSpace {
+pub fn build_user_space(base_slot: usize, program: &[u8], data: u64) -> UserSpace {
     let cnode = object_cnode();
     let untyped_index = untyped_with_room(SPACE_BYTES);
     // SAFETY: Index below the count boot reported.
@@ -398,7 +398,7 @@ fn build_user_space(base_slot: usize, program: &[u8], data: u64) -> UserSpace {
 }
 
 /// Create a thread that starts at CPL 3 in `space`.
-fn build_user_thread(
+pub fn build_user_thread(
     tcb_slot_index: usize,
     kernel_stack_slot: u64,
     space: &UserSpace,
@@ -488,7 +488,7 @@ fn build_user_thread(
 /// # Safety
 ///
 /// The caller must not hold another mutable borrow of the same TCB.
-unsafe fn tcb_at(slot_index: usize) -> &'static mut tcb::Tcb {
+pub unsafe fn tcb_at(slot_index: usize) -> &'static mut tcb::Tcb {
     let cnode = object_cnode();
     // SAFETY: Index in range.
     let slot = unsafe { cnode.slot(slot_index) };

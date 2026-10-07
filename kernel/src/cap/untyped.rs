@@ -166,7 +166,13 @@ fn object_layout(cap_type: CapType, size_bits: u8) -> Result<(u64, u64), CapErro
             1u64 << size_bits
         }
 
-        CapType::Null => return Err(CapError::InvalidArgument),
+        // Neither of these names memory, and they do not name it for
+        // different reasons: `Null` is the absence of a capability,
+        // and `IrqControl` is authority over interrupt lines, which
+        // are a property of the machine rather than of RAM (ADR 041).
+        // There is exactly one IRQControl, created at boot; no amount
+        // of Untyped produces a second.
+        CapType::Null | CapType::IrqControl => return Err(CapError::InvalidArgument),
     };
 
     // ADR 017's alignment rule: the next power of two at or above the

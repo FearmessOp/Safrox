@@ -44,13 +44,14 @@ use crate::qemu;
 /// Interrupts".
 pub const EXCEPTION_COUNT: usize = 32;
 
-/// Total stubs generated: the 32 exceptions plus the two M6 needs.
+/// Total stubs generated: the 32 exceptions, M6's two, and one per
+/// interrupt line (M10).
 ///
-/// The extra two get the same treatment as an exception -- a stub that
+/// All of them get the same treatment as an exception -- a stub that
 /// normalises the frame and jumps to the common tail -- because a
 /// handler that has to care whether it was entered from an exception
 /// or an interrupt is a handler with two shapes.
-pub const STUB_COUNT: usize = 34;
+pub const STUB_COUNT: usize = 34 + crate::cap::irq::MAX_IRQ;
 
 /// Index into `isr_table` for the LAPIC timer. Not the vector number:
 /// the table is dense and the timer's vector (32) happens to equal its
@@ -59,6 +60,34 @@ pub const TIMER_STUB_INDEX: usize = 32;
 
 /// Index into `isr_table` for the spurious interrupt.
 pub const SPURIOUS_STUB_INDEX: usize = 33;
+
+/// Index into `isr_table` of the stub for IRQ 0 (M10).
+///
+/// Line `n`'s stub is at `IRQ_STUB_BASE + n` and delivers on vector
+/// [`crate::apic::irq_to_vector`]`(n)`. The two numbers differ by one
+/// and that is deliberate rather than an off-by-one waiting to
+/// happen: the table has been dense since M6, and the spurious vector
+/// (index 33, vector 255) already established that an index is not a
+/// vector.
+pub const IRQ_STUB_BASE: usize = 34;
+
+const _: () = {
+    assert!(
+        IRQ_STUB_BASE + crate::cap::irq::MAX_IRQ == STUB_COUNT,
+        "the IRQ stubs do not fill the table exactly"
+    );
+    // The assembly below writes the vector numbers as literals, so
+    // this is what keeps them honest if the base ever moves.
+    assert!(
+        crate::apic::IRQ_VECTOR_BASE == 33,
+        "the IRQ stubs push literal vector numbers starting at 33; \
+         IRQ_VECTOR_BASE has moved and the assembly has not"
+    );
+    assert!(
+        crate::cap::irq::MAX_IRQ == 16,
+        "there are exactly 16 IRQ stubs written out below"
+    );
+};
 
 /// Machine state at the point an exception was taken.
 ///
@@ -343,6 +372,11 @@ const TIMER_VECTOR: u64 = 32;
 /// Vector the LAPIC uses for spurious interrupts.
 const SPURIOUS_VECTOR: u64 = 255;
 
+/// First and last vector carrying a user-owned interrupt line.
+const IRQ_VECTOR_FIRST: u64 = crate::apic::IRQ_VECTOR_BASE as u64;
+const IRQ_VECTOR_LAST: u64 =
+    crate::apic::IRQ_VECTOR_BASE as u64 + crate::apic::IRQ_VECTOR_COUNT as u64 - 1;
+
 const _: () = {
     assert!(
         TIMER_VECTOR == crate::apic::TIMER_VECTOR as u64,
@@ -352,7 +386,60 @@ const _: () = {
         SPURIOUS_VECTOR == crate::apic::SPURIOUS_VECTOR as u64,
         "the dispatcher and the APIC disagree about the spurious vector"
     );
+    assert!(
+        IRQ_VECTOR_FIRST > TIMER_VECTOR && IRQ_VECTOR_LAST < SPURIOUS_VECTOR,
+        "the IRQ vector range overlaps the timer or the spurious vector"
+    );
 };
+
+/// Handle an interrupt on a user-owned line (M10, ADR 042).
+///
+/// Four steps, and the fourth is here rather than in `cap::irq`
+/// because every vector in this file ends with an EOI and having one
+/// place that writes it is worth more than keeping the four steps in
+/// one function.
+///
+/// The EOI comes **after** the handler, which is the opposite of
+/// [`handle_timer`] and for a reason worth stating: the timer
+/// acknowledges first because `sched::tick` may not return for a long
+/// time, and an unacknowledged LAPIC would stop the clock that is
+/// supposed to take the CPU back. [`crate::cap::irq::handle_interrupt`]
+/// never switches threads — it signals a Notification, which makes a
+/// thread *runnable* and returns — so there is no such window, and
+/// acknowledging afterwards keeps the invariant that the line is
+/// already masked by the time the LAPIC will deliver anything else.
+///
+/// # Safety
+///
+/// Called from an IRQ stub, with IF clear.
+unsafe fn handle_irq(vector: u64) {
+    let irq = crate::apic::vector_to_irq(vector as u8).unwrap_or_else(|| {
+        panic!(
+            "vector {} reached handle_irq but does not map to a line; the \
+             IDT has a gate the vector table does not know about",
+            vector
+        )
+    });
+
+    // The `irq-alloc` scenario arms a hook here. It does nothing
+    // unless armed, and when armed it allocates — which is the point:
+    // ADR 022's tripwire has been live since M6 but only the *timer*
+    // has ever exercised it, and a timer interrupt is the kernel's
+    // own. This is the first time it is reached from a path a user
+    // component triggers.
+    crate::irqtest::allocate_from_handler_if_armed();
+
+    // SAFETY: We are in interrupt context with IF clear, which is
+    // exactly `handle_interrupt`'s precondition.
+    unsafe {
+        crate::cap::irq::handle_interrupt(irq);
+    }
+
+    // SAFETY: Once per interrupt, from its handler.
+    unsafe {
+        crate::apic::end_of_interrupt();
+    }
+}
 
 /// Handle the periodic timer.
 ///
@@ -438,6 +525,14 @@ unsafe extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
             //
             // Reference: Intel SDM Vol. 3A, 11.9 "Spurious Interrupt".
             crate::apic::count_spurious();
+        }
+        vector @ IRQ_VECTOR_FIRST..=IRQ_VECTOR_LAST => {
+            // SAFETY: Entered through an interrupt gate, so IF is
+            // clear, and the vector is in the IRQ range by the
+            // pattern above.
+            unsafe {
+                handle_irq(vector);
+            }
         }
         _ => {
             report(frame);
@@ -633,6 +728,95 @@ global_asm!(
     "    push 0",
     "    push 255",
     "    jmp isr_common",
+    // ---- interrupt lines (M10) -----------------------------------------
+    //
+    // One per line, vectors 33..=48. Written out rather than
+    // generated by the macro for the same reason the two above are:
+    // the macro derives its label from the vector number, and these
+    // labels are named by *line* (`isr_stub_irq_0` delivers on vector
+    // 33). Keeping the label in line-space is what makes the table
+    // below readable; the `const` assertions above are what keep the
+    // literals honest.
+    ".align 16",
+    "isr_stub_irq_0:",
+    "    push 0",
+    "    push 33",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_1:",
+    "    push 0",
+    "    push 34",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_2:",
+    "    push 0",
+    "    push 35",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_3:",
+    "    push 0",
+    "    push 36",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_4:",
+    "    push 0",
+    "    push 37",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_5:",
+    "    push 0",
+    "    push 38",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_6:",
+    "    push 0",
+    "    push 39",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_7:",
+    "    push 0",
+    "    push 40",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_8:",
+    "    push 0",
+    "    push 41",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_9:",
+    "    push 0",
+    "    push 42",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_10:",
+    "    push 0",
+    "    push 43",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_11:",
+    "    push 0",
+    "    push 44",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_12:",
+    "    push 0",
+    "    push 45",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_13:",
+    "    push 0",
+    "    push 46",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_14:",
+    "    push 0",
+    "    push 47",
+    "    jmp isr_common",
+    ".align 16",
+    "isr_stub_irq_15:",
+    "    push 0",
+    "    push 48",
+    "    jmp isr_common",
     // ---- the table -----------------------------------------------------
     //
     // A plain array of absolute addresses, so Rust can index it instead
@@ -650,6 +834,10 @@ global_asm!(
     ".quad isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27",
     ".quad isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31",
     ".quad isr_stub_timer, isr_stub_spurious",
+    ".quad isr_stub_irq_0,  isr_stub_irq_1,  isr_stub_irq_2,  isr_stub_irq_3",
+    ".quad isr_stub_irq_4,  isr_stub_irq_5,  isr_stub_irq_6,  isr_stub_irq_7",
+    ".quad isr_stub_irq_8,  isr_stub_irq_9,  isr_stub_irq_10, isr_stub_irq_11",
+    ".quad isr_stub_irq_12, isr_stub_irq_13, isr_stub_irq_14, isr_stub_irq_15",
 );
 
 /// Compile-time cross-check: the error-code classification used by the

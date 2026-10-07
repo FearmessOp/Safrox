@@ -16,9 +16,11 @@
 use core::arch::asm;
 use core::mem::size_of;
 
-use crate::apic::{SPURIOUS_VECTOR, TIMER_VECTOR};
+use crate::apic::{irq_to_vector, IRQ_VECTOR_COUNT, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::gdt::{self, KERNEL_CODE_SELECTOR};
-use crate::interrupts::{isr_table, EXCEPTION_COUNT, SPURIOUS_STUB_INDEX, TIMER_STUB_INDEX};
+use crate::interrupts::{
+    isr_table, EXCEPTION_COUNT, IRQ_STUB_BASE, SPURIOUS_STUB_INDEX, TIMER_STUB_INDEX,
+};
 
 /// Total number of IDT vectors the architecture defines.
 const IDT_ENTRIES: usize = 256;
@@ -170,6 +172,27 @@ pub unsafe fn init() {
             IdtEntry::interrupt_gate(isr_table[TIMER_STUB_INDEX] as usize as u64, 0);
         IDT[SPURIOUS_VECTOR as usize] =
             IdtEntry::interrupt_gate(isr_table[SPURIOUS_STUB_INDEX] as usize as u64, 0);
+
+        // M10's interrupt lines, one gate each.
+        //
+        // Every line gets a gate whether or not anybody owns it, and
+        // that is a decision rather than laziness. An unowned line
+        // with no gate would raise #GP if its interrupt ever arrived,
+        // and #GP during interrupt delivery is a double fault -- the
+        // kernel would die because of something outside it, which
+        // ADR 030 refuses. With a gate, the same interrupt reaches
+        // `handle_interrupt`, finds no owner, and is counted and
+        // dropped: ADR 042's *defined* behaviour.
+        //
+        // DPL 0, like every other gate: a user thread must not be
+        // able to forge a device interrupt with `int 38`. The way to
+        // signal a driver from user space is `Signal` on its
+        // Notification, which requires holding a capability for it.
+        for irq in 0..IRQ_VECTOR_COUNT {
+            let vector = irq_to_vector(irq as u8) as usize;
+            IDT[vector] =
+                IdtEntry::interrupt_gate(isr_table[IRQ_STUB_BASE + irq] as usize as u64, 0);
+        }
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

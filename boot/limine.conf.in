@@ -496,3 +496,82 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: ipc-captransfercost
+
+
+/+PythOS (M10: interrupt handling)
+    comment: A hardware interrupt reaching a thread outside the kernel,
+    comment: which is the whole of M10. A line is claimed from IRQControl
+    comment: and masked; a second claim on it gives IrqAlreadyOwned, which
+    comment: is the one-owner rule rather than a resource shortage -- two
+    comment: owners could not both acknowledge, and the second could watch
+    comment: the first's device activity. Then a self-IPI arrives through
+    comment: the IDT, the stub and the dispatcher, and wakes a thread
+    comment: blocked in Wait with the badge its own capability carries.
+    comment: The interrupt source is a self-IPI rather than a device
+    comment: because scenario 4 must show that no SECOND interrupt is
+    comment: delivered before Ack -- with a device, "the mask worked" and
+    comment: "nothing was sent" are indistinguishable (ADR 023's K8).
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: irq-test
+
+/+PythOS (M10: claiming a line without IRQControl)
+    comment: An Endpoint capability in place of IRQControl. Refused with
+    comment: WrongType, the line stays unowned and the destination slot
+    comment: stays empty -- a refused Get leaves no trace, which is
+    comment: ADR 020's atomicity rule applied to an operation that is not
+    comment: a retype. Every other scenario holds the capability, so none
+    comment: of them can show what happens without it: a check nothing
+    comment: reaches is indistinguishable from its own absence (K5).
+    comment: Ends in a deliberate panic so the checks are asserted on a
+    comment: panic-expecting run. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: irq-no-cap
+
+/+PythOS (M10: the handler's destination is revoked)
+    comment: The race ADR 042 names. A handler is bound and its line
+    comment: opened; the Notification *capability* is then deleted while
+    comment: the object itself stays alive behind another capability --
+    comment: the harder half, because a freed object might be caught by
+    comment: chance and a live one at the same address never would.
+    comment: The interrupt arrives, the generation check refuses it, the
+    comment: stale counter moves, nothing is delivered, and the line
+    comment: stays shut. The kernel is still running afterwards, which is
+    comment: the actual claim: a lost destination isolates one driver
+    comment: rather than stopping the machine (ADR 030). Exit 35, by the
+    comment: same deliberate panic.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: irq-revoked
+
+/+PythOS (M10: allocation inside a device interrupt)
+    comment: ADR 022's tripwire has been live since M6, but only the
+    comment: timer has ever reached it -- and a timer interrupt is the
+    comment: kernel's own. This is the first time it fires on a path a
+    comment: user component triggers, which is the case the rule was
+    comment: written for: a device chooses how often its handler runs, so
+    comment: an allocation there is one whose rate an attacker controls.
+    comment: Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: irq-alloc
+
+
+/+PythOS (M10: a ring 3 thread waits for an interrupt)
+    comment: M10's purpose, stated as a test. A thread at CPL 3, in its
+    comment: own address space, invokes Wait on a Notification it was
+    comment: given -- the first blocking syscall this kernel has -- and
+    comment: is resumed by a hardware interrupt, with the badge the
+    comment: handler's capability carries.
+    comment: The thread reports both before and after the Wait, and the
+    comment: scenario confirms it is genuinely BLOCKED before raising
+    comment: the interrupt. Without that confirmation, a Wait that
+    comment: returned immediately would be indistinguishable from one
+    comment: that blocked and was woken, and the scenario would prove
+    comment: nothing about the interrupt path.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: irq-user

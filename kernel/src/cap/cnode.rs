@@ -35,7 +35,13 @@ use crate::memory::PhysAddr;
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 pub struct Slot {
-    /// The object this capability names, or `ObjectRef::NULL` if empty.
+    /// The object this capability names.
+    ///
+    /// Null for an empty slot, and also null for the one capability
+    /// that names no object: `IRQControl` conveys authority over
+    /// interrupt lines, and a line is not memory (ADR 041). Which of
+    /// the two a null means is settled by the type, which is why
+    /// [`Slot::is_empty`] asks the type rather than this field.
     object: ObjectRef,
     /// Packed: type (bits 0-4), rights (5-8), depth (9-12),
     /// generation (16-23). See the accessors.
@@ -79,8 +85,36 @@ const _: () = {
 };
 
 impl Slot {
-    pub const fn is_empty(&self) -> bool {
-        self.object.is_null()
+    /// Whether this slot holds no capability.
+    ///
+    /// Decided by the **type**, not by the object address, and the
+    /// difference took until M10 to matter.
+    ///
+    /// For every type up to M9 the two were the same thing: `clear`
+    /// writes a null object and a `Null` type together, and `fill` is
+    /// only ever called with a real object. So `object.is_null()` was
+    /// an equivalent test and an easier one to reach for.
+    ///
+    /// `IRQControl` broke the equivalence by being the first
+    /// capability that names **no object at all** (ADR 041). What it
+    /// conveys is authority over interrupt lines, and a line is not
+    /// memory -- there is nothing for its `object` field to point at.
+    /// Seeded with a null address, it read as an empty slot, and
+    /// `irq-test` panicked with `EmptySlot` on a capability that was
+    /// demonstrably there.
+    ///
+    /// ADR 017 already said which of the two definitions was intended:
+    /// *"`Null` is not a ninth type: it is the absence of a
+    /// capability, and it is here so that a slot is always a valid
+    /// `CapType` rather than needing a separate occupied flag."* The
+    /// type is the occupancy flag. Testing the address was the
+    /// inconsistency, and it happened to agree for nine types.
+    ///
+    /// The change is behaviour-preserving for everything that existed
+    /// before: for those types `object.is_null()` holds exactly when
+    /// the type is `Null`, so no existing slot changes its answer.
+    pub fn is_empty(&self) -> bool {
+        self.cap_type() == CapType::Null
     }
 
     pub fn cap_type(&self) -> CapType {
@@ -670,24 +704,61 @@ unsafe fn release_ipc_references(slot: &Slot) {
                 );
             }
         }
+        CapType::IrqHandler => {
+            // **M10, and the debt M9c recorded.**
+            //
+            // The note left here said the compiler would stop the
+            // milestone that created the first IrqHandler, and it
+            // did. What it predicted was a binding to break; what is
+            // actually owed turned out to be larger and more
+            // urgent -- an interrupt *line*.
+            //
+            // A handler that stops existing must give its line back,
+            // or no component could ever claim it again: the
+            // ownership table would name an object whose memory has
+            // been returned to its Untyped. Worse, the line would
+            // still be open, so the next interrupt on it would reach
+            // `handle_interrupt`, find a stale owner, and signal
+            // through a pointer into reused memory.
+            //
+            // `release_line` therefore masks the line *before*
+            // clearing the owner, which is what makes the window
+            // empty rather than merely narrow (ADR 041).
+            //
+            // SAFETY: The slot holds a live IrqHandler and interrupts
+            // are disabled, so no interrupt can be partway through
+            // reading the table.
+            let released = unsafe { crate::cap::irq::release_line(slot) };
+            if released {
+                // SAFETY: As above; the handler is still readable.
+                let irq = unsafe { crate::cap::irq::handler_at(slot.object()) }.irq();
+                crate::println!(
+                    "[irq] handler at {} deleted; IRQ {} masked and \
+                     released, and may be claimed again (ADR 041)",
+                    slot.object(),
+                    irq
+                );
+            }
+        }
         // Everything else: an object nothing in the IPC layer holds a
         // reference to. Listed rather than matched with `_` so that a
         // new CapType is a build failure here -- which is exactly how
         // the Notification arm above came to be missing.
         //
-        // That paid off immediately. Making this match exhaustive
-        // produced `non-exhaustive patterns: CapType::IrqHandler not
-        // covered` -- a variant M12 will need an arm for, since an
-        // IRQHandler binds to a Notification (ADR 038) and revoking
-        // one has to break that binding. Today nothing creates an
-        // IrqHandler, so there is nothing to release; when M12
-        // arrives, this line is where the compiler will stop it.
+        // That has now paid off twice. Making this match exhaustive
+        // in M9c produced `non-exhaustive patterns: CapType::IrqHandler
+        // not covered`, which is the arm directly above; adding
+        // `IrqControl` in M10 produced the same error again, and the
+        // answer that time was genuinely "nothing to do" -- IRQControl
+        // names no object and holds no reference. The value of the
+        // exhaustive match is that both conclusions had to be reached
+        // deliberately.
         CapType::Null
         | CapType::Untyped
         | CapType::CNode
         | CapType::Frame
         | CapType::PageTable
-        | CapType::IrqHandler => {}
+        | CapType::IrqControl => {}
     }
 }
 

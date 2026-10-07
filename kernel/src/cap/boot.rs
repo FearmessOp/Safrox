@@ -51,6 +51,17 @@ pub const ROOT_SLOT_UNTYPED: usize = 0;
 /// Index of the general-purpose object CNode within the root.
 pub const ROOT_SLOT_OBJECTS: usize = 1;
 
+/// Slot in the object CNode holding the one IRQControl capability
+/// (M10, ADR 041).
+///
+/// Fixed and high, for the same reason [`BOOT_TCB_SLOT`] is: the test
+/// fixtures work upward from zero, and this capability must outlive
+/// every one of them. There is exactly one IRQControl in the system
+/// and nothing can create a second — it is not retypeable (see
+/// `untyped::object_layout`) — so losing this one would make every
+/// interrupt line unclaimable until reboot.
+pub const IRQ_CONTROL_SLOT: usize = 254;
+
 /// Largest root Untyped we will create: 2^22 = 4 MiB.
 ///
 /// A region bigger than this is split into several. Two reasons to cap
@@ -415,6 +426,46 @@ pub unsafe fn init_from_regions(regions: &[MemoryRegion]) {
         }
     }
 
+    // --- IRQControl (M10, ADR 041) ---------------------------------------
+    //
+    // One capability, seeded as a root. Not retyped from an Untyped,
+    // because what it conveys is not memory: it is the authority to
+    // hand out interrupt lines, and the lines exist whether or not
+    // anybody has memory to spare.
+    //
+    // Seeded here rather than created on demand so that there is
+    // exactly one and its existence does not depend on anything a
+    // component does. `seed_root` gives it depth 0, so an IRQHandler
+    // derived from it would be at depth 1 -- except that handlers are
+    // derived from the *Untyped* that holds them, which is what makes
+    // revoking that Untyped release the line.
+    //
+    // Its object reference is null, and that is honest rather than a
+    // placeholder: there is no object. Every operation that takes an
+    // IRQControl checks only the type, never dereferences it.
+    //
+    // SAFETY: The object CNode was created and zeroed above, and
+    // IRQ_CONTROL_SLOT is within it (checked at build time below).
+    unsafe {
+        let objects = CNode::new(object_base, OBJECT_RADIX);
+        let slot = objects.slot(IRQ_CONTROL_SLOT);
+        cnode::seed_root(
+            slot,
+            ObjectRef::NULL,
+            CapType::IrqControl,
+            Rights::ALL,
+            0,
+            false,
+        )
+        .expect("the freshly zeroed IRQControl slot was not empty");
+    }
+    println!(
+        "[cap] IRQControl seeded in object slot {}; {} interrupt lines \
+         can be claimed from it (ADR 041)",
+        IRQ_CONTROL_SLOT,
+        super::irq::MAX_IRQ
+    );
+
     // SAFETY: Single-threaded boot path; nothing else reads these yet.
     unsafe {
         let cspace = &raw mut INIT_CSPACE;
@@ -693,5 +744,13 @@ const _: () = {
     assert!(
         ROOT_SLOT_UNTYPED < (1 << ROOT_RADIX) && ROOT_SLOT_OBJECTS < (1 << ROOT_RADIX),
         "a reserved root slot index is outside the root CNode"
+    );
+    assert!(
+        BOOT_TCB_SLOT < (1 << OBJECT_RADIX) && IRQ_CONTROL_SLOT < (1 << OBJECT_RADIX),
+        "a reserved object slot index is outside the object CNode"
+    );
+    assert!(
+        BOOT_TCB_SLOT != IRQ_CONTROL_SLOT,
+        "the boot TCB and IRQControl have been given the same slot"
     );
 };

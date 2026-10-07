@@ -19,6 +19,7 @@ pub mod boot;
 pub mod cnode;
 pub mod cptr;
 pub mod ipc;
+pub mod irq;
 pub mod tcb;
 pub mod untyped;
 pub mod vspace;
@@ -29,9 +30,9 @@ use crate::memory::PhysAddr;
 
 // ---- Object types ------------------------------------------------------
 
-/// The eight object types (ADR 017).
+/// The object types (ADR 017).
 ///
-/// `Null` is not a ninth type: it is the absence of a capability, and it
+/// `Null` is not one of them: it is the absence of a capability, and it
 /// is here so that a slot is always a valid `CapType` rather than needing
 /// a separate "occupied" flag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,6 +47,15 @@ pub enum CapType {
     Frame = 6,
     PageTable = 7,
     IrqHandler = 8,
+    /// Authority to claim interrupt lines (M10, ADR 041).
+    ///
+    /// The one capability in the system with **no object behind it**.
+    /// Every other type names memory carved from an Untyped; this one
+    /// names the right to hand out lines, and a line is not memory.
+    /// There is exactly one, created at boot and given to init, and it
+    /// cannot be retyped into existence — which is why `fixed_size`
+    /// returns `None` for it and `object_layout` refuses it outright.
+    IrqControl = 9,
 }
 
 impl CapType {
@@ -64,6 +74,7 @@ impl CapType {
             6 => Some(CapType::Frame),
             7 => Some(CapType::PageTable),
             8 => Some(CapType::IrqHandler),
+            9 => Some(CapType::IrqControl),
             _ => None,
         }
     }
@@ -80,6 +91,7 @@ impl CapType {
             CapType::Frame => "Frame",
             CapType::PageTable => "PageTable",
             CapType::IrqHandler => "IRQHandler",
+            CapType::IrqControl => "IRQControl",
         }
     }
 
@@ -93,7 +105,12 @@ impl CapType {
             CapType::Frame => Some(FRAME_SIZE),
             CapType::PageTable => Some(PAGE_TABLE_SIZE),
             CapType::IrqHandler => Some(IRQ_HANDLER_SIZE),
-            CapType::Null | CapType::Untyped | CapType::CNode => None,
+            // `Untyped` and `CNode` have a size the caller chooses;
+            // `Null` and `IrqControl` have no object at all, which is
+            // a third thing this `None` is quietly standing for. The
+            // distinction is enforced in `object_layout`, which
+            // refuses both rather than asking here.
+            CapType::Null | CapType::Untyped | CapType::CNode | CapType::IrqControl => None,
         }
     }
 
@@ -404,6 +421,17 @@ pub enum CapError {
     /// The thread or the notification is already bound to something.
     AlreadyBound,
 
+    // ---- M10: interrupts (ADR 041, 042) ----
+    /// Another component already holds the handler for this line
+    /// (ADR 041).
+    ///
+    /// Not a resource shortage but the **one-owner rule**: a second
+    /// holder could not be given the interrupt without answering who
+    /// acknowledges it, and could observe the first's device activity
+    /// as a side channel. Sharing a line is a user-space problem,
+    /// solved by a multiplexer that owns it.
+    IrqAlreadyOwned { irq: u8 },
+
     /// Size, alignment or type combination is not valid.
     InvalidArgument,
 }
@@ -514,6 +542,13 @@ impl fmt::Display for CapError {
             CapError::AlreadyBound => {
                 write!(f, "AlreadyBound (ADR 038)")
             }
+            CapError::IrqAlreadyOwned { irq } => write!(
+                f,
+                "IrqAlreadyOwned (IRQ {} already has a handler; a line \
+                 has exactly one owner, and sharing is a user-space \
+                 multiplexer's job -- ADR 041)",
+                irq
+            ),
             CapError::InvalidArgument => write!(f, "InvalidArgument"),
         }
     }

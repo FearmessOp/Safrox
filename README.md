@@ -3,12 +3,49 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M9c — capability transfer and notifications.
-IPC is complete.** A message can carry up to four capabilities, into
-slots the *receiver* opened; a Notification accumulates signals
-without ever blocking its sender; and one thread can wait on an
-endpoint and a notification at once, which is what M13's driver will
-need.
+**Current milestone: M10 — user-space interrupt handling.** A
+hardware interrupt now reaches a thread at CPL 3. Everything before
+this was the kernel talking to itself; a driver needs the other
+direction, and this is it:
+
+```
+[irq] ring 3: a thread at cpl 3 blocked in Wait, a hardware interrupt
+on vector 38 arrived, and the thread resumed with badge 0x00a50000
+```
+
+The kernel's part is **four steps and there is no fifth**: find the
+line's owner, mask the line, signal a Notification, acknowledge the
+LAPIC. That code runs in interrupt context, at a rate the *device*
+chooses, inside the trusted base — so every instruction in it is
+multiplied by a number the kernel does not control.
+
+A line has **exactly one owner**, and the third reason is the one
+that decided it. Two components on one line raises *who gets the
+interrupt* and *who acknowledges it*, both awkward; but it also means
+either can watch the other's device activity. A disk's interrupt rate
+is a side channel on what is being written to it. Sharing is solved
+in user space by a multiplexer that owns the line — the microkernel
+argument in miniature.
+
+**`Ack` is the driver's job**, and the kernel does not know when it
+should happen: the driver reads its device's status register, and the
+kernel does not know where that register is. If it did, device logic
+would be in the kernel. A driver that never acknowledges leaves its
+line shut — **isolation rather than deadlock**, since it silences its
+own device and nothing else. Recovery is revoking the handler, not a
+timeout: a timeout needs a scheduling budget
+[ADR 017](docs/adr/017-nesne-kumesi.md) left out and a policy
+[ADR 011](docs/adr/011-sayfa-tablosu-api.md) forbids.
+
+The whole path is in [docs/interrupts.md](docs/interrupts.md);
+the decisions are [ADR 041](docs/adr/041-irq-capability-modeli.md)
+and [ADR 042](docs/adr/042-kesme-yolu-ve-ack.md).
+
+**M9c — capability transfer and notifications. IPC is complete.** A
+message can carry up to four capabilities, into slots the *receiver*
+opened; a Notification accumulates signals without ever blocking its
+sender; and one thread can wait on an endpoint and a notification at
+once, which is what M13's driver will need.
 
 M9 landed in three parts because one attempt at all eleven
 acceptance criteria produced code that did not compile and was never
@@ -189,13 +226,202 @@ cloned into `third_party/` automatically.
 | `make run-usersmep` | The kernel fetches from a user page → #PF; **must** exit 35 |
 | `make run-usersmap` | The kernel reads a user page unguarded → #PF; **must** exit 35 |
 | `make run-userforge` | Six forged CPtrs, six errors, kernel alive; **must** exit 33 |
-| `make test` | `fmt`, `clippy`, all twenty-seven scenarios, runner self-test |
+| `make run-irqtest` | Interrupt suite: derivation, delivery, the mask, latency; **must** exit 33 |
+| `make run-irquser` | **A ring 3 thread is woken by a hardware interrupt**; **must** exit 33 |
+| `make run-irqnocap` | Claiming a line without IRQControl is refused; **must** exit 35 |
+| `make run-irqrevoked` | The handler's destination is deleted, kernel alive; **must** exit 35 |
+| `make run-irqalloc` | Allocating inside a *device* interrupt; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all fifty-one scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
 | `make toolchain-check` | Report tool availability |
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
+
+## M10 acceptance criteria
+
+Six scenarios. `irq-no-cap` and `irq-revoked` exit 35 **by design**:
+each ends in a deliberate panic so its checks are asserted on a
+panic-expecting run, the arrangement `thread-kill-running`
+established. In both the kernel is still running when it does.
+
+### 1. `make run-irqtest` — the line, the mask and the latency
+
+```
+[irq] derivation: IRQ 5 claimed and masked; a second claim on it gives
+IrqAlreadyOwned and leaves no trace; IRQ 11 claimed independently
+[irq] binding: handler points at a Notification badged 0x00a50000; a
+non-Notification gives WrongType and an empty slot gives EmptySlot;
+the line is still masked
+[irq] delivery: a self-IPI on vector 38 reached a thread blocked in
+Wait, with badge 0x00a50000; the line was masked before the signal
+```
+
+"Leaves no trace" is a separate claim from the refusal: after a
+rejected `Get` the line is unowned **and** the destination slot is
+empty. A `Get` that took the line without writing a capability would
+be worse than one that did neither — the line would be permanently
+unclaimable.
+
+The badge comes from the capability rather than from a field in the
+handler, so a driver that mints a differently badged capability gets
+differently badged interrupts without telling the kernel twice
+([ADR 037](docs/adr/037-badge.md)).
+
+**And the criterion the milestone turns on:**
+
+```
+[irq] masked: an interrupt on the shut line was refused
+(while_masked 0 -> 1) and not delivered (delivered stayed at 1)
+[irq] ack: the identical stimulus was delivered once the line was
+reopened (1 -> 2 delivered). One interrupt per Ack
+```
+
+Two counters, and both are necessary. A single "interrupts seen"
+figure cannot distinguish *the mask worked* from *nothing was sent*.
+The scenario does not sleep and then assert that nothing happened —
+it waits for `while_masked` to **move**, which is positive evidence
+that the interrupt arrived and was refused.
+
+The second line rules out the opposite failure. A kernel that masked
+a line permanently would pass the first, and that is not isolation
+but a dead device.
+
+### 2. `make run-irquser` — the milestone's purpose
+
+```
+[irq] the user thread is blocked at cpl 3 inside Wait; raising IRQ 5
+[irq] ring 3: a thread at cpl 3 blocked in Wait, a hardware interrupt
+on vector 38 arrived, and the thread resumed with badge 0x00a50000
+```
+
+`Wait` is this kernel's **first blocking invocation**. Everything
+before it answered and returned; this one parks the calling thread
+until a signal arrives, which is what lets a driver wait for its
+device rather than poll for it. It needed no special handling: a
+syscall runs on the calling thread's own kernel stack
+([ADR 029](docs/adr/029-ring-3-giris-ve-cikis.md)), so blocking saves
+the context there like any other switch.
+
+**The first line is load-bearing.** The scenario confirms the thread
+is genuinely *blocked* before raising the interrupt. A `Wait` that
+returned immediately — because the mask was already set, say — would
+wake "successfully" with the interrupt path uninvolved, and every
+other check here would still pass.
+
+### 3–5. The negatives
+
+```
+[irq] refused with WrongType(Endpoint), as ADR 041 requires
+[irq] the line is unowned and the destination slot is empty
+
+[irq] detected: stale_notification 0 -> 1, delivered unchanged at 0
+[irq] the kernel is still running and the line is masked
+
+[irq] inside the device interrupt handler, in_interrupt=true;
+calling allocate() (must panic)
+```
+
+`irq-revoked` is the interesting one. It deletes the Notification
+**capability** while the object itself stays alive behind a second
+capability — the harder half, because a freed object might be caught
+by chance and a live one at the same address never would be. The
+generation check catches it, and the line stays shut: a driver that
+has lost its destination must not leave its device raising
+interrupts nobody can receive.
+
+`irq-alloc` reaches [ADR 022](docs/adr/022-kernelin-ayricalikli-kaynaklari.md)'s
+tripwire from a *device* interrupt for the first time. It has been
+live since M6, but only the timer had ever reached it — and a timer
+interrupt is the kernel's own. A device chooses how often its
+handler runs, so an allocation there is one whose rate an attacker
+controls. That is the case the rule was written for.
+
+### Measured
+
+```
+[irq] wake latency: 32 samples, minimum 10752 cycles, mean 26398,
+maximum 274890
+```
+
+From the instruction that raises the IPI to the woken thread's first
+instruction: interrupt delivery, the stub, the dispatcher, the
+signal, and **one context switch**. The switch is inside the figure
+because a driver experiences it — a Notification makes a thread
+*runnable*, and becoming runnable is not the same as running.
+
+The minimum is the headline. A mean here would mostly record how
+often the timer interrupted the measurement. Under emulation, where
+the TSC is virtual and the IPI is simulated: an order of magnitude,
+not a measurement.
+
+### K5 in M10: the mutation died, and said something about the test
+
+The prescribed mutation was to make `Ack` a no-op. **It was killed** —
+but the first failure came from the wrong place, and that is the
+part worth recording.
+
+Scenario 3's `assert!(!is_masked(..))` fired first and stopped the
+run before scenario 4 was reached. That assertion reads **the same
+flag `Ack` writes**: close to asking the mutation whether it mutated
+itself. A suite whose only evidence has that shape satisfies K5's
+letter and not its intent.
+
+So the two `is_masked` assertions were temporarily removed and the
+mutation re-run. The failure then came from the behavioural check:
+
+```
+[PANIC] after Ack the same interrupt was still not delivered; the
+line is masked permanently, which silences the device rather than
+isolating it
+```
+
+An interrupt was raised, no delivery followed, and a counter said
+so — no flag consulted. That is the evidence worth having.
+
+A variant was also needed: "never open the line" is caught too early
+to reach scenario 4's second half, so `Ack` was made to work exactly
+once. Under that the first half passed and the second failed, which
+confirms the two halves test different properties rather than one
+twice.
+
+The `is_masked` assertions were kept — a fast failure with a precise
+message is worth having — with a note beside them saying they are
+not what makes the check sound.
+
+### What M10 cost: a definition that had been ambiguous for nine types
+
+`IRQControl` is the first capability in this system that **names no
+object**. What it conveys is the authority to hand out interrupt
+lines, and a line is not memory.
+
+The first run of `irq-test` panicked with
+`IRQControl.Get refused the test line: EmptySlot` — on a capability
+that was visibly there, seeded at boot.
+
+[`Slot::is_empty()`](kernel/src/cap/cnode.rs:82) tested the **object
+address**. For nine types that was equivalent to testing the type,
+because `clear` writes a null object and a `Null` type together and
+`fill` is only ever called with a real object. The tenth type broke
+the equivalence.
+
+[ADR 017](docs/adr/017-nesne-kumesi.md) had already settled which
+definition was meant:
+
+> `Null` is not a ninth type: it is the absence of a capability, and
+> it is here so that a slot is always a valid `CapType` rather than
+> needing a separate occupied flag.
+
+The type *is* the occupancy flag; testing the address was the
+inconsistency. `is_empty` now asks the type, and for every existing
+type the two agree exactly — no slot changes its answer.
+
+The shape is worth keeping: **this was not a bug in new code.** It
+was two definitions that had coincided for nine types and diverged
+on the tenth. Nothing could have caught it earlier, because until
+there was an object-less capability there was no difference to
+observe.
 
 ## M9c acceptance criteria
 
@@ -1697,6 +1923,8 @@ kernel/src/cap/untyped.rs   retype: two phases, atomic, always zeroes
 kernel/src/cap/boot.rs      Root Untypeds, the init CSpace, allocator retirement
 kernel/src/cap/tcb.rs       TCB: context, states, SetRegisters/ReadRegisters/SetSpace
 kernel/src/cap/vspace.rs    VSpace: Frame and PageTable Map/Unmap, rights to permissions
+kernel/src/cap/ipc.rs       Endpoint, Notification, the rendezvous, Call/Reply, badges
+kernel/src/cap/irq.rs       IRQHandler, the ownership table, the four-step interrupt path
 kernel/src/sched.rs     switch_context, round-robin, CR3 switching, the two guards
 kernel/src/apic.rs      LAPIC, timer calibrated against the TSC, legacy PIC masking
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
@@ -1705,6 +1933,9 @@ kernel/src/heaptest.rs  Kernel heap acceptance tests and negative scenarios
 kernel/src/captest.rs   Capability acceptance tests, the revoke measurement, two tripwires
 kernel/src/threadtest.rs  Thread and scheduler tests, the switch measurement, three scenarios
 kernel/src/vspacetest.rs  Address space tests, the CR3 measurement, three scenarios
+kernel/src/usertest.rs    Ring 3 tests and five negatives; the user-program assembler
+kernel/src/ipctest.rs     IPC tests, the cancellation and transfer measurements
+kernel/src/irqtest.rs     Interrupt tests, the wake-latency measurement, three negatives
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -2309,6 +2540,40 @@ deleting the body of `TlbFlush::flush` entirely, `invlpg` and `mfence`
 both, leaves all fifteen scenarios passing. The experiment was run. What
 `TlbFlush` buys in this environment is compile-time only.
 
+**Interrupt masking is a software flag, not an IOAPIC mask.** On real
+hardware a masked line stops the *device*; the flag here stops
+delivery, not the interrupt reaching the CPU. The contract — no second
+interrupt delivered before `Ack` — is the same either way, and
+`irq-test` scenario 4 tests the contract rather than the mechanism, so
+it does not change when **M12** moves masking into the IOAPIC's
+redirection table. Named in
+[ADR 042](docs/adr/042-kesme-yolu-ve-ack.md).
+
+**Interrupt lines cannot be shared.** One owner per line, by decision
+rather than omission
+([ADR 041](docs/adr/041-irq-capability-modeli.md)): a second listener
+could watch the first's device activity as a side channel. Real
+hardware does share lines (PCI INTx), and the answer is not in the
+kernel — a user-space multiplexer owns the line and distributes to its
+own clients. **M12.**
+
+**Sixteen interrupt lines.** `MAX_IRQ` is a table size, not a hardware
+limit. The table is read on the interrupt path and ADR 022 forbids
+allocating there, so it is fixed at compile time. Widening it is one
+line; making it dynamic is not.
+
+**Interrupts only ever reach this CPU.** The ownership table is
+protected by per-entry atomics, but routing is whatever the LAPIC does
+with a self-IPI. Choosing *which* CPU a line goes to needs the IOAPIC,
+and arrives with it.
+
+**No device drives any of this yet.** M10 delivers an interrupt to a
+ring-3 thread; nothing on the other end is a real device. The source
+is a LAPIC self-IPI, chosen so the test can decide *when* the
+interrupt arrives — with a device, "the mask worked" and "nothing was
+sent" would be indistinguishable (ADR 023's K8). **M13.**
+
+
 **The heap has no lock.** Same shape as the frame allocator's gap: one
 CPU, one non-reentrant entry point — though "interrupts disabled" is no
 longer part of the argument, since M6. What holds it together now is
@@ -2452,12 +2717,13 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: **IPC's
-implementation** (M9's architect pass fixed the semantics; no code
-yet), device interrupts beyond the timer (the legacy PICs are masked
-and the IOAPIC is untouched), other CPUs, a loader (M8's user programs
-are assembled by hand, byte by byte, because anything longer would
-need one), and a user-space scheduler.
+Deliberately absent, each belonging to a later milestone: **a real
+IOAPIC** (M10 delivers interrupts through the LAPIC and masks lines
+with a software flag — see *Known gaps*), **a device driver** (M10
+gets interrupts to user space; nothing drives hardware yet), other
+CPUs, a loader (user programs are still assembled by hand, byte by
+byte, because anything longer would need one), and a user-space
+scheduler.
 
 Three things arrived in M8 as debts rather than features, and each is
 written down where it will be found:

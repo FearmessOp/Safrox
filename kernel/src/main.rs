@@ -62,6 +62,7 @@ mod idt;
 mod interrupts;
 mod io;
 mod ipctest;
+mod irqtest;
 mod memory;
 mod memtest;
 mod panic;
@@ -892,6 +893,44 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("ipc-test") {
         println!("[boot] cmdline requested the IPC tests");
         ipctest::run();
+    }
+
+    // M10 interrupt scenarios.
+    //
+    // Every token begins "irq-" and none contains another, which is
+    // the rule M9c arrived at the hard way: `ipc-cap-test` contained
+    // `cap-test` and silently dispatched a different milestone's
+    // suite. Names that cannot overlap need remembering once;
+    // ordering rules need remembering by whoever adds the next
+    // scenario.
+    //
+    // `irq-alloc` in particular is *not* spelled
+    // `irq-interrupt-alloc`, which would contain M5's
+    // `cap-interrupt-alloc`... it would not, in fact, but the near
+    // miss is the kind of thing that only has to be wrong once.
+    if cmdline.contains("irq-no-cap") {
+        println!("[boot] cmdline requested the no-capability interrupt test");
+        irqtest::run_no_cap();
+    }
+
+    if cmdline.contains("irq-revoked") {
+        println!("[boot] cmdline requested the revoked-destination test");
+        irqtest::run_revoked();
+    }
+
+    if cmdline.contains("irq-alloc") {
+        println!("[boot] cmdline requested the device-interrupt allocation tripwire");
+        irqtest::run_alloc();
+    }
+
+    if cmdline.contains("irq-user") {
+        println!("[boot] cmdline requested the ring 3 interrupt test");
+        irqtest::run_user();
+    }
+
+    if cmdline.contains("irq-test") {
+        println!("[boot] cmdline requested the interrupt tests");
+        irqtest::run();
     }
 
     println!("[boot] M9a checks passed");
