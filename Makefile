@@ -73,6 +73,12 @@ ISO_USERFORGE := $(BUILD_DIR)/pythos-userforge.iso
 ISO_IPCTEST := $(BUILD_DIR)/pythos-ipctest.iso
 ISO_IPCCANCEL := $(BUILD_DIR)/pythos-ipccancel.iso
 ISO_IPCREVOKED := $(BUILD_DIR)/pythos-ipcrevoked.iso
+# M9b call/reply images.
+ISO_IPCCALL := $(BUILD_DIR)/pythos-ipccall.iso
+ISO_IPCDEAD := $(BUILD_DIR)/pythos-ipcdead.iso
+ISO_IPCSTALE := $(BUILD_DIR)/pythos-ipcstale.iso
+ISO_IPCSELF := $(BUILD_DIR)/pythos-ipcself.iso
+ISO_IPCCOST := $(BUILD_DIR)/pythos-ipccost.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -86,7 +92,9 @@ ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_VSSTALE) \
                $(ISO_USERTEST) $(ISO_USERPRIV) $(ISO_USERKREAD) \
                $(ISO_USERSMEP) $(ISO_USERSMAP) $(ISO_USERFORGE) \
-               $(ISO_IPCTEST) $(ISO_IPCCANCEL) $(ISO_IPCREVOKED)
+               $(ISO_IPCTEST) $(ISO_IPCCANCEL) $(ISO_IPCREVOKED) \
+               $(ISO_IPCCALL) $(ISO_IPCDEAD) $(ISO_IPCSTALE) \
+               $(ISO_IPCSELF) $(ISO_IPCCOST)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -149,6 +157,8 @@ QEMU_FLAGS := \
         run-usertest run-userpriv run-userkread run-usersmep \
         run-usersmap run-userforge \
         run-ipctest run-ipccancel run-ipcrevoked \
+        run-ipccall run-ipcdead run-ipcstale run-ipcself \
+        run-ipccost \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -401,7 +411,9 @@ test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
       run-vspacetest run-vskernel run-vsisolation run-vsstale \
       run-usertest run-userpriv run-userkread run-usersmep \
       run-usersmap run-userforge \
-      run-ipctest run-ipccancel run-ipcrevoked
+      run-ipctest run-ipccancel run-ipcrevoked \
+        run-ipccall run-ipcdead run-ipcstale run-ipcself \
+        run-ipccost
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 	--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
 	@echo "M9a: all acceptance tests passed"
@@ -534,3 +546,40 @@ run-ipccancel: $(ISO_IPCCANCEL)
 
 run-ipcrevoked: $(ISO_IPCREVOKED)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCREVOKED) --expect ipcrevoked -- $(QEMU_FLAGS)
+
+# ---- M9b call/reply images --------------------------------------------
+
+$(ISO_IPCCALL): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,37)
+
+$(ISO_IPCDEAD): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,38)
+
+$(ISO_IPCSTALE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,39)
+
+$(ISO_IPCSELF): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,40)
+
+$(ISO_IPCCOST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,41)
+
+# M9b scenarios. All five exit 33, including the three negatives:
+# a client woken with an error is a caller-visible outcome, not a
+# fault, and a kernel that died on any of them would be one a user
+# component could halt.
+
+run-ipccall: $(ISO_IPCCALL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCCALL) --expect ipccall -- $(QEMU_FLAGS)
+
+run-ipcdead: $(ISO_IPCDEAD)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCDEAD) --expect ipcdead -- $(QEMU_FLAGS)
+
+run-ipcstale: $(ISO_IPCSTALE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCSTALE) --expect ipcstale -- $(QEMU_FLAGS)
+
+run-ipcself: $(ISO_IPCSELF)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCSELF) --expect ipcself -- $(QEMU_FLAGS)
+
+run-ipccost: $(ISO_IPCCOST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IPCCOST) --expect ipccost -- $(QEMU_FLAGS)

@@ -3,8 +3,8 @@
 Bu belge ADR 033–040'ın birlikte ne anlama geldiğini tek yerde
 topluyor. Kararların gerekçesi ADR'lerde; burada **ne olduğu** var.
 
-Güncelleme: **M9a uygulandı.** Belge hem şartname hem de artık
-çalışan kodun tarifi; ikisinin ayrımı aşağıdaki tabloda.
+Güncelleme: **M9a ve M9b uygulandı.** Belge hem şartname hem de
+artık çalışan kodun tarifi; ikisinin ayrımı aşağıdaki tabloda.
 
 ## Kapsam: ne çalışıyor, ne yazıldı ama kapalı
 
@@ -16,19 +16,45 @@ tamamı "denenmemiş iddia iddia değildir" üzerine kurulu.
 | Parça | İçerik | Durum |
 |---|---|---|
 | **M9a** | Endpoint, `Send`, `Recv`, bekleme kuyruğu, iptal | **çalışıyor, test ediliyor** |
-| M9b | `Call`, `Reply`, `ReplyRecv`, badge, cevap doğrulama | yazıldı, `dead_code` |
+| **M9b** | `Call`, `Reply`, `ReplyRecv`, badge, cevap doğrulama | **çalışıyor, test ediliyor** |
 | M9c | Capability transferi, Notification, bağlı bekleme | yazıldı, `dead_code` |
 
-Sonraki parçalar yorum satırına alınmadı, silinmedi:
-`#[allow(dead_code)]` ile duruyorlar. Yorumlamak derleyicinin
+Kalan parça yorum satırına alınmadı, silinmedi:
+`#[allow(dead_code)]` ile duruyor. Yorumlamak derleyicinin
 denetimini keserdi; silmek, olduğu kadarıyla doğru olan işi çöpe
-atardı. Böylece her parça her derlemede tip denetiminden geçiyor ve
-bir attribute silinerek açılıyor — ve **hiçbir şey test edilmediği
+atardı. Böylece her derlemede tip denetiminden geçiyor ve bir
+attribute silinerek açılıyor — ve **hiçbir şey test edilmediği
 halde test edilmiş gibi durmuyor.**
 
-Bu belgedeki M9b/M9c bölümleri dolayısıyla hâlâ şartname. M9a'nın
-bölümleri ise ölçülmüş: kabul testleri `ipc-test`,
-`ipc-cancel-cost` ve `ipc-endpoint-revoked`.
+Bu belgedeki M9c bölümleri dolayısıyla hâlâ şartname. M9a ve M9b'nin
+bölümleri ölçülmüş: kabul testleri `ipc-test`, `ipc-cancel-cost`,
+`ipc-endpoint-revoked`, `ipc-call-test`, `ipc-server-dies`,
+`ipc-stale-reply`, `ipc-self-call` ve `ipc-cost`.
+
+### Parçalara bölmek ne kazandırdı
+
+M9b'yi açmak, M9a'nın testlerinin erişemediği **dört** kusur buldu —
+her biri ona ulaşan senaryonun ilk koşusunda, ve üçü M9a'nın
+gönderip test ettiği kodun içinde:
+
+1. **Global teslimat yuvası sağlam değildi.** "Aynı anda en fazla bir
+   teslimat havada olabilir" invariant'ı hiçbir zaman doğru değildi;
+   yalnızca erişilemezdi. Uyandırmak çalıştırmak değil — `ReplyRecv`
+   ilki hâlâ yuvadayken ikinci bir teslimat park ediyor. Teslimat
+   hedef thread'in TCB'sine taşındı (ADR 036).
+2. **`Call`'ın acil randevu yolu outcome'ı okumuyordu**, dolayısıyla
+   sunucusu ölen bir istemci boş bir mesaj ve bir *başarı* alıyordu.
+3. **`send_inner`'ın randevu dalı** uyandırdığı alıcıya outcome
+   yazmıyordu. M9a'da görünmezdi, çünkü `recv` sebebi mesajın
+   içeriğinden çıkarıyordu — ki ADR 034 boş mesaja izin verdiği için
+   o çıkarım da yanlıştı.
+4. **Kuyruğa girmiş bir `Call` bir kez uyanıyor**, outcome iki kez
+   okunuyordu; ikinci okuma temizlenmiş alanı görüp `Pending`
+   buluyordu.
+
+Hepsi birden yazılsaydı hepsi birden gelirdi — hiç çalıştırılmamış
+bir derlemede. (Üçünün ayrıntısı ADR 039'da, birincisininki
+ADR 036'da.)
 
 ### M9a'nın iki taşıyıcı sonucu
 
@@ -399,20 +425,46 @@ tetiklenmiş olmalı).
 
 ---
 
-## 8. Ne ölçülecek
+## 8. Ölçüm (M9b'de yapıldı)
 
-ADR 040 fastpath'i erteledi ve karşılığında ölçüm sözü verdi:
+ADR 040 fastpath'i erteledi ve karşılığında ölçüm sözü verdi.
+`ipc-cost` o sözü ödüyor; üç yolu 32 örneğin **minimumuyla**
+ölçüyor (gürültü hep ekler, en küçük gözlem gerçeğe en yakın
+olandır — M9a'nın iptal ölçümünün zor yoldan öğrettiği şey).
 
-| Senaryo | Ne gösteriyor |
-|---|---|
-| 3 word, cap yok, alıcı hazır | fastpath'in gelecekteki taban çizgisi |
-| 3 word, cap yok, alıcı hazır değil | bir bağlam değiştirmenin maliyeti |
-| 128 word, 4 cap, alıcı hazır | kopyalama + transfer |
+| Yol | Çevrim | Ne içeriyor |
+|---|---|---|
+| `Send`+`Recv` | 882 | bir randevu, bir bağlam değişimi |
+| `Call`+`Reply` | 13 902 | iki randevu, iki bağlam değişimi |
+| `ReplyRecv` döngüsü | 13 776 | aynısı, sunucu yarısı tek girişte |
 
-Taban çizgisi M8'in syscall turu: **934 çevrim** (emülasyon).
+Karşılaştırma tabanı M8'in syscall turu (**934 çevrim**) ve bağlam
+değişimi (**~1000**).
 
-Üçüncü senaryo ADR 034'ün "ilk word'ler register'da" kararını
-sınayacak: fark küçükse karar gereksizdi.
+**`Call` bir randevudan 13 020 çevrim pahalı.** Beklenen yön bu — o
+bir değil iki randevu — ve test bunu bir sağlık kontrolü olarak
+*şart koşuyor*: eşit çıksalardı rakamlar işi değil başka bir şeyi
+ölçüyor olurdu.
 
-Emülasyon şerhi: QEMU'da kopyalama maliyeti gerçek donanımı
-yansıtmıyor (cache davranışı). Üçüncü sayı **üst sınır**.
+**`ReplyRecv` tasarrufu yalnızca 126 çevrim**, ADR 036'nın
+dayandığı ~934'lük kernel girişinin çok altında. Sebep mekanizmada
+değil, ölçümün koştuğu yerde: M13'e kadar user mode yok, dolayısıyla
+`reply_recv` bir fonksiyon çağrısıyla erişiliyor ve hiçbir ayrıcalık
+geçişi tasarruf edilmiyor; tasarruf edilen bir çağrı ve bir endpoint
+yeniden çözümlemesi. Bu rakam **rapor ediliyor, iddia edilmiyor** —
+ADR 036'nın savı M13'te sınanabilir hale geliyor ve orada sınanmalı.
+Yine de kayda geçiyor, çünkü o karşılaştırmanın taban çizgisi bu.
+
+Senaryo bunu bir `assert` değil, iki kollu bir rapor olarak yazıyor:
+fark bu ölçümün gürültü tabanına yakın, dolayısıyla döngünün *pahalı*
+çıkması da bir arıza değil. Arıza olan, rakamın yorumsuz geçmesi
+olurdu.
+
+Henüz ölçülmeyen: **128 word + 4 cap**. Capability transferi M9c'de,
+ve ADR 034'ün "ilk word'ler register'da" kararını sınayan senaryo
+oraya kalıyor.
+
+Emülasyon şerhi: QEMU'nun TCG'si bir ayrıcalık geçişinin gerçek
+silikonda maliyeti olan pipeline boşaltmasını modellemiyor. Her
+rakam bir **taban**, ve aralarındaki oranlar tek tek rakamlardan
+daha çok şey söylüyor.

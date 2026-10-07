@@ -188,13 +188,17 @@ pub const FXSAVE_OFFSET: usize = 256;
 /// not move anything the assembly reads. M9 is what that gap was for.
 pub const IPC_FIELDS_START: usize = 136;
 
-/// Where they end. Nine fields, 72 bytes.
+/// Where they end. Ten fields, 80 bytes.
 ///
 /// Named rather than written as a literal because the reserved array
 /// below is sized from it: get this wrong and the TCB changes size,
 /// which the `const` assertion turns into a build failure instead of a
 /// misaligned fxsave area at runtime.
-pub const IPC_FIELDS_END: usize = 208;
+///
+/// M9b moved this from 208 to 216 for `replying_server`. The gap M8
+/// left runs to [`FXSAVE_OFFSET`], so the room was already there and
+/// nothing else moved — which is what the gap was for.
+pub const IPC_FIELDS_END: usize = 216;
 
 /// Size of an `fxsave` area: fixed by the architecture.
 ///
@@ -251,22 +255,41 @@ impl ReplySlot {
     };
 }
 
-/// How a blocked sender's wait ended (ADR 039).
+/// How a blocked thread's IPC wait ended (ADR 039).
 ///
-/// Three outcomes and no fourth: the message was taken, the wait was
-/// cancelled, or nothing has happened yet. "Undefined" is not among
-/// them — the master prompt's rule applied to a state machine rather
-/// than to a value.
+/// Four outcomes and no fifth. "Undefined" is not among them — the
+/// master prompt's rule applied to a state machine rather than to a
+/// value.
+///
+/// # Why `Cancelled` and `ReplyGone` are separate
+///
+/// M9b added the fourth, and the reason is ADR 039's error table
+/// rather than tidiness:
+///
+/// | Cancelled while | The caller is told |
+/// |---|---|
+/// | `BlockedOnEndpoint` (Send or Recv) | `EndpointDead` |
+/// | `BlockedOnReply` | `ReplyTargetGone` |
+///
+/// A `Call` passes through *both* states, so by the time it wakes its
+/// own state no longer says which one it was cancelled in. One value
+/// for both would have made a dead server and a revoked endpoint
+/// indistinguishable to the client — two situations with different
+/// remedies. The distinction is recorded where it is still known, in
+/// `cancel_ipc`, which can see the state it is cancelling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum SendOutcome {
     /// Still queued; nothing has happened.
     Pending = 0,
-    /// A receiver took the message.
+    /// A receiver took the message, or a reply arrived.
     Delivered = 1,
-    /// The endpoint was revoked, or this thread was taken out of the
-    /// queue by `Suspend` (ADR 039).
+    /// The endpoint was revoked, or this thread was taken out of its
+    /// queue by `Suspend` while waiting for a rendezvous (ADR 039).
     Cancelled = 2,
+    /// This thread was waiting for a **reply** that will never come:
+    /// the server died, or the wait was cancelled (ADR 036).
+    ReplyGone = 3,
 }
 
 impl SendOutcome {
@@ -274,6 +297,7 @@ impl SendOutcome {
         match bits {
             1 => SendOutcome::Delivered,
             2 => SendOutcome::Cancelled,
+            3 => SendOutcome::ReplyGone,
             // Anything else reads as "nothing has happened", which is
             // the only safe interpretation: it leaves the thread
             // waiting rather than inventing a completion it never had.
@@ -281,12 +305,12 @@ impl SendOutcome {
         }
     }
 
-    #[allow(dead_code)] // used by the M9b/M9c diagnostics
     pub const fn name(self) -> &'static str {
         match self {
             SendOutcome::Pending => "Pending",
             SendOutcome::Delivered => "Delivered",
             SendOutcome::Cancelled => "Cancelled",
+            SendOutcome::ReplyGone => "ReplyGone",
         }
     }
 }
@@ -348,6 +372,71 @@ impl PendingSend {
         _pad: 0,
         reply_slot: 0,
         caps: [0; 4],
+    };
+}
+
+/// A message waiting for a thread that is not running yet.
+///
+/// # Why this is per-thread, and what it replaced
+///
+/// M9a parked deliveries in **one global slot**, on the stated
+/// invariant that "at most one delivery can be in flight, because the
+/// transfer runs with interrupts disabled and the woken thread reads
+/// its delivery before anything else can run".
+///
+/// The second half of that sentence is false, and M9b's first run
+/// proved it: waking a thread calls `sched::enqueue`, which puts it on
+/// the *ready queue*. It does not run. The thread that did the waking
+/// carries on, and a server that replies and then receives again —
+/// which is the entire shape of `ReplyRecv` — parks a second delivery
+/// while the first is still sitting there.
+///
+/// The global slot's assertion caught it on the first attempt rather
+/// than letting two clients receive each other's answers, which is
+/// what that assertion was for. But the invariant it guarded was
+/// never true; it was merely unreachable in M9a, where no two
+/// deliveries ever overlapped.
+///
+/// A message addressed to a thread belongs in that thread. The send
+/// direction already worked this way ([`PendingSend`]) for the same
+/// reason, and the asymmetry was the oversight.
+///
+/// `#[repr(C)]` so the layout is written rather than inferred: the
+/// reserved array below is sized from this type.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Incoming {
+    /// The message tag.
+    tag: u64,
+    /// The first three message words.
+    registers: [u64; 3],
+    /// The badge on the capability the sender used (ADR 037), or the
+    /// accumulated signal mask for a notification.
+    badge: u32,
+    /// Whether anything is here at all.
+    ///
+    /// A flag rather than "the tag is zero", because a zero-length,
+    /// zero-label message is perfectly legal (ADR 034) and a receiver
+    /// must be able to tell one from an empty mailbox.
+    present: u8,
+    _pad: [u8; 3],
+}
+
+const _: () = {
+    assert!(
+        core::mem::size_of::<Incoming>() == 40,
+        "Incoming changed size; the TCB's reserved padding is computed \
+         from it and would no longer add up"
+    );
+};
+
+impl Incoming {
+    const EMPTY: Incoming = Incoming {
+        tag: 0,
+        registers: [0; 3],
+        badge: 0,
+        present: 0,
+        _pad: [0; 3],
     };
 }
 
@@ -525,6 +614,26 @@ pub struct Tcb {
     /// sources -- a client request and an interrupt.
     bound_notification: u64,
 
+    /// The server that owes *this* thread a reply, or zero (ADR 039).
+    ///
+    /// The other half of `reply_to`, and the two are always set and
+    /// cleared together:
+    ///
+    /// ```text
+    /// server.reply_to        -> caller
+    /// caller.replying_server -> server
+    /// ```
+    ///
+    /// Without it, cancelling a caller's wait would mean *finding* the
+    /// server that holds the reply right, and the only way to do that
+    /// is to examine every TCB in the system. ADR 039 rejected the
+    /// scan as unbounded work on a path the master prompt requires to
+    /// be bounded, and bought the back-pointer for eight bytes.
+    ///
+    /// The eight bytes carry an obligation: the two fields must agree,
+    /// so a `debug_assert` guards the places that write either one.
+    replying_server: u64,
+
     /// Reserved. Brings the fixed part to FXSAVE_OFFSET.
     _reserved: [u8; FXSAVE_OFFSET - IPC_FIELDS_END],
 
@@ -553,9 +662,21 @@ pub struct Tcb {
     /// happens immediately never touches it.
     pending: PendingSend,
 
+    /// The message this thread was woken with, if any (M9b).
+    ///
+    /// Beside `pending` and for the symmetrical reason: a thread that
+    /// is not running cannot be handed anything in registers, so both
+    /// directions need somewhere to wait. See [`Incoming`] for what
+    /// this replaced and why the global slot it replaced could not
+    /// work.
+    incoming: Incoming,
+
     /// Reserved. Brings the fixed part to IPC_BUFFER_OFFSET.
-    _reserved2:
-        [u8; IPC_BUFFER_OFFSET - FXSAVE_OFFSET - FXSAVE_SIZE - core::mem::size_of::<PendingSend>()],
+    _reserved2: [u8; IPC_BUFFER_OFFSET
+        - FXSAVE_OFFSET
+        - FXSAVE_SIZE
+        - core::mem::size_of::<PendingSend>()
+        - core::mem::size_of::<Incoming>()],
 
     /// The IPC buffer: 128 message words (ADR 017, ADR 034).
     ///
@@ -640,8 +761,13 @@ const _: () = {
         "receive_cnode and reply_to swapped places"
     );
     assert!(
-        core::mem::offset_of!(Tcb, bound_notification) + 8 == IPC_FIELDS_END,
-        "bound_notification is not the last IPC field, or IPC_FIELDS_END \
+        core::mem::offset_of!(Tcb, replying_server)
+            == core::mem::offset_of!(Tcb, bound_notification) + 8,
+        "replying_server must follow bound_notification"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, replying_server) + 8 == IPC_FIELDS_END,
+        "replying_server is not the last IPC field, or IPC_FIELDS_END \
          is wrong; the reserved array below is sized from it"
     );
     assert!(
@@ -945,11 +1071,36 @@ impl Tcb {
     /// `BlockedOnReply`, and `slot` the address of the slot holding
     /// its capability.
     pub(crate) unsafe fn set_reply_target(&mut self, caller: u64, slot: PhysAddr, generation: u8) {
+        debug_assert!(
+            self.reply_to == 0,
+            "this thread already owes a reply to {:#018x}; recording a \
+             second caller would strand the first for good",
+            self.reply_to
+        );
         self.reply_to = caller;
         self.reply_slot = slot.0;
         self.reply_generation = generation;
+
+        // The back half of the link, written here so the two can
+        // never be set separately. ADR 039 requires them to be either
+        // both full or both empty, and the cheapest way to hold a
+        // rule like that is to give it one place to live.
+        //
+        // SAFETY: The caller guarantees `caller` names a live TCB
+        // entering BlockedOnReply.
+        let caller_tcb = unsafe { tcb_at(ObjectRef(PhysAddr(caller))) };
+        // SAFETY: Every TCB lives in the physical window.
+        let own_phys = unsafe { tcb_phys(self) };
+        caller_tcb.replying_server = own_phys.0;
     }
 
+    /// Forget that this thread owes a reply.
+    ///
+    /// Clears only this end of the link. The caller's
+    /// `replying_server` is cleared by whichever path knows the caller
+    /// is still the thread it was — this function is also reached when
+    /// the caller has *gone*, and following a stale pointer to tidy it
+    /// up is exactly the bug the generation check exists to prevent.
     pub(crate) fn clear_reply_target(&mut self) {
         self.reply_to = 0;
         self.reply_slot = 0;
@@ -1046,6 +1197,21 @@ impl Tcb {
         self.bound_notification = notification;
     }
 
+    /// The server that owes this thread a reply, or zero (ADR 039).
+    pub fn replying_server(&self) -> u64 {
+        self.replying_server
+    }
+
+    /// Record which server owes this thread a reply.
+    ///
+    /// The back half of the two-way link; `set_reply_target` writes
+    /// the front half on the server. Both are written at rendezvous
+    /// and both are cleared when the reply arrives or the wait is
+    /// cancelled.
+    pub(crate) fn set_replying_server(&mut self, server: u64) {
+        self.replying_server = server;
+    }
+
     /// Whether the previous bound delivery was the notification.
     ///
     /// The alternation bit — ADR 038's starvation guarantee in one
@@ -1121,11 +1287,6 @@ impl Tcb {
         self.pending.outcome = outcome as u8;
     }
 
-    /// How this thread's IPC wait ended, without clearing it.
-    pub(crate) fn send_outcome(&self) -> SendOutcome {
-        SendOutcome::from_bits(self.pending.outcome)
-    }
-
     /// Read and clear the outcome.
     ///
     /// Clearing matters: a thread that sent once and blocked again
@@ -1137,9 +1298,62 @@ impl Tcb {
         outcome
     }
 
+    // ---- The message this thread was woken with (M9b) --------------
+
+    /// Park a delivery for a thread that is not running yet.
+    ///
+    /// # Panics
+    ///
+    /// If one is already parked. A second delivery would overwrite a
+    /// message the thread has not collected, and both situations that
+    /// could produce one are kernel defects: a wake path that does not
+    /// clear, or two senders matched with a single receiver.
+    ///
+    /// This assertion replaces the one on M9a's *global* delivery slot
+    /// and keeps its value. What changes is that the check is now
+    /// per-thread, so the **legal** case — two deliveries to two
+    /// different threads — stops tripping it. That case is not
+    /// hypothetical: it is every `ReplyRecv`.
+    pub(crate) fn park_incoming(&mut self, tag: u64, badge: u32, registers: [u64; 3]) {
+        assert!(
+            self.incoming.present == 0,
+            "a second message was parked for a thread that has not \
+             collected the first; either a wake path is not clearing \
+             the slot, or two senders were matched with one receiver"
+        );
+        self.incoming = Incoming {
+            tag,
+            registers,
+            badge,
+            present: 1,
+            _pad: [0; 3],
+        };
+    }
+
+    /// Collect the parked message, if there is one.
+    ///
+    /// `None` means nothing was parked, which is how a cancelled wait
+    /// is told from a legitimately empty message — ADR 034 permits a
+    /// zero-length, zero-label one, so the contents cannot carry that
+    /// distinction.
+    pub(crate) fn take_incoming(&mut self) -> Option<(u64, u32, [u64; 3])> {
+        if self.incoming.present == 0 {
+            return None;
+        }
+        let taken = self.incoming;
+        self.incoming = Incoming::EMPTY;
+        Some((taken.tag, taken.badge, taken.registers))
+    }
+
+    /// Throw away a parked message its target will never collect.
+    pub(crate) fn discard_incoming(&mut self) {
+        self.incoming = Incoming::EMPTY;
+    }
+
     /// Reset every IPC field. Part of `configure`.
     pub(crate) fn clear_ipc_state(&mut self) {
         self.pending = PendingSend::EMPTY;
+        self.incoming = Incoming::EMPTY;
         self.ipc_next = 0;
         self.ipc_prev = 0;
         self.blocked_on_endpoint = 0;
@@ -1147,6 +1361,7 @@ impl Tcb {
         self.clear_reply_target();
         self.clear_receive_slots();
         self.bound_notification = 0;
+        self.replying_server = 0;
     }
 
     /// Give this thread a stack and an entry point, ready to run.

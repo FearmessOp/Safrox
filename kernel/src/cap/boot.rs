@@ -607,9 +607,36 @@ pub unsafe fn root_untyped(index: usize) -> &'static mut Slot {
 ///
 /// As [`leaf_cnode`]: `init_from_regions` must have run.
 pub unsafe fn root_untyped_with_room(bytes: u64) -> &'static mut Slot {
+    // SAFETY: Caller's guarantee.
+    unsafe { root_untyped_with_room_from(bytes, 0) }
+}
+
+/// As [`root_untyped_with_room`], but skipping the first `skip`
+/// candidates that would have matched.
+///
+/// # Why a test would want this
+///
+/// Normally a fixture should not care *which* Untyped it gets — that
+/// is K6's whole point. But one scenario does, and for a reason the
+/// rule anticipates rather than contradicts: `ipc-stale-reply` has to
+/// **revoke** an Untyped to get a TCB's memory back, and a revoke
+/// takes every object carved from it. If the client and the server
+/// came from the same one, destroying the client would destroy the
+/// running server too.
+///
+/// So the requirement is not "give me Untyped number 3" but "give me
+/// one that is not the one you gave me before" — which is still a
+/// statement about *need* rather than about the memory map, and still
+/// fails loudly if it cannot be met.
+///
+/// # Safety
+///
+/// As [`root_untyped_with_room`].
+pub unsafe fn root_untyped_with_room_from(bytes: u64, skip: usize) -> &'static mut Slot {
     let count = root_untyped_count();
     let mut largest_remaining = 0u64;
     let mut found: Option<usize> = None;
+    let mut skipped = 0usize;
 
     for index in 0..count {
         // SAFETY: Index below the count, and the caller guarantees the
@@ -625,6 +652,10 @@ pub unsafe fn root_untyped_with_room(bytes: u64) -> &'static mut Slot {
             largest_remaining = remaining;
         }
         if remaining >= bytes && found.is_none() {
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
             found = Some(index);
             // Not breaking: the loop also computes `largest_remaining`
             // for the panic below, and a scan of ~100 slots at fixture
@@ -638,11 +669,14 @@ pub unsafe fn root_untyped_with_room(bytes: u64) -> &'static mut Slot {
         // SAFETY: Index came from the loop above, so it is in range.
         Some(index) => unsafe { root_untyped(index) },
         None => panic!(
-            "no root Untyped has {} bytes free: {} were examined and the \
-             most any of them had left was {}. Either the request is \
-             larger than a root Untyped can be (the largest is 2^{} = \
-             {} bytes) or earlier fixtures have used the memory up",
+            "no root Untyped has {} bytes free after skipping {}: {} were \
+             examined and the most any of them had left was {}. Either \
+             the request is larger than a root Untyped can be (the \
+             largest is 2^{} = {} bytes), earlier fixtures have used the \
+             memory up, or the skip count is higher than the number of \
+             Untypeds that can satisfy the request",
             bytes,
+            skip,
             count,
             largest_remaining,
             MAX_ROOT_UNTYPED_BITS,

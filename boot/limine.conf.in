@@ -372,3 +372,80 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: ipc-endpoint-revoked
+
+/PythOS (call and reply)
+    comment: M9b. Four scenarios: a Call/Reply round trip, ReplyRecv
+    comment: doing two operations in one kernel entry, two badged
+    comment: clients the server tells apart, and the reply-stealing
+    comment: case.
+    comment: The fourth is ADR 036's finest decision: reply_to is
+    comment: written at the rendezvous rather than when Recv returns,
+    comment: because otherwise a second server arriving between a
+    comment: first server's Recv and its Reply would take the first
+    comment: server's caller. The window is opened by the test rather
+    comment: than by a timer, so the scenario is deterministic --
+    comment: ADR 023's K8, learned in M9a. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-call-test
+
+/PythOS (server dies owing a reply)
+    comment: A server is revoked while holding a caller. The client
+    comment: must wake with ReplyTargetGone rather than waiting for
+    comment: an answer that can never come.
+    comment: ADR 036 separates two cases and treats them differently:
+    comment: a server that *declines* to answer leaves its client
+    comment: waiting forever, which is accepted because a timeout
+    comment: needs a scheduling budget this project does not have. A
+    comment: server that *dies* is a case the kernel can see, so
+    comment: leaving the client blocked would be a defect rather than
+    comment: a trade-off. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-server-dies
+
+/PythOS (stale reply target)
+    comment: The caller's TCB is revoked and a new TCB is retyped into
+    comment: the same memory -- which ADR 020's watermark reset makes
+    comment: likely rather than contrived. The server's Reply must be
+    comment: refused.
+    comment: This is the only scenario in which the generation check
+    comment: can be seen to work: the address matches, so an
+    comment: address-only check would deliver the reply to a stranger.
+    comment: The test verifies the new TCB really did land at the old
+    comment: address BEFORE asserting anything, because if it did not
+    comment: the scenario proves nothing and must say so. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-stale-reply
+
+/PythOS (self-call deadlock)
+    comment: A thread Calls its own endpoint with nobody receiving. It
+    comment: blocks forever, and that is deliberately not prevented: a
+    comment: check for "am I the receiver" would catch this and miss
+    comment: A->B->A, which is partial protection at full cost.
+    comment: What the design does promise is that the deadlock is
+    comment: escapable, and this tests that promise -- Suspend takes
+    comment: the thread off the queue and the Call returns an error.
+    comment: The escape needs a TCB capability, so rescue is itself an
+    comment: authority. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-self-call
+
+/PythOS (IPC cost)
+    comment: ADR 040 refused a fastpath and promised to measure the
+    comment: slow one instead. Three figures: a bare Send+Recv
+    comment: rendezvous, a Call+Reply round, and a server loop built
+    comment: on ReplyRecv.
+    comment: The differences matter more than any single number -- a
+    comment: Call is two rendezvous where a Send is one, and the test
+    comment: asserts that ordering rather than a target, because equal
+    comment: figures would mean the measurement is reporting
+    comment: something other than the IPC path.
+    comment: Minimum of 32 samples after a warm-up, which is M9a's
+    comment: lesson: the first touch of freshly-zeroed memory swamped
+    comment: that measurement by two orders of magnitude. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: ipc-cost

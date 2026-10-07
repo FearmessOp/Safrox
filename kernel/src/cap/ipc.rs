@@ -39,15 +39,35 @@
 //! | Part | Contents | State |
 //! |---|---|---|
 //! | **M9a** | Endpoint, `Send`, `Recv`, the wait queue, cancellation | **live** |
-//! | M9b | `Call`, `Reply`, `ReplyRecv`, badges, reply validation | written, `dead_code` |
+//! | **M9b** | `Call`, `Reply`, `ReplyRecv`, badges, reply validation | **live** |
 //! | M9c | capability transfer, Notification, bound waiting | written, `dead_code` |
 //!
-//! The later parts are marked `#[allow(dead_code)]` rather than
-//! commented out or deleted. Commenting them out would stop the
-//! compiler checking them; deleting them would throw away work that is
-//! correct as far as it goes. This way each part is type-checked on
-//! every build and turned on by removing one attribute — and nothing
+//! The remaining part is marked `#[allow(dead_code)]` rather than
+//! commented out or deleted. Commenting it out would stop the
+//! compiler checking it; deleting it would throw away work that is
+//! correct as far as it goes. This way it is type-checked on every
+//! build and turned on by removing one attribute — and nothing
 //! claims to be tested that is not.
+//!
+//! Splitting the milestone paid for itself twice over. Turning M9b on
+//! found **four** defects that M9a's tests could not reach, every one
+//! of them on the first run of the scenario that reached it:
+//!
+//! * the global delivery slot was unsound — see [`Incoming`] in
+//!   `tcb.rs`; the invariant it asserted was never true, only
+//!   unreachable;
+//! * `Call`'s immediate-rendezvous path never read its outcome, so a
+//!   client whose server died got an empty **success**;
+//! * `send_inner`'s rendezvous branch never recorded an outcome for
+//!   the receiver it woke — invisible while `recv` inferred the
+//!   reason from the message's contents rather than reading it;
+//! * a queued `Call` wakes **once**, and the outcome was read twice.
+//!
+//! Three of those are in code M9a shipped and tested. Written all at
+//! once, they would have arrived together, in a build that had never
+//! run.
+//!
+//! [`Incoming`]: super::tcb::Incoming
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -719,6 +739,17 @@ static ALTERNATION_CHOSE_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 /// Replies that found their target gone (ADR 036).
 static STALE_REPLIES: AtomicU64 = AtomicU64::new(0);
+/// Calls made: a Send that also waits for an answer.
+static CALLS: AtomicU64 = AtomicU64::new(0);
+/// Replies delivered to a caller that was still waiting.
+static REPLIES_SENT: AtomicU64 = AtomicU64::new(0);
+/// `ReplyRecv` invocations — one syscall doing two operations.
+///
+/// Counted so the acceptance test can show the saving is real rather
+/// than claimed: a server loop using `ReplyRecv` makes exactly one
+/// kernel entry per request, and the figure here against the syscall
+/// count is what demonstrates it (ADR 036).
+static REPLY_RECVS: AtomicU64 = AtomicU64::new(0);
 
 pub fn rendezvous_count() -> u64 {
     RENDEZVOUS_COUNT.load(Ordering::Acquire)
@@ -760,6 +791,18 @@ pub fn stale_replies() -> u64 {
     STALE_REPLIES.load(Ordering::Acquire)
 }
 
+pub fn calls() -> u64 {
+    CALLS.load(Ordering::Acquire)
+}
+
+pub fn replies_sent() -> u64 {
+    REPLIES_SENT.load(Ordering::Acquire)
+}
+
+pub fn reply_recvs() -> u64 {
+    REPLY_RECVS.load(Ordering::Acquire)
+}
+
 /// Report what the IPC path has done.
 pub fn report() {
     use crate::println;
@@ -786,6 +829,13 @@ pub fn report() {
         "[ipc] {} cancellations, {} replies found their target gone",
         cancellations(),
         stale_replies()
+    );
+    println!(
+        "[ipc] call/reply: {} calls, {} replies delivered, {} of them \
+         through ReplyRecv (one syscall rather than two, ADR 036)",
+        calls(),
+        replies_sent(),
+        reply_recvs()
     );
 }
 
@@ -1018,103 +1068,50 @@ impl Message<'_> {
     }
 }
 
-// ---- The delivery slot -------------------------------------------------
-
-/// Where a delivery waits until the receiving thread runs again.
-///
-/// A blocked receiver cannot be handed its message directly: it is not
-/// executing, and its registers are in a saved context. So the delivery
-/// is parked here and collected when the thread resumes.
-///
-/// **One slot, not one per thread**, and the reason is an invariant
-/// worth stating: at most one delivery can be in flight, because the
-/// whole transfer runs with interrupts disabled and the woken thread
-/// reads its delivery before anything else can run. The assertion in
-/// `put` holds that invariant rather than trusting it — if the
-/// transfer ever became interruptible, this is what would say so.
-static PENDING_DELIVERY: DeliverySlot = DeliverySlot::new();
-
-/// A single-slot mailbox for a delivery in flight.
-///
-/// Not a lock and not a queue: a cell with a tripwire.
-struct DeliverySlot {
-    slot: core::cell::UnsafeCell<Option<(u64, Delivery)>>,
-}
-
-// SAFETY: Single CPU, and every access happens inside an
-// interrupt-disabled region. There is no second execution context that
-// could observe a partial write.
-unsafe impl Sync for DeliverySlot {}
-
-impl DeliverySlot {
-    const fn new() -> DeliverySlot {
-        DeliverySlot {
-            slot: core::cell::UnsafeCell::new(None),
-        }
-    }
-
-    /// Park a delivery for the thread at `target`.
-    ///
-    /// # Safety
-    ///
-    /// Interrupts must be disabled.
-    unsafe fn put(&self, target: u64, delivery: Delivery) {
-        debug_assert!(!crate::sched::interrupts_enabled());
-        // SAFETY: Single CPU, interrupts disabled by the caller.
-        let slot = unsafe { &mut *self.slot.get() };
-        assert!(
-            slot.is_none(),
-            "two IPC deliveries are in flight at once; the transfer is \
-             meant to be indivisible (ADR 025), so something yielded in \
-             the middle of one"
-        );
-        *slot = Some((target, delivery));
-    }
-
-    /// Collect the delivery meant for `target`.
-    ///
-    /// # Safety
-    ///
-    /// Interrupts must be disabled.
-    unsafe fn take(&self, target: u64) -> Option<Delivery> {
-        debug_assert!(!crate::sched::interrupts_enabled());
-        // SAFETY: As above.
-        let slot = unsafe { &mut *self.slot.get() };
-        match slot {
-            Some((owner, delivery)) if *owner == target => {
-                let delivery = *delivery;
-                *slot = None;
-                Some(delivery)
-            }
-            _ => None,
-        }
-    }
-
-    /// Throw away a delivery whose target will never collect it.
-    ///
-    /// # Safety
-    ///
-    /// Interrupts must be disabled.
-    unsafe fn discard(&self, target: u64) {
-        debug_assert!(!crate::sched::interrupts_enabled());
-        // SAFETY: As above.
-        let slot = unsafe { &mut *self.slot.get() };
-        if matches!(slot, Some((owner, _)) if *owner == target) {
-            *slot = None;
-        }
-    }
-}
+// ---- Parking a delivery ------------------------------------------------
+//
+// A blocked receiver cannot be handed its message directly: it is not
+// executing, and its registers are in a saved context. So the delivery
+// waits in the receiver's own TCB until it runs again.
+//
+// # What this replaced, and why the first version could not work
+//
+// M9a parked deliveries in a single global slot, with an assertion
+// that only one could ever be in flight. The stated reason was that
+// "the transfer runs with interrupts disabled and the woken thread
+// reads its delivery before anything else can run".
+//
+// The second half is false. Waking a thread calls `sched::enqueue`,
+// which makes it *ready* -- it does not run. The waker carries on, and
+// a server that replies and then receives again (which is the whole
+// shape of `ReplyRecv`) parks a second delivery while the first is
+// still sitting in the slot.
+//
+// M9b's first run tripped the assertion on its second scenario. That
+// is the assertion working: it reported a broken invariant instead of
+// letting two clients receive each other's answers. But the invariant
+// was never true -- only unreachable, because nothing in M9a produced
+// two overlapping deliveries.
+//
+// A message addressed to a thread belongs in that thread. The send
+// direction already worked this way (`PendingSend`), and the asymmetry
+// was the oversight rather than a decision.
 
 /// Collect the message this thread was woken with.
 ///
 /// # Safety
 ///
 /// Interrupts disabled, and `thread` is the running thread.
-unsafe fn take_delivery(thread: &Tcb) -> Delivery {
-    // SAFETY: Every TCB lives in the physical window.
-    let phys = unsafe { tcb::tcb_phys(thread) }.0;
-    // SAFETY: Interrupts disabled by the caller.
-    unsafe { PENDING_DELIVERY.take(phys) }.unwrap_or(Delivery::EMPTY)
+unsafe fn take_delivery(thread: &mut Tcb) -> Delivery {
+    debug_assert!(!crate::sched::interrupts_enabled());
+    match thread.take_incoming() {
+        Some((tag, badge, registers)) => Delivery {
+            tag: MessageTag::from_bits(tag),
+            badge,
+            registers,
+        },
+        None => Delivery::EMPTY,
+    }
 }
 
 /// Hand a delivery to a thread that is about to be woken.
@@ -1122,11 +1119,9 @@ unsafe fn take_delivery(thread: &Tcb) -> Delivery {
 /// # Safety
 ///
 /// Interrupts disabled; `thread` live and about to become runnable.
-unsafe fn park_delivery(thread: &Tcb, delivery: Delivery) {
-    // SAFETY: Every TCB lives in the physical window.
-    let phys = unsafe { tcb::tcb_phys(thread) }.0;
-    // SAFETY: Interrupts disabled by the caller.
-    unsafe { PENDING_DELIVERY.put(phys, delivery) }
+unsafe fn park_delivery(thread: &mut Tcb, delivery: Delivery) {
+    debug_assert!(!crate::sched::interrupts_enabled());
+    thread.park_incoming(delivery.tag.bits(), delivery.badge, delivery.registers);
 }
 
 // ---- The rendezvous (ADR 033) ------------------------------------------
@@ -1289,6 +1284,21 @@ unsafe fn send_inner(
             }
         }
 
+        // The receiver's outcome, recorded here because this is a
+        // wake path and every wake path owes one.
+        //
+        // M9a left it out and nothing noticed: `recv` returned the
+        // parked delivery without asking why it had woken, so the
+        // field was never read. M9b's `collect_reply` reads the
+        // outcome on both `Call` paths, and the measurement scenario
+        // -- which blocks a receiver and then sends to it -- reached
+        // this line first and woke with `Pending`.
+        //
+        // The panic that caught it is deliberately worded as an
+        // instruction rather than a complaint: *some wake path is not
+        // recording one*. This was that path.
+        receiver.record_send_outcome(tcb::SendOutcome::Delivered);
+
         // SAFETY: The receiver is off every queue and about to run.
         unsafe {
             park_delivery(receiver, delivery);
@@ -1302,15 +1312,30 @@ unsafe fn send_inner(
         // `Call`: wait for the reply. Not in any queue -- the right to
         // wake us is in the server's TCB (ADR 033's second new state).
         //
-        // SAFETY: We are the running thread; `suspend` on the current
-        // thread yields and returns when something resumes us.
+        // SAFETY: We are the running thread; `block_current` yields
+        // and returns when something resumes us.
         unsafe {
             sender.set_state(ThreadState::BlockedOnReply);
             crate::sched::block_current();
         }
-        // SAFETY: We are running again, interrupts still disabled by
-        // the guard above.
-        return Ok(unsafe { take_delivery(sender) });
+
+        // And then the outcome, which this path used to skip.
+        //
+        // The first version returned `Ok(take_delivery(sender))` here
+        // without asking *why* the thread had woken -- so a client
+        // whose server died got an empty message and a success. The
+        // kernel had done everything right: `release_reply_obligation`
+        // woke the caller and recorded `ReplyGone`, and the log said
+        // so. The caller simply did not look.
+        //
+        // The deferred path below always checked. The asymmetry is
+        // the whole defect, and `ipc-server-dies` is what found it:
+        // the scenario arranges an immediate rendezvous, so it is the
+        // only one that reaches this branch with a dead server.
+        let outcome = sender.take_send_outcome();
+        // SAFETY: Running again, interrupts still disabled by the
+        // guard above.
+        return unsafe { collect_reply(sender, outcome, "Call, after an immediate rendezvous") };
     }
 
     // Nobody is receiving. Queue up and block.
@@ -1357,34 +1382,112 @@ unsafe fn send_inner(
         crate::sched::block_current();
     }
 
-    // Woken: a receiver took the message, or the wait was cancelled
-    // (ADR 039).
-    match sender.take_send_outcome() {
-        tcb::SendOutcome::Delivered => {
-            if kind == SendKind::Oneway {
-                Ok(Delivery::EMPTY)
-            } else {
-                // A `Call` whose message was taken is now in
-                // BlockedOnReply; by the time it runs again the reply
-                // has been parked for it.
-                //
-                // SAFETY: Running, interrupts disabled.
-                Ok(unsafe { take_delivery(sender) })
-            }
-        }
-        tcb::SendOutcome::Cancelled => Err(CapError::EndpointDead),
-        tcb::SendOutcome::Pending => {
-            // Woken with nothing recorded. Not a state the kernel can
-            // make sense of, and the master prompt does not allow
-            // "undefined" as an answer: a thread resumed from an IPC
-            // wait was resumed by *something*, and that something
-            // owes an outcome.
-            panic!(
-                "a thread blocked on an endpoint was resumed without an \
-                 outcome being recorded; some wake path is not setting one"
-            )
-        }
+    // Woken -- **once**, whichever kind this is, and that word is the
+    // whole of a defect this path had.
+    //
+    // A queued `Call` does not wake when its message is taken.
+    // `recv`'s `wants_reply` branch moves the sender from
+    // BlockedOnEndpoint straight to BlockedOnReply *without* making
+    // it runnable, so from this thread's side the two waits ADR 036
+    // describes are one sleep. There is one wake, and therefore one
+    // outcome to read.
+    //
+    // The first version read it here to choose between `Send` and
+    // `Call`, then handed the `Call` to `collect_reply`, which read
+    // it again. `take_send_outcome` clears the field, so the second
+    // read found `Pending` and the panic fired -- correctly. It was
+    // reporting a missing recording that was in fact a surplus read.
+    let outcome = sender.take_send_outcome();
+
+    if kind == SendKind::Call {
+        // SAFETY: Running, interrupts disabled.
+        return unsafe { collect_reply(sender, outcome, "Call, queued on an endpoint") };
     }
+
+    match outcome {
+        tcb::SendOutcome::Delivered => Ok(Delivery::EMPTY),
+        tcb::SendOutcome::Cancelled => Err(CapError::EndpointDead),
+        // A one-way `Send` never enters BlockedOnReply, and
+        // `ReplyGone` is only ever recorded for a thread that is in
+        // it: `cancel_ipc` chooses the outcome by state, and
+        // `release_reply_obligation` only ever touches the thread a
+        // reply target names. So this is not a case to handle but a
+        // claim that the state machine is intact.
+        tcb::SendOutcome::ReplyGone => panic!(
+            "a one-way Send woke with outcome ReplyGone, which is only \
+             recorded for a thread in BlockedOnReply -- a Send never \
+             enters that state, so either cancel_ipc() stopped \
+             choosing by state or a SendKind was lost"
+        ),
+        tcb::SendOutcome::Pending => unexpected_wake("Send, queued on an endpoint", outcome),
+    }
+}
+
+/// Turn the outcome a `Call` woke with into a result.
+///
+/// Both halves of `Call` end here — the one that rendezvoused
+/// immediately and the one that queued first — because both wake out
+/// of `BlockedOnReply` and owe the caller the same answer. Having two
+/// copies is how the immediate path came to skip the check entirely:
+/// it returned the parked message without asking whether one had been
+/// parked at all, so a dead server produced an empty success.
+///
+/// The outcome is **passed in rather than read here**, and that is
+/// not a matter of taste. `take_send_outcome` clears the field, so a
+/// second call consumes an answer nobody recorded; see the note in
+/// `send_inner` above. One wake, one read, and the reading happens
+/// where the caller already had to branch.
+///
+/// `waiting_in` names which of the two halves this was, so that a
+/// `Pending` says more than "a Call woke without an answer".
+///
+/// # Safety
+///
+/// `thread` is the running thread and interrupts are disabled.
+unsafe fn collect_reply(
+    thread: &mut Tcb,
+    outcome: tcb::SendOutcome,
+    waiting_in: &str,
+) -> Result<Delivery, CapError> {
+    match outcome {
+        tcb::SendOutcome::Delivered => {
+            // SAFETY: Caller's guarantee.
+            Ok(unsafe { take_delivery(thread) })
+        }
+        tcb::SendOutcome::ReplyGone => Err(CapError::ReplyTargetGone),
+        // Woken out of the *first* wait by a cancellation: the
+        // endpoint went away before anyone took the message. ADR 039's
+        // table keeps this distinct from ReplyGone because "the
+        // endpoint went away" and "the server went away" have
+        // different remedies, and a client that could not tell them
+        // apart would have to guess.
+        tcb::SendOutcome::Cancelled => Err(CapError::EndpointDead),
+        tcb::SendOutcome::Pending => unexpected_wake(waiting_in, outcome),
+    }
+}
+
+/// A thread woke from an IPC wait with no outcome recorded.
+///
+/// Not a state the kernel can make sense of, and the master prompt
+/// does not allow "undefined" as an answer: a thread resumed from an
+/// IPC wait was resumed by *something*, and that something owes it an
+/// answer.
+///
+/// `waiting_in` names the operation that was blocked. Without it the
+/// message says a wake path is missing but not *which* wait it
+/// failed to satisfy, and there are four — the two halves of `Call`,
+/// `Recv`, and `Wait`. The first attempt at this panic omitted it and
+/// cost a second run to find out.
+fn unexpected_wake(waiting_in: &str, outcome: tcb::SendOutcome) -> ! {
+    panic!(
+        "a thread blocked in {} was resumed with outcome {}; some wake \
+         path is not recording one. Every path that makes a blocked \
+         thread runnable owes it an answer -- see reply(), \
+         send_inner()'s rendezvous branch, cancel_ipc() and \
+         release_reply_obligation()",
+        waiting_in,
+        outcome.name()
+    )
 }
 
 /// Physical address of an Endpoint.
@@ -1434,13 +1537,13 @@ pub unsafe fn send(
 /// # Safety
 ///
 /// As [`send_inner`].
-#[allow(dead_code)] // M9b
 pub unsafe fn call(
     slot: &Slot,
     message: &Message<'_>,
     sender_space: &super::cptr::CSpace,
     caller_slot: &Slot,
 ) -> Result<Delivery, CapError> {
+    CALLS.fetch_add(1, Ordering::AcqRel);
     // SAFETY: Caller's guarantee.
     unsafe {
         send_inner(
@@ -1455,10 +1558,10 @@ pub unsafe fn call(
 
 /// `Recv`: wait for a message on an endpoint.
 ///
-/// **M9a.** A thread with a bound Notification can also be woken by a
-/// signal, with the alternation bit deciding which source wins when
-/// both are ready — that is ADR 038 and it arrives in M9c. Nothing in
-/// M9a can bind one, so the branch below never fires; it is left in
+/// A thread with a bound Notification can also be woken by a signal,
+/// with the alternation bit deciding which source wins when both are
+/// ready — that is ADR 038 and it arrives in **M9c**. Nothing before
+/// then can bind one, so the branch below never fires; it is left in
 /// place, behind a condition that is currently always false, rather
 /// than removed and rewritten later.
 ///
@@ -1540,7 +1643,20 @@ pub unsafe fn recv(slot: &Slot) -> Result<Delivery, CapError> {
                 sender.set_state(ThreadState::BlockedOnReply);
             }
             sender.set_blocked_on(0);
-            sender.record_send_outcome(tcb::SendOutcome::Delivered);
+
+            // No outcome is recorded here, and the omission is the
+            // point: the sender is not being woken. It goes on
+            // sleeping in a second state, and the answer it will read
+            // belongs to whoever ends *that* wait -- `reply`,
+            // `cancel_ipc`, or `release_reply_obligation`.
+            //
+            // Recording `Delivered` here would be worse than useless.
+            // It would sit in the field as a plausible-looking stale
+            // value, so a wake path that forgot its own recording
+            // would hand the caller an empty message and a success
+            // instead of tripping the `Pending` panic. The whole
+            // value of that panic is that the field is empty unless
+            // someone filled it deliberately.
         } else {
             sender.record_send_outcome(tcb::SendOutcome::Delivered);
             // SAFETY: The sender is off every IPC queue.
@@ -1570,19 +1686,28 @@ pub unsafe fn recv(slot: &Slot) -> Result<Delivery, CapError> {
     }
 
     // Woken: a sender arrived, a bound signal came, or the wait was
-    // cancelled.
+    // cancelled. The outcome says which, and it is read rather than
+    // inferred from the delivery's contents -- a zero-length,
+    // zero-label message is perfectly legal (ADR 034), so "the
+    // delivery looks empty" cannot distinguish a cancelled wait from
+    // a satisfied one.
+    //
+    // M9a inferred it, with a three-part condition on the tag, the
+    // badge and `blocked_on`. That worked only because nothing then
+    // sent an empty message to a blocked receiver.
+    //
     // SAFETY: Running again, interrupts disabled.
-    let delivery = unsafe { take_delivery(receiver) };
-    if delivery.tag.bits() == 0 && delivery.badge == 0 && receiver.blocked_on() == 0 {
-        // Nothing was parked for us: the wait was cancelled (ADR 039).
-        // Distinguished from a genuinely empty message by the absence
-        // of a delivery rather than by its contents -- a zero-length,
-        // zero-label message is perfectly legal.
-        if was_cancelled(receiver) {
-            return Err(CapError::EndpointDead);
+    match receiver.take_send_outcome() {
+        tcb::SendOutcome::Delivered => {
+            // SAFETY: As above.
+            Ok(unsafe { take_delivery(receiver) })
+        }
+        tcb::SendOutcome::Cancelled => Err(CapError::EndpointDead),
+        tcb::SendOutcome::ReplyGone => Err(CapError::ReplyTargetGone),
+        outcome @ tcb::SendOutcome::Pending => {
+            unexpected_wake("Recv, queued on an endpoint", outcome)
         }
     }
-    Ok(delivery)
 }
 
 /// `Reply`: answer the thread that called us.
@@ -1591,7 +1716,6 @@ pub unsafe fn recv(slot: &Slot) -> Result<Delivery, CapError> {
 ///
 /// `replier_space` must be the running thread's CSpace; no other
 /// mutable borrow of the current TCB may be held.
-#[allow(dead_code)] // M9b
 pub unsafe fn reply(
     message: &Message<'_>,
     replier_space: &super::cptr::CSpace,
@@ -1633,6 +1757,14 @@ pub unsafe fn reply(
     let delivery = unsafe { complete_rendezvous(server, caller, message, 0, replier_space) };
 
     server.clear_reply_target();
+    caller.set_replying_server(0);
+
+    // The outcome, without which the caller wakes with `Pending` and
+    // `send_inner` panics -- it refuses to invent a completion for a
+    // thread that was resumed by *something*. That panic is the right
+    // one; this is the line that keeps it from firing on the success
+    // path.
+    caller.record_send_outcome(tcb::SendOutcome::Delivered);
 
     // SAFETY: The caller is in BlockedOnReply, which is in no queue.
     unsafe {
@@ -1640,6 +1772,7 @@ pub unsafe fn reply(
         make_runnable(caller);
     }
 
+    REPLIES_SENT.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -1654,12 +1787,13 @@ pub unsafe fn reply(
 /// # Safety
 ///
 /// As [`reply`] and [`recv`].
-#[allow(dead_code)] // M9b
 pub unsafe fn reply_recv(
     reply_message: &Message<'_>,
     endpoint_slot: &Slot,
     replier_space: &super::cptr::CSpace,
 ) -> Result<Delivery, CapError> {
+    REPLY_RECVS.fetch_add(1, Ordering::AcqRel);
+
     // Not a fastpath (ADR 040). The two halves run exactly the code
     // `reply` and `recv` run; what is saved is one kernel entry and
     // one exit, which is a real cost measured in M8 at 934 cycles --
@@ -1667,7 +1801,10 @@ pub unsafe fn reply_recv(
     //
     // A reply that fails does not stop the receive: the server would
     // otherwise be left unable to serve anyone because one client
-    // vanished. The error is counted and the loop continues.
+    // vanished. That is a deliberate asymmetry rather than a dropped
+    // error -- the failure is counted in STALE_REPLIES, and a server
+    // whose client disappeared between request and answer has nothing
+    // to do about it except carry on.
     //
     // SAFETY: Caller's guarantee.
     let _ = unsafe { reply(reply_message, replier_space) };
@@ -1688,11 +1825,6 @@ pub unsafe fn reply_recv(
 /// a silently wrong lookup. The known gaps list it.
 fn pending_sender_space() -> super::cptr::CSpace {
     super::boot::init_cspace()
-}
-
-/// Whether this thread's IPC wait was cancelled rather than satisfied.
-fn was_cancelled(thread: &Tcb) -> bool {
-    matches!(thread.send_outcome(), tcb::SendOutcome::Cancelled)
 }
 
 // ---- Cancellation and death (ADR 039) ----------------------------------
@@ -1720,16 +1852,21 @@ pub unsafe fn cancel_ipc(thread: &mut Tcb) {
         return;
     }
 
+    // Which wait is being cancelled, recorded **here** because this is
+    // the last place it is known. A `Call` passes through both states,
+    // so a thread woken later cannot tell from its own fields whether
+    // it was queued on an endpoint or waiting for a reply -- and
+    // ADR 039 gives those two different errors.
+    let outcome = if thread.state() == ThreadState::BlockedOnReply {
+        tcb::SendOutcome::ReplyGone
+    } else {
+        tcb::SendOutcome::Cancelled
+    };
+
     CANCELLATIONS.fetch_add(1, Ordering::AcqRel);
 
-    // SAFETY: Every TCB lives in the physical window.
-    let phys = unsafe { tcb::tcb_phys(thread) }.0;
     // Anything parked for this thread will never be collected.
-    //
-    // SAFETY: Interrupts disabled.
-    unsafe {
-        PENDING_DELIVERY.discard(phys);
-    }
+    thread.discard_incoming();
 
     let endpoint_phys = thread.blocked_on();
     if endpoint_phys != 0 {
@@ -1745,11 +1882,80 @@ pub unsafe fn cancel_ipc(thread: &mut Tcb) {
 
     // A thread in `BlockedOnReply` is in no queue at all (ADR 033), so
     // there is nothing to unlink — but a server may still hold a reply
-    // right naming it. That right is deliberately *not* cleared here:
-    // the generation check in `reply_target_is_live` makes it safe to
-    // leave, and clearing it would mean finding the server, which
-    // means a search. Staleness is detected, not prevented.
-    thread.record_send_outcome(tcb::SendOutcome::Cancelled);
+    // right naming it.
+    //
+    // That right *is* cleared, and cheaply: `replying_server` is the
+    // back-pointer ADR 039 added for exactly this, so finding the
+    // server is a field read rather than a search. Doing it keeps a
+    // later `Reply` from being charged as a stale one when the
+    // staleness was already known here.
+    //
+    // The generation check in `reply_target_is_live` stays regardless:
+    // the two are a belt and braces, and ADR 028 established the
+    // pattern -- clean up *and* check validity, because the cleanup
+    // cannot reach every path.
+    let server_phys = thread.replying_server();
+    if server_phys != 0 {
+        // SAFETY: A non-zero `replying_server` names the live TCB that
+        // owes this thread a reply; `set_reply_target` and this line
+        // are the only writers.
+        let server = unsafe { tcb::tcb_at(ObjectRef(PhysAddr(server_phys))) };
+        server.clear_reply_target();
+        thread.set_replying_server(0);
+    }
+
+    thread.record_send_outcome(outcome);
+}
+
+/// Tell the thread waiting on a dying server that no reply is coming
+/// (ADR 036's "server crashes" promise, paid here).
+///
+/// Called when a TCB stops existing. Without it a client that made a
+/// `Call` to a server that then died would wait forever — and ADR 036
+/// says plainly that this case is one the kernel *can* know about, so
+/// leaving the client blocked would be a defect rather than a
+/// trade-off.
+///
+/// Returns whether anybody was woken, so the caller can say so.
+///
+/// # Safety
+///
+/// `server` must be live and interrupts disabled.
+pub unsafe fn release_reply_obligation(server: &mut Tcb) -> bool {
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    let Some((caller_phys, _, _)) = server.reply_target() else {
+        return false;
+    };
+
+    // The same three comparisons `Reply` makes. The caller may already
+    // be gone -- both ends can die, in either order -- and waking
+    // whatever now occupies its memory would be far worse than waking
+    // nobody.
+    if !server.reply_target_is_live() {
+        server.clear_reply_target();
+        return false;
+    }
+
+    // SAFETY: The check above established the caller is the thread it
+    // was.
+    let caller = unsafe { tcb::tcb_at(ObjectRef(PhysAddr(caller_phys))) };
+    if caller.state() != ThreadState::BlockedOnReply {
+        server.clear_reply_target();
+        return false;
+    }
+
+    caller.discard_incoming();
+    caller.set_replying_server(0);
+    caller.record_send_outcome(tcb::SendOutcome::ReplyGone);
+    server.clear_reply_target();
+    CANCELLATIONS.fetch_add(1, Ordering::AcqRel);
+
+    // SAFETY: A thread in BlockedOnReply is in no queue at all.
+    unsafe {
+        make_runnable(caller);
+    }
+    true
 }
 
 /// Wake every thread waiting on an endpoint that is being revoked.
@@ -1773,13 +1979,7 @@ pub unsafe fn cancel_all_waiters(endpoint: &mut Endpoint) -> usize {
     //
     // SAFETY: Interrupts disabled.
     while let Some(thread) = unsafe { endpoint.dequeue() } {
-        // SAFETY: Every TCB lives in the physical window.
-        let phys = unsafe { tcb::tcb_phys(thread) }.0;
-        // SAFETY: Interrupts disabled.
-        unsafe {
-            PENDING_DELIVERY.discard(phys);
-        }
-
+        thread.discard_incoming();
         thread.set_blocked_on(0);
         thread.record_send_outcome(tcb::SendOutcome::Cancelled);
         CANCELLATIONS.fetch_add(1, Ordering::AcqRel);

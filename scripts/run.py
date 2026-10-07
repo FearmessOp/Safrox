@@ -2000,6 +2000,265 @@ EXPECTATIONS = {
             re.compile(r"EXCEPTION", re.M),
         ],
     ),
+    # ---- M9b: Call, Reply and badges -----------------------------------
+    #
+    # Five scenarios, all exiting 33 -- including the three negatives. A
+    # client woken with an error is a caller-visible outcome rather than
+    # a fault, and a kernel that died on any of them would be one a user
+    # component could halt.
+    "ipccall": Expectation(
+        name="call and reply",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # 1. The round trip, with the value the client checked. A
+            #    bare "the reply arrived" would pass on a kernel that
+            #    delivered an empty message.
+            re.compile(
+                r"^\[ipc\] call/reply: the round trip completed -- client "
+                r"sent, server answered 0x[0-9a-f]{16}, client verified it; "
+                r"[1-9]\d* calls and [1-9]\d* replies so far",
+                re.M,
+            ),
+            # 2. ReplyRecv, counted rather than described. The claim is
+            #    about syscall count, so the figure is what is required:
+            #    a server making two separate calls would satisfy "the
+            #    reply arrived and a request came back" equally well.
+            re.compile(
+                r"^\[ipc\] replyrecv: one invocation both answered a client "
+                r"and collected the next request -- [1-9]\d* ReplyRecv "
+                r"against [1-9]\d* replies delivered",
+                re.M,
+            ),
+            # 3. Two badges, both named, and **both replies checked**.
+            #    The last clause is the one that matters: every other
+            #    line here would pass on a kernel that crossed the two
+            #    answers.
+            re.compile(
+                r"^\[ipc\] badge: two clients on one endpoint carried "
+                r"0x1000 and 0x1002; the server told them apart and each "
+                r"got its own answer \(0x[0-9a-f]{16} and 0x[0-9a-f]{16}\)",
+                re.M,
+            ),
+            # 4. ADR 036's finest decision, and the note that the
+            #    scenario does not depend on timing. Required text
+            #    rather than decoration: a later edit that replaced the
+            #    controlled window with a sleep would still pass the
+            #    other checks on a lucky run, and this line is what
+            #    says the window was constructed.
+            re.compile(
+                r"^\[ipc\] reply-to-at-rendezvous: server B called Recv "
+                r"while server A held a caller and came away with nothing; "
+                r"A's reply reached the right client",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] reply-to-at-rendezvous: .*The window was opened "
+                r"by the test rather than by a timer",
+                re.M | re.S,
+            ),
+            re.compile(r"^\[ipc\] all M9b call/reply tests passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+    "ipcdead": Expectation(
+        name="server dies owing a reply",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The kernel says so from inside `delete`, which is where
+            # the obligation is actually discharged. Requiring this
+            # line tests the wiring rather than only its effect --
+            # the same reasoning as `ipcrevoked` above.
+            re.compile(
+                r"^\[ipc\] thread at .* died owing a reply; its caller was "
+                r"woken with ReplyTargetGone",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ipc\] server-dies: the server was revoked holding a "
+                r"caller; the client woke with ReplyTargetGone rather than "
+                r"waiting forever",
+                re.M,
+            ),
+            # The distinction ADR 036 draws, in the log: a server that
+            # *declines* to answer is a different case and does leave
+            # its client waiting.
+            re.compile(
+                r"^\[ipc\] server-dies: .*a server that merely declines to "
+                r"answer is a different matter",
+                re.M | re.S,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "ipcstale": Expectation(
+        name="stale reply target",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The premise, stated before the claim. If the replacement
+            # TCB had not landed at the old address the scenario would
+            # prove nothing, and this line is what shows it did --
+            # "the SAME address" is required text.
+            re.compile(
+                r"^\[ipc\] stale-reply: the replacement TCB landed at the "
+                r"SAME address 0x[0-9a-f]{16}, generation \d+ -> \d+",
+                re.M,
+            ),
+            # Claim 1: the live path. The reply is refused, and by the
+            # *first* of ADR 036's three comparisons rather than the
+            # generation -- because the back-pointer cleared
+            # `reply_to` when the client was revoked (ADR 039).
+            #
+            # Requiring NoReplyTarget by name rather than "an error"
+            # is what keeps the two claims apart. The scenario's first
+            # draft asserted ReplyTargetGone here and failed, which is
+            # how the ordering between cleanup and validation became
+            # visible at all.
+            re.compile(
+                r"^\[ipc\] stale-reply: the Reply was refused with "
+                r"NoReplyTarget -- the back-pointer cleared the server's "
+                r"reply_to when the client died",
+                re.M,
+            ),
+            # Claim 2: the generation comparison itself, exercised
+            # directly. **Both halves are required.**
+            #
+            # "Generation 0 is refused" on its own would pass on a
+            # check that refuses everything. The accepted case is what
+            # rules that out, and the two differ in nothing but the
+            # generation -- same address, same slot, same type.
+            re.compile(
+                r"^\[ipc\] stale-reply: the generation check, exercised "
+                r"directly: generation [0-9]+ is accepted and [0-9]+ is "
+                r"refused at the SAME address 0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # And the stranger occupying the old address was never
+            # woken. "still Inactive" is the load-bearing part: a reply
+            # delivered to the replacement TCB would have made it
+            # runnable, so this is the check that the wrong thread was
+            # not woken rather than merely that an error was returned.
+            re.compile(
+                r"^\[ipc\] stale-reply: the live path gave NoReplyTarget "
+                r"and the new TCB at the same address is untouched "
+                r"\(still Inactive\)",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "ipcself": Expectation(
+        name="self-call deadlock",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # The deadlock exists and is named rather than prevented.
+            re.compile(
+                r"^\[ipc\] self-call: the thread is BlockedOnEndpoint with "
+                r"nobody receiving -- a deadlock, and deliberately not "
+                r"prevented",
+                re.M,
+            ),
+            # And it is escapable. This is the promise ADR 036 makes in
+            # exchange for not preventing it, so it is the part worth
+            # testing.
+            re.compile(
+                r"^\[ipc\] self-call: Suspend took the thread off the queue "
+                r"and Resume returned an error from the Call",
+                re.M,
+            ),
+            # Rescue needs a capability. A system where any component
+            # could unstick any other would have a different security
+            # story, and the line records which one this is.
+            re.compile(
+                r"^\[ipc\] self-call: .*the escape needs a TCB capability",
+                re.M | re.S,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "ipccost": Expectation(
+        name="IPC cost (measurement)",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            # Three figures, all non-zero. A zero would mean the TSC
+            # read the same value twice, which is a broken measurement
+            # rather than an infinitely fast one.
+            re.compile(
+                r"^\[ipc\] cost: Send\+Recv [1-9]\d* cycles, Call\+Reply "
+                r"[1-9]\d* cycles, ReplyRecv loop [1-9]\d* cycles "
+                r"\(minimum of \d+ samples each\)",
+                re.M,
+            ),
+            # The difference, and the comparison ADR 040 asked for.
+            re.compile(
+                r"^\[ipc\] cost: a Call round costs [1-9]\d* cycles more "
+                r"than a bare rendezvous",
+                re.M,
+            ),
+            # What the ReplyRecv figure does **not** show.
+            #
+            # ADR 036 claims ReplyRecv saves a kernel entry, which M8
+            # measured at 934 cycles. The saving here is far smaller,
+            # and necessarily so: there is no user mode until M13, so
+            # `reply_recv` is reached by a function call and no
+            # privilege transition is saved at all.
+            #
+            # Required as an alternation because either outcome is
+            # legitimate -- the difference is around this measurement's
+            # noise floor under TCG, so the loop coming out *dearer* is
+            # not a failure. What is not legitimate is the figure going
+            # unremarked: a reader who took the small saving for a
+            # refutation of ADR 036 would be drawing a conclusion the
+            # measurement cannot support, and a reader who took it for
+            # a confirmation would be worse off still.
+            re.compile(
+                r"^\[ipc\] cost: the ReplyRecv loop (saves [1-9]\d* cycles "
+                r"a round|did not come out cheaper).*(no user mode until "
+                r"M13|until M13 the saving is one function call)",
+                re.M | re.S,
+            ),
+            # The caveat is required text. These are emulated figures
+            # and a reader who takes them for silicon would draw the
+            # wrong conclusion -- the same rule M6 and M8 follow.
+            re.compile(
+                r"^\[ipc\] cost: measured under emulation",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            # The kernel's own sanity check on the measurement.
+            re.compile(r"did not cost more than a bare rendezvous", re.M),
+        ],
+    ),
 }
 
 

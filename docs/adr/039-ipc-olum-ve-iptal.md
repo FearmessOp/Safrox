@@ -81,8 +81,69 @@ Alternatif, bütün TCB'leri tarayıp `reply_to == tcb` olanı bulmaktı
 — sınırsız iş, master prompt yasağı.
 
 **Tutarlılık kuralı:** iki alan ya ikisi birden dolu ya ikisi
-birden boş. Bir `debug_assert` bunu her ikisine dokunan yerde
-kontrol edecek.
+birden boş.
+
+> **Uygulandı (M9b).** `replying_server` artık var ve
+> `set_reply_target` **iki ucu birden** yazıyor — ayrı ayrı
+> yazılabilen iki alan olmaktan çıktılar, dolayısıyla
+> ayrışamazlar. Bir kuralın en ucuz barınağı, ona tek bir yer
+> vermektir.
+>
+> M9a bu alanı yazmamıştı, ve kodda yokluğunu bir karara
+> dönüştüren bir yorum vardı: "temizlemek bir arama gerektirirdi."
+> Cümle doğruydu ama sonucu yanlıştı — ADR'nin cevabı zaten buydu:
+> arama yapma, ters bağı koy. Yorum silindi.
+>
+> Temizleme asimetrik: `clear_reply_target` yalnızca sunucu
+> tarafını siliyor. Çağıran tarafını, çağıranın hâlâ o thread
+> olduğunu **bilen** yol siliyor; aynı fonksiyon çağıranın
+> öldüğü durumda da çağrılıyor ve eski bir işaretçiyi "toparlamak
+> için" izlemek tam da generation kontrolünün önlemek için var
+> olduğu hata olurdu.
+
+### Her uyandırma yolu bir cevap borçlu
+
+`SendOutcome` dört değer alıyor ve beşincisi yok; "tanımsız" bunlardan
+biri değil. Bloke bir thread'i hazır yapan her yol, ona **neden**
+uyandığını da yazmak zorunda — yoksa thread uyanıp `Pending` okuyor,
+ki bu "hâlâ bekliyorum" demek ve doğru olamaz.
+
+Kernel bu durumda uyduruyor değil, `panic` ediyor. M9b'de o panik üç
+kez ateşlendi ve üçü de gerçek kusurdu:
+
+1. `send_inner`'ın randevu dalı, uyandırdığı **alıcıya** outcome
+   yazmıyordu. M9a'da görünmezdi: `recv` uyanma sebebini teslimatın
+   içeriğinden çıkarıyordu, yani alanı hiç okumuyordu. (Çıkarım da
+   yanlıştı: ADR 034 sıfır uzunluklu, sıfır etiketli mesaja izin
+   veriyor, dolayısıyla "teslimat boş görünüyor" iptal edilmiş bir
+   beklemeyi karşılanmış olandan ayıramaz. `recv` artık outcome'u
+   okuyor.)
+2. `Call`'ın **acil randevu** yolu outcome'u hiç okumuyordu;
+   koşulsuz `Ok(take_delivery(...))` dönüyordu. Sunucusu ölen bir
+   istemci boş bir mesaj ve bir **başarı** alıyordu. Kernel her şeyi
+   doğru yapmıştı — `release_reply_obligation` çağıranı uyandırıp
+   `ReplyGone` yazmıştı; çağıran bakmıyordu.
+3. Kuyruğa girmiş bir `Call` **bir kez** uyanıyor, iki kez değil:
+   `recv`'in `wants_reply` dalı göndereni `BlockedOnEndpoint`'ten
+   doğrudan `BlockedOnReply`'ye taşıyor, hazır yapmadan. Bir uyku,
+   bir outcome. `send_inner` onu `Send`/`Call` ayrımı için okuyor,
+   sonra `collect_reply`'ye veriyordu, o da tekrar okuyordu —
+   `take_send_outcome` alanı temizlediği için ikincisi `Pending`
+   buluyordu. Panik eksik bir yazmayı bildiriyordu; gerçekte fazla
+   bir okuma vardı.
+
+Üçüncüsünün dersi, panik mesajının kendisiyle ilgili: ilk hali
+*hangi* beklemenin karşılanmadığını söylemiyordu, ve bunu öğrenmek
+bir koşuya mal oldu. Artık `waiting_in` argümanı yolu adlandırıyor.
+
+Ayrıca `recv`'in randevu dalı göndereni `BlockedOnReply`'ye
+taşırken **bilerek** outcome yazmıyor: gönderen uyandırılmıyor,
+ikinci bir durumda uyumaya devam ediyor. Oraya `Delivered` yazmak
+işe yaramazdan kötü olurdu — alanda makul görünen bayat bir değer
+olarak oturur, ve kendi yazmasını unutan bir uyandırma yolu
+`Pending` paniğini tetiklemek yerine çağırana boş bir mesajla
+başarı verirdi. Paniğin bütün değeri, alanın biri kasten
+doldurmadıkça boş olmasında.
 
 ### Kuyruktan çıkarma O(1)
 

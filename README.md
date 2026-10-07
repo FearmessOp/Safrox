@@ -3,19 +3,56 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M9a — synchronous rendezvous.** Two threads can
-now meet on an Endpoint: `Send`, `Recv`, a doubly linked wait queue,
-and cancellation. No capability transfer, no `Call`/`Reply`, no
-Notification — those are M9b and M9c, written and type-checked but
-behind `#[allow(dead_code)]` rather than claimed.
+**Current milestone: M9b — Call, Reply and badges.** A client can now
+make a request and wait for the answer. `Call`, `Reply`, `ReplyRecv`,
+badges that let one server tell its clients apart, and a reply right
+that cannot be stolen or delivered to a stranger. No capability
+transfer and no Notification — those are M9c, written and
+type-checked but behind `#[allow(dead_code)]` rather than claimed.
 
 M9 is landing in three parts because one attempt at all eleven
 acceptance criteria produced code that did not compile and was never
 run. Worth stating plainly: the discipline here is that an untested
 claim is not a claim.
 
-The result that carries the milestone is a measurement, and it needs
-two figures rather than one:
+**Splitting it paid for itself.** Turning M9b on found four kernel
+defects that M9a's tests could not reach — each on the *first* run of
+the scenario that reached it, and three of them in code M9a had
+shipped and tested:
+
+* the global delivery slot was unsound. Its invariant ("at most one
+  delivery in flight, because the woken thread reads it before
+  anything else runs") was never true — waking a thread enqueues it,
+  it does not run it — merely unreachable until `ReplyRecv` existed;
+* `Call`'s immediate-rendezvous path never read its outcome, so a
+  client whose server died got an empty message and a **success**;
+* `send_inner`'s rendezvous branch recorded no outcome for the
+  receiver it woke, invisible while `recv` inferred the reason from
+  the message's contents — an inference ADR 034 had already made
+  invalid by permitting an empty message;
+* a queued `Call` wakes **once**, and the outcome was read twice.
+
+Written all at once, those four would have arrived together in a
+build that had never run.
+
+The result that carries the milestone is the one with teeth:
+
+```
+[ipc] reply-to-at-rendezvous: server B called Recv while server A held a
+caller and came away with nothing; A's reply reached the right client
+```
+
+The reply right is recorded at the *rendezvous*, not when `Recv`
+returns. Written later, a second server arriving in the gap would
+take the first server's caller. What makes this a test rather than a
+coin flip is that the gap is **opened by the test**: server A waits
+on a flag between its `Recv` and its `Reply`, so the window is as
+long as the scenario needs and the second server's `Recv` is
+guaranteed to land inside it. A version that relied on the timer
+would pass on any run where A happened to finish within its slice.
+
+M9a's measurement still carries that part, and it needs two figures
+rather than one:
 
 ```
 [ipc] cancel-cost: 42 cycles with 50 waiting, 42 cycles with 500 waiting
@@ -30,8 +67,8 @@ and the walk happens with interrupts disabled.
 
 The semantics are fixed in eight ADRs
 ([033](docs/adr/033-rendezvous-semantigi.md)–[040](docs/adr/040-hizli-yol-yok.md));
-the shape of the whole thing, with M9a marked off from what is still
-specification, is in [docs/ipc.md](docs/ipc.md).
+the shape of the whole thing, with M9a and M9b marked off from what
+is still specification, is in [docs/ipc.md](docs/ipc.md).
 
 **M8 — Ring 3.** Code runs at CPL 3, in its
 own address space, with its instructions in a page that is executable
@@ -143,10 +180,136 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
+## M9b acceptance criteria
+
+Five scenarios, all exiting 33 — including the three negatives. A
+client woken with an error is a caller-visible outcome rather than a
+fault, and a kernel that died on any of them would be one any
+component could halt. `make test` runs all forty-two.
+
+### 1. `make run-ipccall` — the request/response pattern
+
+```
+[ipc] call/reply: the round trip completed -- client sent, server answered 0xbeef000000000000, client verified it; 1 calls and 1 replies so far
+[ipc] replyrecv: one invocation both answered a client and collected the next request -- 1 ReplyRecv against 3 replies delivered
+[ipc] badge: two clients on one endpoint carried 0x1000 and 0x1002; the server told them apart and each got its own answer (0xbeef000000001000 and 0xbeef000000001002)
+[ipc] reply-to-at-rendezvous: server B called Recv while server A held a caller and came away with nothing
+```
+
+Four claims, and two of them are easy to pass for the wrong reason.
+
+**The badges.** The server derives its answer *from the badge*, so a
+reply delivered to the wrong client is visible in that client's own
+check. Two fixed constants would both look correct whichever way
+they were crossed. Each client also gets its own static — a single
+shared pair could not express the failure it is meant to catch,
+because whichever client wrote last would look right.
+
+**`ReplyRecv`.** The claim is about *syscall count*, so that is what
+is counted. "The reply arrived and a request came back" would pass
+just as well on a server making two separate calls, which is exactly
+what [ADR 036](docs/adr/036-call-reply.md) says `ReplyRecv` exists to
+avoid.
+
+### 2. `make run-ipcdead` — a server that dies owes an answer
+
+```
+[ipc] thread at 0x... died owing a reply; its caller was woken with ReplyTargetGone
+[ipc] server-dies: the server was revoked holding a caller; the client woke with ReplyTargetGone rather than waiting forever
+```
+
+ADR 036 distinguishes two ways a client can be left waiting and
+treats them differently. A server that **declines** to answer leaves
+its client blocked forever, and that is accepted: a timeout needs a
+scheduling budget the project does not have. A server that **dies**
+is different — the kernel can see the obligation, so leaving the
+client blocked would be a defect rather than a trade-off.
+
+This scenario is what found the second defect listed above. The
+kernel had done everything right: `release_reply_obligation` woke
+the caller and recorded `ReplyGone`. The caller simply did not look.
+
+### 3. `make run-ipcstale` — a reply does not reach a stranger
+
+```
+[ipc] stale-reply: the replacement TCB landed at the SAME address 0x0000000000020800, generation 0 -> 1
+[ipc] stale-reply: the Reply was refused with NoReplyTarget -- the back-pointer cleared the server's reply_to when the client died
+[ipc] stale-reply: the generation check, exercised directly: generation 1 is accepted and 0 is refused at the SAME address
+```
+
+The client's TCB is revoked and a new one is retyped onto the same
+address — which [ADR 020](docs/adr/020-retype-semantigi.md)'s
+watermark reset makes likely rather than lucky.
+
+**The test checks its own premise first.** If the replacement landed
+elsewhere, the address comparison alone would refuse the reply and
+the generation check — the thing under test — would never run. That
+check earned its place on the first attempt: the replacement
+appeared at `0x25000` against `0x20800`, and the scenario said so
+and stopped rather than passing. Three causes in sequence: a shared
+Untyped, then `cnode::revoke` where only `revoke_untyped` resets a
+watermark, then `Suspend` clearing the reply right before the
+generation could be consulted.
+
+**And then it had to be split into two claims.** On every reachable
+path the back-pointer's cleanup fires *before* the generation check,
+so the live path returns `NoReplyTarget` — the first of the three
+comparisons, not the third. Asserting "the generation refused it"
+there would have been a test passing for the wrong reason. So the
+generation check is exercised directly as a second claim, accepting
+generation 1 and refusing generation 0 **at the same address**. Both
+halves are required: "it refuses the stale one" alone would pass on
+a check that refuses everything.
+
+[ADR 028](docs/adr/028-vspace-yasam-dongusu.md) called this belt and
+braces. M9b added the corollary: when the cleanup always wins, the
+validation needs a test of its own.
+
+### 4. `make run-ipcself` — the deadlock is not prevented, but it is escapable
+
+```
+[ipc] self-call: the thread is BlockedOnEndpoint with nobody receiving -- a deadlock, and deliberately not prevented
+[ipc] self-call: Suspend took the thread off the queue and Resume returned an error from the Call
+```
+
+A check for "am I the receiver" would catch the direct case and miss
+A→B→A: partial protection at full cost. What ADR 036 promises
+instead is that the deadlock is *escapable*, and that promise is
+what is tested. The escape needs a TCB capability, so rescue is
+itself an authority.
+
+### 5. `make run-ipccost` — what the three paths cost
+
+```
+[ipc] cost: Send+Recv 882 cycles, Call+Reply 13902 cycles, ReplyRecv loop 13776 cycles (minimum of 32 samples each)
+[ipc] cost: a Call round costs 13020 cycles more than a bare rendezvous
+```
+
+[ADR 040](docs/adr/040-hizli-yol-yok.md) refused a fastpath and
+promised to measure the slow one instead. The `Call` figure is
+asserted to exceed the rendezvous — not as a performance target but
+as a sanity check on the measurement: a `Call` is two rendezvous and
+two switches, so equal figures would mean the numbers are dominated
+by something other than the work.
+
+**The `ReplyRecv` figure is the interesting one, and it does not
+show what ADR 036 claims.** The saving is 126 cycles against the
+~934 a kernel entry costs. The reason is a property of the test
+rather than of the kernel: there is no user mode until M13, so
+`reply_recv` is reached by a function call and no privilege
+transition is saved at all. It is **reported rather than asserted** —
+an assertion of ~934 would fail honestly today, and one of "it is
+positive" would be satisfied by noise. ADR 036's claim becomes
+testable at M13; this figure is the baseline it will be compared
+against.
+
+The scenario says so in the log either way, including when the loop
+comes out *dearer*. That is not a failure at this noise floor; a
+figure going past unremarked would be.
+
 ## M9a acceptance criteria
 
-Three scenarios, all exiting 33. `make test` runs them with the other
-thirty-four.
+Three scenarios, all exiting 33.
 
 ### 1. `make run-ipctest` — the rendezvous works, in both orders
 
@@ -223,7 +386,7 @@ owner could always suspend it first. Here the waiters may belong to
 *other components*, so refusing would let any of them make an
 endpoint un-revokable — a denial of service against whoever owns it.
 
-### K5: what was broken, and what broke
+### K5 in M9a: what was broken, and what broke
 
 [ADR 023](docs/adr/023-test-disiplini.md)'s K5 asks for at least one
 test per milestone verified by breaking the thing it tests. M9a got
@@ -266,6 +429,45 @@ times in a row. A race: the timer can fire between the entry
 trampoline's `sti` and its `jmp`, so the spinner is preempted before
 its first instruction. It *did* run, and the one-shot test reported
 the mechanism working as a failure. Now ADR 023's K8.
+
+### K5 in M9b: the generation check, and a guard that was weaker than it looked
+
+**Deliberate.** The line `&& slot.generation() == generation` was
+deleted from `reply_target_is_live`. `ipc-stale-reply` died:
+
+```
+[PANIC] a reply target with a stale generation was accepted. The address
+matches a live TCB and the slot holds a TCB, so the first two comparisons
+pass -- the generation is the only thing standing between this reply and
+a thread it was never meant for (ADR 036)
+```
+
+Exit 35, three violations reported, and the panic names the missing
+comparison rather than merely reporting a wrong answer. The line was
+restored and the scenario passes again.
+
+**The first attempt produced a finding of its own, and it is the
+kind that is easy to mistake for success.** The build refused the
+mutation before any test could run: `-D warnings` turned the now-dead
+`generation` binding into an error. That is a real line of defence,
+and it is worth knowing it exists — but it is *weaker than it looks*.
+Renaming the binding to `_generation` silences it in one keystroke,
+which is exactly what an edit removing the check for some
+plausible-looking reason would do without a second thought. The
+mutation was redone that way so the test itself had to catch it, and
+it did.
+
+The lesson generalises past this one check: **"the compiler would
+catch it" is evidence about a particular way of making the mistake,
+not about the mistake.**
+
+This also demonstrates why `ipc-stale-reply` carries two claims
+rather than one. The mutation is invisible to the live path — the
+back-pointer clears `reply_to` first, so the reply is refused by the
+*first* comparison either way. Only the second claim, which calls
+`reply_target_is_live` directly, can see it. A scenario that had
+asserted "the generation refused the reply" on the live path would
+have passed with the check deleted.
 
 ## M8 acceptance criteria
 

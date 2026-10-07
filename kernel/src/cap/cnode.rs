@@ -563,10 +563,18 @@ pub unsafe fn delete(slot: &mut Slot) -> Result<(), CapError> {
 ///   endpoint immortal. That reasoning is ADR 039's and it is
 ///   deliberately *not* ADR 026's, where refusing was safe because the
 ///   thread's own owner could always suspend it first.
-/// * **A TCB.** If the thread is parked in an IPC queue, it comes out.
-///   Leaving it there would be a dangling reference of the worst kind:
-///   the endpoint would eventually hand a message to a thread whose
-///   memory has been recycled.
+/// * **A TCB.** Two obligations, and they are different ends of the
+///   same conversation:
+///   - If the thread is parked in an IPC queue, it comes out. Leaving
+///     it there would be a dangling reference of the worst kind: the
+///     endpoint would eventually hand a message to a thread whose
+///     memory has been recycled.
+///   - If the thread *owes* somebody a reply, that somebody is woken
+///     with `ReplyTargetGone`. This is ADR 036's "what if the server
+///     crashes" promise, and it is payable precisely because the
+///     kernel can see the obligation — a client left blocked here
+///     would be a defect rather than the accepted trade-off ADR 036
+///     makes for a server that merely *declines* to answer.
 ///
 /// This function is the whole of "ADR 039 is implemented rather than
 /// written down". Without it, `ipc-endpoint-revoked` hangs.
@@ -602,6 +610,17 @@ unsafe fn release_ipc_references(slot: &Slot) {
                 unsafe {
                     crate::cap::ipc::cancel_ipc(thread);
                 }
+            }
+            // And the other direction: this thread may owe a reply.
+            //
+            // SAFETY: As above.
+            let woke_caller = unsafe { crate::cap::ipc::release_reply_obligation(thread) };
+            if woke_caller {
+                crate::println!(
+                    "[ipc] thread at {} died owing a reply; its caller was \
+                     woken with ReplyTargetGone (ADR 036)",
+                    slot.object()
+                );
             }
         }
         _ => {}

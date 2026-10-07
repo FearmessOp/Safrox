@@ -234,6 +234,93 @@ beklerken `BlockedOnEndpoint`, randevu olunca `BlockedOnReply`.
 kuyruğunda, ikincisinde hiçbir kuyrukta değil — ve iptal yolları
 farklı (ADR 039).
 
+## Teslimat nerede bekler (M9b'de düzeltildi)
+
+Uyandırılan bir thread'e mesajı doğrudan verilemiyor: o anda
+çalışmıyor, register'ları kayıtlı bir bağlamda. Mesajın bir yerde
+beklemesi gerekiyor.
+
+M9a bunu **tek bir global yuvada** yaptı, şu gerekçeyle: "aynı anda
+en fazla bir teslimat havada olabilir, çünkü aktarım kesmeler kapalı
+koşuyor ve uyandırılan thread başka hiçbir şey çalışmadan önce
+mesajını okuyor."
+
+Cümlenin ikinci yarısı yanlış. Bir thread'i uyandırmak
+`sched::enqueue` çağırıyor; bu onu **hazır** yapıyor, çalıştırmıyor.
+Uyandıran devam ediyor — ve cevap verip sonra tekrar alan bir sunucu
+(ki `ReplyRecv`'in tamamı bu şekil) ilki hâlâ yuvadayken ikinci bir
+teslimat park ediyor.
+
+M9b'nin ilk koşusu ikinci senaryoda assertion'ı tetikledi. Assertion
+görevini yaptı: iki istemcinin birbirinin cevabını almasına izin
+vermek yerine bozuk bir invariant'ı bildirdi. Ama o invariant hiçbir
+zaman **doğru** değildi — yalnızca erişilemezdi, çünkü M9a'da iki
+teslimat hiç çakışmıyordu.
+
+**Karar: teslimat hedef thread'in kendi TCB'sinde bekler**
+(`Incoming`, 40 bayt). Gönderme yönü zaten böyle çalışıyordu
+(`PendingSend`); asimetri bir karar değil, bir gözden kaçmaydı.
+Assertion thread başına taşındı, dolayısıyla **yasal** durum — iki
+farklı thread'e iki teslimat — artık tetiklemiyor.
+
+Genel ders: "aynı anda yalnızca bir X olabilir" diyen bir global
+durum, o cümlenin neden doğru olduğunu da yazmak zorunda. Burada
+yazılmıştı, ve yazıldığı için yanlışlığı görülebildi.
+
+## Temizlik mi, doğrulama mı: ikisi de, ama testleri ayrı
+
+`reply_to` iki ayrı mekanizmayla korunuyor:
+
+1. **Temizlik.** Çağıranın beklemesi iptal edilince `cancel_ipc`,
+   `replying_server` ters bağını izleyip sunucunun `reply_to`'sunu
+   yerinde siliyor (ADR 039).
+2. **Doğrulama.** `reply_target_is_live` üç karşılaştırma yapıyor:
+   yuva hâlâ bir TCB tutuyor mu, aynı nesneyi mi gösteriyor,
+   generation oynadı mı.
+
+ADR 028 bu deseni "kemer ve askı" diye kurmuştu. M9b bir şey daha
+öğretti: **temizlik her zaman kazanınca, doğrulamanın kendi testi
+gerekiyor.**
+
+`ipc-stale-reply` tam da bunu yaşadı. Senaryo çağıranın TCB'sini
+revoke ediyor, yerine aynı adrese yeni bir TCB koyuyor, ve sunucunun
+`Reply`'inin reddedilmesini bekliyor. Reddediliyor — ama
+`NoReplyTarget` ile, `ReplyTargetGone` ile değil: ters bağ `reply_to`'yu
+çoktan silmişti, yani **üç karşılaştırmanın birincisi** cevabı
+reddetti ve generation'a sıra hiç gelmedi.
+
+Erişilebilir her yolda temizlik önce davranıyor. Dolayısıyla
+senaryonun "generation eskimiş cevabı reddetti" demesi, doğru bir
+sonucu yanlış bir gerekçeyle raporlamak olurdu.
+
+**İki iddia ayrıldı:**
+
+- **İddia 1 (canlı yol):** `Reply` `NoReplyTarget` veriyor, ve eski
+  adresi işgal eden yabancı uyandırılmıyor — hâlâ `Inactive`.
+- **İddia 2 (doğrulamanın kendisi):** `reply_target_is_live`
+  doğrudan çağrılıyor; **aynı adreste** generation 1 kabul ediliyor,
+  generation 0 reddediliyor. İki yarı da gerekli: yalnızca "eskisini
+  reddediyor" demek, her şeyi reddeden bir kontrolde de geçerdi.
+
+### K5 mutasyonu (koşuldu)
+
+`reply_target_is_live`'dan `&& slot.generation() == generation`
+satırı silindi. `ipc-stale-reply` öldü: İddia 2'nin eski yarısında
+panik, exit 35, runner üç ihlal bildirdi. Satır geri kondu, senaryo
+yeniden geçti.
+
+İlk denemenin kendi bulgusu var. Derleme mutasyonu **reddetti** —
+`-D warnings`, artık kullanılmayan `generation` bağını hataya
+çevirdi, yani hiçbir şey koşmadı. Bu gerçek bir savunma hattı, ama
+göründüğünden zayıf: bağı `_generation` yapmak onu tek hamlede
+susturuyor, ki kontrolü makul görünen bir gerekçeyle kaldıran bir
+düzenleme tam olarak bunu düşünmeden yapardı. Mutasyon o şekilde
+tekrarlandı ki testin kendisi yakalamak zorunda kalsın — yakaladı.
+
+Ders tek bir kontrolü aşıyor: "derleyici zaten yakalar", hatanın
+**belirli bir yapılış biçimi** hakkında kanıttır, hatanın kendisi
+hakkında değil.
+
 ## Elenen alternatifler
 
 **Cevap hakkını çağıranın TCB'sinde tutmak.** Sunucunun çağıranı
@@ -258,8 +345,14 @@ ADR 017 bunu bilinçli kapattı.
   `BlockedOnReply` durumu, hiçbir kuyrukta değil.
 - `reply_to` **randevu anında** yazılıyor, `Recv` dönerken değil —
   yoksa ikinci bir alıcı çağıranı çalabilirdi.
-- `ReplyRecv` iki syscall'ı birleştiriyor; sunucu döngüsünün
-  maliyetini yarıya indiriyor (~930 çevrim, M8 ölçümü).
+- `ReplyRecv` iki syscall'ı birleştiriyor. **Tasarruf M9b'de
+  ölçüldü ve beklenenin çok altında çıktı: 13902'ye karşı 13776
+  çevrim, yani ~126.** Gerekçesi mekanizmada değil, ölçümün
+  koştuğu yerde: M13'e kadar user mode yok, dolayısıyla
+  `reply_recv` bir Rust fonksiyon çağrısıyla erişiliyor ve hiçbir
+  ayrıcalık geçişi tasarruf edilmiyor. ~930 çevrimlik iddia M13'te
+  sınanabilir hale geliyor; o zamana kadar **iddia edilmiyor**,
+  rapor ediliyor.
 - Geçerlilik **üç karşılaştırma**: adres, generation, durum.
   ADR 028'in VSpace için kurduğu desenin aynısı.
 - **Sunucu çökerse** çağıran uyanır ve `ReplyTargetGone` alır

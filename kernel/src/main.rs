@@ -815,6 +815,37 @@ extern "C" fn kmain() -> ! {
         ipctest::run_cancel_cost();
     }
 
+    // M9b, before the M9a line below: `ipc-call-test` *contains*
+    // "ipc-test" as a substring, so the shorter check would match
+    // first and silently run the wrong scenario. Ordering rather than
+    // a tighter pattern, because the tokens are chosen here and the
+    // ordering is one line; a regex would be a second thing to keep
+    // right.
+    if cmdline.contains("ipc-call-test") {
+        println!("[boot] cmdline requested the call/reply tests");
+        ipctest::run_call();
+    }
+
+    if cmdline.contains("ipc-server-dies") {
+        println!("[boot] cmdline requested the dead-server test");
+        ipctest::run_server_dies();
+    }
+
+    if cmdline.contains("ipc-stale-reply") {
+        println!("[boot] cmdline requested the stale-reply test");
+        ipctest::run_stale_reply();
+    }
+
+    if cmdline.contains("ipc-self-call") {
+        println!("[boot] cmdline requested the self-call test");
+        ipctest::run_self_call();
+    }
+
+    if cmdline.contains("ipc-cost") {
+        println!("[boot] cmdline requested the IPC cost measurement");
+        ipctest::run_ipc_cost();
+    }
+
     if cmdline.contains("ipc-test") {
         println!("[boot] cmdline requested the IPC tests");
         ipctest::run();
