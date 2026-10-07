@@ -694,6 +694,17 @@ fn current_rsp() -> u64 {
     rsp
 }
 
+/// Physical address of the kernel's PML4.
+///
+/// The scheduler needs this without borrowing the table: a thread whose
+/// `vspace_root` is zero runs in the kernel's address space (ADR 027),
+/// and the switch has to compare that against CR3.
+pub fn kernel_pml4() -> PhysAddr {
+    let frame = KERNEL_PML4.load(Ordering::Acquire);
+    assert!(frame != 0, "kernel_pml4() before vm::init()");
+    PhysAddr(frame)
+}
+
 /// The kernel PML4, for code that needs to map something after boot.
 ///
 /// # Safety

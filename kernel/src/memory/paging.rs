@@ -825,6 +825,182 @@ pub unsafe fn translate(
     ))
 }
 
+// ---- Top-level entries, for the capability layer -----------------------
+//
+// M7 additions. None of them change how an existing call behaves: they
+// expose parts of the walk that the VSpace layer needs in order to
+// share the kernel's half and to insert tables the caller supplies.
+
+/// Whether entry `index` of `table` is present.
+///
+/// Used by the VSpace layer to snapshot which top-level entries the
+/// kernel occupies (ADR 027, invariant K2).
+///
+/// # Safety
+///
+/// `table` must be a live page table and `index` below [`ENTRY_COUNT`].
+pub unsafe fn entry_present(table: &PageTable, index: usize) -> bool {
+    debug_assert!(index < ENTRY_COUNT);
+    table.entries[index].is_present()
+}
+
+/// Copy one entry from `from` to `to`.
+///
+/// This is how a new address space inherits the kernel's half: the
+/// *entries* are copied, so every table beneath them is shared rather
+/// than duplicated. A change to a kernel mapping is therefore visible
+/// in every address space at once -- which is required, and is also
+/// why a user mapping must never be allowed into the kernel half
+/// (ADR 027, invariant K1).
+///
+/// # Safety
+///
+/// Both tables must be live, `index` below [`ENTRY_COUNT`], and the two
+/// must not be the same table.
+pub unsafe fn copy_entry(from: &PageTable, to: &mut PageTable, index: usize) {
+    debug_assert!(index < ENTRY_COUNT);
+    debug_assert!(
+        !core::ptr::eq(from, to),
+        "copying an entry from a table to itself"
+    );
+    to.entries[index] = from.entries[index];
+}
+
+/// Install `frame` as the page table at `level` covering `addr`.
+///
+/// `level` is the level of the table being inserted: 3 for a PDPT, 2
+/// for a PD, 1 for a PT. Every level above it must already be present,
+/// because this function allocates nothing -- that is the whole point
+/// (ADR 027: intermediate tables are supplied, not allocated).
+///
+/// The frame is **not** zeroed here. It comes from a `retype`, which
+/// zeroes unconditionally (ADR 020), and zeroing again would hide the
+/// day that stops being true.
+///
+/// # Safety
+///
+/// `table` must be a live PML4, and `frame` must hold a zeroed page
+/// table that nothing else has installed anywhere.
+pub unsafe fn insert_table(
+    table: &mut PageTable,
+    addr: VirtAddr,
+    frame: PhysFrame,
+    level: u8,
+    user: bool,
+) -> Result<(), MapError> {
+    assert!((1..=3).contains(&level), "level must be 1, 2 or 3");
+
+    if !layout::is_canonical(addr.0) {
+        return Err(MapError::NotCanonical { addr });
+    }
+
+    // Walk down to the table that will hold the pointer. The entry at
+    // `level + 1` is the one we write.
+    let mut current: *mut PageTable = table;
+    for walk_level in ((level + 2)..=4u8).rev() {
+        let index = table_index(addr, walk_level);
+        // SAFETY: `current` points at a live table -- the caller's PML4
+        // first, then one reached through a present, non-huge entry.
+        let entry = unsafe { (*current).entries[index] };
+
+        if !entry.is_present() {
+            // The level above is missing. Reported as OutOfFrames
+            // because that is what the no-allocation source produces
+            // elsewhere, and the VSpace layer turns both into
+            // MissingPageTable.
+            return Err(MapError::OutOfFrames);
+        }
+        if entry.is_huge() {
+            return Err(MapError::BlockedByHugePage { level: walk_level });
+        }
+
+        // SAFETY: Present and non-huge, so the frame holds a table.
+        current = unsafe { table_mut(entry.frame()) };
+    }
+
+    let index = table_index(addr, level + 1);
+    // SAFETY: `current` is the table at `level + 1`.
+    let existing = unsafe { (*current).entries[index] };
+    if existing.is_present() {
+        return Err(MapError::AlreadyMapped {
+            existing: existing.frame(),
+        });
+    }
+
+    // SAFETY: As above. Intermediate flags are permissive; the leaf
+    // decides the real permissions, because the CPU intersects along
+    // the walk.
+    unsafe {
+        (*current).entries[index] = Entry::new(frame, intermediate_entry_flags(user));
+    }
+
+    Ok(())
+}
+
+/// Remove the page table at `level` covering `addr` and return its frame.
+///
+/// The frame is handed back rather than freed: it belongs to whoever
+/// supplied it. This is the half of ADR 015's question that M7 answers
+/// by changing who owns the table rather than by counting references.
+///
+/// Whatever that table still contains goes with it. That is the
+/// caller's business -- they hold the capability, and they are the only
+/// one who can know whether the mappings underneath still matter.
+///
+/// # Safety
+///
+/// `table` must be a live PML4. The caller must flush the TLB
+/// afterwards: a whole subtree has gone, so `invlpg` on one page is not
+/// enough.
+pub unsafe fn remove_table(
+    table: &mut PageTable,
+    addr: VirtAddr,
+    level: u8,
+) -> Result<PhysFrame, UnmapError> {
+    assert!((1..=3).contains(&level), "level must be 1, 2 or 3");
+
+    if !layout::is_canonical(addr.0) {
+        return Err(UnmapError::NotCanonical { addr });
+    }
+
+    let mut current: *mut PageTable = table;
+    for walk_level in ((level + 2)..=4u8).rev() {
+        let index = table_index(addr, walk_level);
+        // SAFETY: `current` points at a live table.
+        let entry = unsafe { (*current).entries[index] };
+
+        if !entry.is_present() {
+            return Err(UnmapError::NotMapped);
+        }
+        if entry.is_huge() {
+            return Err(UnmapError::BlockedByHugePage { level: walk_level });
+        }
+
+        // SAFETY: Present and non-huge.
+        current = unsafe { table_mut(entry.frame()) };
+    }
+
+    let index = table_index(addr, level + 1);
+    // SAFETY: `current` is the table at `level + 1`.
+    let entry = unsafe { (*current).entries[index] };
+
+    if !entry.is_present() {
+        return Err(UnmapError::NotMapped);
+    }
+    if entry.is_huge() {
+        return Err(UnmapError::BlockedByHugePage { level: level + 1 });
+    }
+
+    let frame = entry.frame();
+
+    // SAFETY: As above.
+    unsafe {
+        (*current).entries[index] = Entry::empty();
+    }
+
+    Ok(frame)
+}
+
 // ---- CR3 ---------------------------------------------------------------
 
 /// Physical frame of the active PML4.

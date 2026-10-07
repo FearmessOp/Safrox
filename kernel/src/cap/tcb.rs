@@ -181,8 +181,41 @@ pub struct Tcb {
     /// list inside the capability slots (ADR 019).
     next_ready: u64,
 
+    /// Physical address of this thread's root page table, or zero to
+    /// mean "the kernel's own address space" (ADR 027).
+    ///
+    /// Zero rather than an `Option` because the scheduler compares it
+    /// against CR3 on every switch, and a null check costs the same
+    /// instruction as the comparison it would otherwise do anyway.
+    vspace_root: u64,
+
+    /// Physical address of the slot the VSpace capability lives in.
+    ///
+    /// Needed because the staleness check has to *look at* that slot,
+    /// and a TCB has no CSpace to resolve a CPtr through. The slot's
+    /// address is stable: it sits inside a CNode object, which does
+    /// not move.
+    ///
+    /// Zero when `vspace_root` is zero.
+    vspace_slot: u64,
+
+    /// Generation that slot had when `SetSpace` was called.
+    ///
+    /// Checked before every switch into this thread, alongside the
+    /// slot still holding a PageTable. The root address alone would
+    /// not be enough: revoking returns the memory to its Untyped and
+    /// resets the watermark, so the *next* retype is likely to place
+    /// a new object at exactly the old address. The thread would then
+    /// resume in somebody else's address space, with no fault to
+    /// mark the moment.
+    ///
+    /// Precisely the problem ADR 018 solved for CPtrs, wearing a
+    /// different hat. See ADR 028.
+    vspace_generation: u8,
+    _pad2: [u8; 7],
+
     /// Reserved. Brings the fixed part to IPC_BUFFER_OFFSET.
-    _reserved: [u8; IPC_BUFFER_OFFSET - 112],
+    _reserved: [u8; IPC_BUFFER_OFFSET - 136],
 
     /// The IPC buffer. Untouched in M6.
     _ipc_buffer: [u8; super::TCB_SIZE - IPC_BUFFER_OFFSET],
@@ -249,6 +282,74 @@ impl Tcb {
 
     pub fn stack_slot(&self) -> u64 {
         self.stack_slot
+    }
+
+    /// Physical address of this thread's root page table, or zero for
+    /// the kernel's address space.
+    pub fn vspace_root(&self) -> u64 {
+        self.vspace_root
+    }
+
+    /// Generation the VSpace slot had when it was bound.
+    pub fn vspace_generation(&self) -> u8 {
+        self.vspace_generation
+    }
+
+    /// Whether this thread's address space is still the one it was
+    /// given.
+    ///
+    /// Three comparisons, no loop (ADR 028). Each rules out a
+    /// different way the capability could have gone away:
+    ///
+    /// * the slot is empty -- deleted or revoked;
+    /// * it holds something else -- the memory was retyped;
+    /// * the generation moved -- it was emptied and refilled, possibly
+    ///   with another PageTable at the very same address.
+    ///
+    /// The third is the one that matters most, and the one an
+    /// address-only check would miss.
+    pub fn vspace_is_live(&self) -> bool {
+        if self.vspace_root == 0 {
+            // The kernel's address space. It cannot be revoked --
+            // nothing holds a capability to it, because `vm::init`
+            // built it rather than retyping it.
+            return true;
+        }
+        if self.vspace_slot == 0 {
+            return false;
+        }
+
+        // SAFETY: A non-zero `vspace_slot` is the physical address of
+        // a slot inside a live CNode, recorded by `set_vspace`. CNodes
+        // are never freed while a capability names them, and PMAP maps
+        // all RAM.
+        let slot = unsafe {
+            &*crate::memory::phys_to_virt(PhysAddr(self.vspace_slot)).as_ptr::<super::cnode::Slot>()
+        };
+
+        !slot.is_empty()
+            && slot.cap_type() == CapType::PageTable
+            && slot.generation() == self.vspace_generation
+            && slot.object().0 .0 == self.vspace_root
+    }
+
+    /// Forget this thread's address space, putting it back in the
+    /// kernel's.
+    ///
+    /// Called by `SetSpace(None)`, and by the scheduler when it finds
+    /// the VSpace has been revoked (ADR 028, case B). In the second
+    /// case the thread is suspended at the same moment: this is not a
+    /// silent fallback into the kernel's address space, which ADR 028
+    /// rejected as worse than stopping.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the scheduler's invariants and must not be
+    /// executing in the VSpace being dropped.
+    pub unsafe fn clear_vspace(&mut self) {
+        self.vspace_root = 0;
+        self.vspace_slot = 0;
+        self.vspace_generation = 0;
     }
 
     /// Whether an address is inside this thread's kernel stack.
@@ -350,6 +451,13 @@ impl Tcb {
         self.switch_count = 0;
         self.next_ready = 0;
         self.state = ThreadState::Inactive as u8;
+
+        // The address space is *not* reset here. `SetRegisters` gives a
+        // thread somewhere to start; `SetSpace` gives it somewhere to
+        // live, and the two are independent invocations. Clearing the
+        // VSpace here would make the order they are called in matter,
+        // which is the sort of hidden coupling that shows up much
+        // later as "it works if you do it the other way round".
     }
 
     /// Record the stack of a thread that is **already running**.
@@ -377,6 +485,27 @@ impl Tcb {
         self.next_ready = 0;
         // Left as Inactive; `sched::init` sets Running.
         self.state = ThreadState::Inactive as u8;
+
+        // The boot thread runs in the kernel's address space, which is
+        // what zero means (ADR 027). It never gets a VSpace capability
+        // because the kernel PML4 was built by `vm::init` rather than
+        // retyped, so there is no slot that could name it.
+        self.vspace_root = 0;
+        self.vspace_slot = 0;
+        self.vspace_generation = 0;
+    }
+
+    /// Bind this thread to an address space.
+    ///
+    /// # Safety
+    ///
+    /// `root` must be the physical address of a live PML4 whose kernel
+    /// half is populated, and `slot` the address of the slot holding
+    /// its capability. The thread must not be running.
+    unsafe fn set_vspace(&mut self, root: PhysAddr, slot: PhysAddr, generation: u8) {
+        self.vspace_root = root.0;
+        self.vspace_slot = slot.0;
+        self.vspace_generation = generation;
     }
 }
 
@@ -449,6 +578,8 @@ pub struct ThreadRegisters {
     pub state: ThreadState,
     pub priority: u8,
     pub switch_count: u64,
+    /// Root page table, or zero for the kernel's address space.
+    pub vspace_root: u64,
 }
 
 /// Count of every invocation, so the acceptance test can show the
@@ -517,7 +648,64 @@ pub unsafe fn read_registers(slot: &Slot) -> Result<ThreadRegisters, CapError> {
         state: tcb.state(),
         priority: tcb.priority(),
         switch_count: tcb.switch_count(),
+        vspace_root: tcb.vspace_root(),
     })
+}
+
+/// `SetSpace`: give a thread an address space.
+///
+/// Refused for a busy thread, for the same reason `SetRegisters` is:
+/// the scheduler holds a reference to it, and changing CR3 under a
+/// thread it is about to switch into would put that thread in an
+/// address space it never agreed to (ADR 026, ADR 028).
+///
+/// Passing `None` returns the thread to the kernel's address space.
+/// That is what keeps ADR 028's refusal to revoke a live VSpace from
+/// being a trap: the running thread can always move out of the way
+/// first, so the two-step sequence always terminates.
+///
+/// # Safety
+///
+/// Both slots must hold live capabilities, and the caller must not hold
+/// another mutable borrow of the TCB.
+pub unsafe fn set_space(tcb_slot: &Slot, vspace_slot: Option<&Slot>) -> Result<(), CapError> {
+    count_invocation();
+
+    // SAFETY: Caller's guarantee.
+    let tcb = unsafe { from_slot(tcb_slot) }?;
+
+    if tcb.state().is_busy() {
+        return Err(CapError::ThreadBusy {
+            state: tcb.state().name(),
+        });
+    }
+
+    match vspace_slot {
+        None => {
+            // SAFETY: The thread is not busy, so the scheduler is not
+            // about to switch into it.
+            unsafe {
+                tcb.clear_vspace();
+            }
+        }
+        Some(slot) => {
+            let root = super::vspace::root_address(slot)?;
+
+            // The slot's own physical address, so the staleness check
+            // can look at it later. A TCB has no CSpace to resolve a
+            // CPtr through, and the slot's address is stable: slots
+            // live inside CNode objects, and a CNode does not move.
+            let slot_phys = PhysAddr(core::ptr::from_ref(slot) as u64 - crate::memory::pmap_base());
+
+            // SAFETY: `root_address` established that the slot holds a
+            // live PageTable, and the thread is not busy.
+            unsafe {
+                tcb.set_vspace(root, slot_phys, slot.generation());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// `SetPriority`: store a priority.

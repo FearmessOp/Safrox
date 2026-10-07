@@ -408,3 +408,119 @@ fn feature_state(supported: bool, enabled: bool) -> &'static str {
         (false, _) => "unsupported",
     }
 }
+
+// ---- SMAP: deliberate access to user pages -----------------------------
+
+/// RFLAGS.AC, bit 18.
+///
+/// With CR4.SMAP set, a CPL 0 access to a page marked USER faults unless
+/// this flag is set. The point is that touching user memory should be a
+/// *decision*, not something a stray pointer can do by accident.
+///
+/// Reference: Intel SDM Vol. 3A, 4.6.1 "Determination of Access Rights",
+/// and Vol. 1, Figure 3-8.
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// Permission to touch user pages, for as long as this value lives.
+///
+/// # Why this arrived in M7 rather than M8
+///
+/// The known-gaps list said `stac`/`clac` would be needed "once user
+/// mappings exist", and filed it under M8 with ring 3. That was one
+/// milestone too late, and the reason is worth keeping: SMAP keys off
+/// the page's USER *bit*, not off the privilege level of the code.
+///
+/// M7 creates pages marked USER -- that is what a user address space is
+/// -- while every thread still runs at CPL 0. So the first user mapping
+/// and the first SMAP violation arrive together, a milestone before the
+/// first ring-3 instruction. The acceptance test found it immediately:
+/// `supervisor read protection-violation` on a page that was plainly
+/// present and plainly readable.
+///
+/// # Why a guard rather than a pair of calls
+///
+/// Hand-written `stac` ... `clac` pairs have one failure mode, and it
+/// is silent: an early `return` between them leaves AC set, and from
+/// that point SMAP protects nothing at all. Nothing faults, nothing
+/// logs, and the protection is simply gone.
+///
+/// `Drop` runs on every path out of a scope, including a panic unwind
+/// and an early return, so the pairing cannot be forgotten. The same
+/// argument as `TlbFlush` in ADR 012: when a rule can be encoded in a
+/// type, a comment is the weaker choice.
+pub struct UserAccess {
+    /// Whether AC was already set when this guard was created.
+    ///
+    /// Restored rather than unconditionally cleared, for the reason
+    /// ADR 025 gives about `InterruptGuard`: an inner region that ended
+    /// with `clac` would silently revoke an outer one's permission.
+    was_set: bool,
+}
+
+impl UserAccess {
+    /// Allow this CPU to touch USER pages until the guard is dropped.
+    pub fn new() -> UserAccess {
+        let was_set = read_rflags() & RFLAGS_AC != 0;
+
+        // The condition carries the `stac` instruction's own
+        // preconditions: on a CPU without CR4.SMAP it is #UD, and
+        // setting AC when it is already set would make the restore on
+        // drop clear somebody else's permission.
+        if features().smap_enabled && !was_set {
+            // SAFETY: `stac` sets RFLAGS.AC and has no other effect.
+            // It requires CPL 0, which holds everywhere in this
+            // kernel, and CR4.SMAP, which the condition above
+            // established.
+            //
+            // Reference: Intel SDM Vol. 2B, "STAC".
+            unsafe {
+                core::arch::asm!("stac", options(nomem, nostack));
+            }
+        }
+
+        UserAccess { was_set }
+    }
+
+    /// Whether SMAP is actually enforcing anything on this machine.
+    ///
+    /// Reported by the acceptance test, because on a CPU without SMAP
+    /// this guard is a no-op and a test that did not say so would be
+    /// claiming a protection it never exercised.
+    pub fn enforcing() -> bool {
+        features().smap_enabled
+    }
+}
+
+impl Drop for UserAccess {
+    fn drop(&mut self) {
+        // Mirrors `new`: only clear AC if this guard is the one that
+        // set it. An inner guard clearing an outer one's permission is
+        // the nesting bug ADR 025 names for `InterruptGuard`.
+        if features().smap_enabled && !self.was_set {
+            // SAFETY: `clac` clears RFLAGS.AC and has no other effect;
+            // the same CPL 0 and CR4.SMAP requirements as `stac`, both
+            // established by the condition above.
+            //
+            // Reference: Intel SDM Vol. 2B, "CLAC".
+            unsafe {
+                core::arch::asm!("clac", options(nomem, nostack));
+            }
+        }
+    }
+}
+
+/// Read RFLAGS.
+fn read_rflags() -> u64 {
+    let flags: u64;
+    // SAFETY: `pushfq` pushes RFLAGS and `pop` takes it off again. Both
+    // touch the stack, so `nostack` would be a lie.
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(preserves_flags));
+    }
+    flags
+}
+
+/// Whether RFLAGS.AC is set, for the acceptance test.
+pub fn user_access_allowed() -> bool {
+    read_rflags() & RFLAGS_AC != 0
+}

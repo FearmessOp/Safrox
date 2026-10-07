@@ -20,6 +20,7 @@ pub mod cnode;
 pub mod cptr;
 pub mod tcb;
 pub mod untyped;
+pub mod vspace;
 
 use core::fmt;
 
@@ -325,6 +326,52 @@ pub enum CapError {
     /// enum is defined before `tcb` in the module graph, and the
     /// caller wants to print it rather than match on it.
     ThreadBusy { state: &'static str },
+
+    // ---- M7: address spaces (ADR 027, 028) ----
+    /// A mapping was requested at an address outside the user half.
+    ///
+    /// Distinct from the paging layer's `WrongHalf`, which is about the
+    /// USER *flag* agreeing with the address. This one is about
+    /// ownership: the kernel's top-level entries are shared by every
+    /// address space, so a user mapping in the kernel half would edit
+    /// tables that every other VSpace is walking (ADR 027, K1).
+    NotUserAddress { address: u64 },
+    /// The paging layer refused the address because the USER flag and
+    /// the half disagree.
+    ///
+    /// Distinct from [`CapError::NotUserAddress`], and the distinction
+    /// is not pedantry -- it was invisible until a mutation test made
+    /// it visible. Deleting the capability layer's half check left
+    /// `vspace-kernel-half` passing, because the paging layer refused
+    /// the same addresses and nothing in the log said which guard had
+    /// fired.
+    ///
+    /// They are checking different properties. `NotUserAddress` is
+    /// about ownership: a user VSpace may only edit the user half,
+    /// because the kernel half's tables are shared by every address
+    /// space. This one is about flag consistency within a single
+    /// request. Separate values are what make it possible to show both
+    /// are present.
+    FlagsWrongHalf { address: u64 },
+    /// An intermediate page table is missing at this address.
+    ///
+    /// Not a failure so much as an instruction: map a PageTable at the
+    /// level below first. The kernel will not spend a frame the caller
+    /// did not offer (ADR 027).
+    MissingPageTable { address: u64 },
+    /// Something is already mapped there. Unmap it first -- overwriting
+    /// would silently drop a frame somebody may still hold.
+    AlreadyMapped { address: u64 },
+    /// Nothing is mapped there.
+    NotMapped { address: u64 },
+    /// The VSpace is the one currently in CR3 (ADR 028, case A).
+    ///
+    /// Revoking it would hand the live page tables back to the Untyped
+    /// while the CPU is still walking them. Move the running thread to
+    /// another VSpace first; `SetSpace` always works, so the sequence
+    /// always terminates.
+    VSpaceInUse { root: u64 },
+
     /// Size, alignment or type combination is not valid.
     InvalidArgument,
 }
@@ -368,6 +415,36 @@ impl fmt::Display for CapError {
                 f,
                 "ThreadBusy (the thread is {}; suspend it first -- ADR 026)",
                 state
+            ),
+            CapError::NotUserAddress { address } => write!(
+                f,
+                "NotUserAddress ({:#018x} is not in the user half; the \
+                 kernel's tables are shared by every VSpace -- ADR 027)",
+                address
+            ),
+            CapError::FlagsWrongHalf { address } => write!(
+                f,
+                "FlagsWrongHalf ({:#018x}: the USER flag and the address \
+                 half disagree)",
+                address
+            ),
+            CapError::MissingPageTable { address } => write!(
+                f,
+                "MissingPageTable (no intermediate table covers {:#018x}; \
+                 map one first -- the kernel does not allocate)",
+                address
+            ),
+            CapError::AlreadyMapped { address } => {
+                write!(f, "AlreadyMapped ({:#018x} is occupied)", address)
+            }
+            CapError::NotMapped { address } => {
+                write!(f, "NotMapped ({:#018x})", address)
+            }
+            CapError::VSpaceInUse { root } => write!(
+                f,
+                "VSpaceInUse (root {:#018x} is in CR3 right now; move the \
+                 running thread elsewhere first -- ADR 028)",
+                root
             ),
             CapError::InvalidArgument => write!(f, "InvalidArgument"),
         }

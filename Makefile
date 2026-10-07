@@ -57,6 +57,11 @@ ISO_THREADTEST := $(BUILD_DIR)/pythos-threadtest.iso
 ISO_THREADOVF := $(BUILD_DIR)/pythos-threadovf.iso
 ISO_THREADINTALLOC := $(BUILD_DIR)/pythos-threadintalloc.iso
 ISO_THREADKILL := $(BUILD_DIR)/pythos-threadkill.iso
+# M7 address space images.
+ISO_VSPACETEST := $(BUILD_DIR)/pythos-vspacetest.iso
+ISO_VSKERNEL := $(BUILD_DIR)/pythos-vskernel.iso
+ISO_VSISOLATION := $(BUILD_DIR)/pythos-vsisolation.iso
+ISO_VSSTALE := $(BUILD_DIR)/pythos-vsstale.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -65,7 +70,9 @@ ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_HEAPTEST) $(ISO_HEAPOOM) $(ISO_HEAPGUARD) \
                $(ISO_CAPTEST) $(ISO_CAPREVOKE) $(ISO_CAPINTALLOC) \
                $(ISO_CAPRETIRED) $(ISO_THREADTEST) $(ISO_THREADOVF) \
-               $(ISO_THREADINTALLOC) $(ISO_THREADKILL)
+               $(ISO_THREADINTALLOC) $(ISO_THREADKILL) \
+               $(ISO_VSPACETEST) $(ISO_VSKERNEL) $(ISO_VSISOLATION) \
+               $(ISO_VSSTALE)
 
 LIMINE_DIR  := third_party/limine
 LIMINE_EXE  := $(LIMINE_DIR)/limine
@@ -122,6 +129,9 @@ QEMU_FLAGS := \
         run-memtest run-doublefree \
         run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
         run-heaptest run-heapoom run-heapguard \
+        run-captest run-caprevoke run-capintalloc run-capretired \
+        run-threadtest run-threadovf run-threadintalloc run-threadkill \
+        run-vspacetest run-vskernel run-vsisolation run-vsstale \
         test debug clean distclean limine toolchain-check fmt clippy
 
 # `test` depends on fmt and clippy, and those must finish before any QEMU run
@@ -370,10 +380,11 @@ test: fmt clippy run run-panic run-int3 run-pf run-df run-memtest run-doublefree
       run-vmtest run-staletlb run-guardpage run-nx run-stackovf \
       run-heaptest run-heapoom run-heapguard \
       run-captest run-caprevoke run-capintalloc run-capretired \
-      run-threadtest run-threadovf run-threadintalloc run-threadkill
+      run-threadtest run-threadovf run-threadintalloc run-threadkill \
+      run-vspacetest run-vskernel run-vsisolation run-vsstale
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_PANIC) \
 		--expect success --self-test-expect-failure -- $(QEMU_FLAGS)
-	@echo "M6: all acceptance tests passed"
+	@echo "M7: all acceptance tests passed"
 
 debug: $(ISO)
 	@echo "GDB: target remote :1234    (symbols in $(KERNEL))"
@@ -404,3 +415,32 @@ clean:
 distclean: clean
 	@rm -rf $(LIMINE_DIR)
 	@echo "  CLEAN   $(LIMINE_DIR)"
+# ---- M7 address space images -------------------------------------------
+
+$(ISO_VSPACETEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,24)
+
+$(ISO_VSKERNEL): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,25)
+
+$(ISO_VSISOLATION): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,26)
+
+$(ISO_VSSTALE): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,27)
+
+# M7 address space scenarios. vspacetest and vskernel exit 33 -- the
+# second because a refused mapping is a caller error, not a kernel
+# fault, and the kernel must still be running afterwards. The other
+# two exit 35.
+run-vspacetest: $(ISO_VSPACETEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSPACETEST) --expect vspacetest -- $(QEMU_FLAGS)
+
+run-vskernel: $(ISO_VSKERNEL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSKERNEL) --expect vskernel -- $(QEMU_FLAGS)
+
+run-vsisolation: $(ISO_VSISOLATION)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSISOLATION) --expect vsisolation -- $(QEMU_FLAGS)
+
+run-vsstale: $(ISO_VSSTALE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSSTALE) --expect vsstale -- $(QEMU_FLAGS)

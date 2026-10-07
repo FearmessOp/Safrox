@@ -3,16 +3,20 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M6 — Threads and preemption.** Threads are TCB
-objects retyped from Untyped memory, each with its own kernel stack and
-guard page. A round-robin scheduler switches between them, and the LAPIC
-timer takes the CPU away from a thread that will not give it up.
+**Current milestone: M7 — Address spaces.** A thread can now have an
+address space of its own, built entirely out of capabilities: a root
+PageTable, the intermediate tables the caller supplies, and Frames
+mapped into the user half. Context switching reloads CR3 — but only
+when the address space actually differs.
 
-The change that reaches furthest is not the scheduler: **interrupts are
-enabled for the first time since M2**. Every soundness argument written
-under "the kernel runs with IF clear" stopped holding at that `sti`, and
-[ADR 025](docs/adr/025-kesme-disiplini.md) replaces the vanished
-assumption with a list of named regions.
+**There is no ring 3 yet.** Threads run at CPL 0 in their own CR3, and
+the split is deliberate: reaching ring 3 and reaching a private address
+space are two separate sources of error, and doing both at once leaves
+a first `#GP` with two suspects. M7 proves the address space; M8 proves
+the privilege level.
+
+The claim that matters is one line of the acceptance test: two threads
+read the *same* virtual address and see different bytes.
 
 The design is seL4's, with three departures named in the ADRs: one
 PageTable type instead of four ([017](docs/adr/017-nesne-kumesi.md)),
@@ -78,7 +82,11 @@ cloned into `third_party/` automatically.
 | `make run-threadovf` | A thread runs off its own stack → #DF; **must** exit 35 |
 | `make run-threadintalloc` | Allocating inside a *real* timer interrupt; **must** exit 35 |
 | `make run-threadkill` | Operating on a running thread is refused; **must** exit 35 |
-| `make test` | `fmt`, `clippy`, all twenty-three scenarios, runner self-test |
+| `make run-vspacetest` | Address space suite; **must** exit 33 |
+| `make run-vskernel` | Mapping into the kernel half is *refused*; **must** exit 33 |
+| `make run-vsisolation` | Reaching into another VSpace → #PF; **must** exit 35 |
+| `make run-vsstale` | Revoking a VSpace in use is refused; **must** exit 35 |
+| `make test` | `fmt`, `clippy`, all twenty-seven scenarios, runner self-test |
 | `make debug` | Boot and wait for GDB on `localhost:1234` |
 | `make clippy` | Lint, including the `// SAFETY:` comment check |
 | `make fmt` | Check formatting |
@@ -86,9 +94,9 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
-## M6 acceptance criteria
+## M7 acceptance criteria
 
-Twenty-three scenarios, all booting the **same** `kernel.elf` through
+Twenty-seven scenarios, all booting the **same** `kernel.elf` through
 different Limine entries ([ADR 002](docs/adr/002-tek-binary-iki-iso.md)).
 
 ### Normal boot — `make run`, exit 33
@@ -737,6 +745,176 @@ Refusing is only acceptable because it cannot trap a caller. `Suspend`
 terminates. The scenario shows both halves: the refusal, then the same
 call succeeding after a suspend. A refusal with no path through it would
 be a denial-of-service vector rather than a safety property.
+### Address spaces — `make run-vspacetest`, exit 33
+
+Nine checks. An address space assembled entirely from capabilities, the
+two translate paths agreeing, SMAP, rights narrowing, isolation, unmap,
+revoke, and the CR3 measurement.
+
+```
+[vspace] kernel half: 5 top-level entries, shared by every address space;
+         cr3 is 0x0000000000054000
+[vspace] built from capabilities: 0x0000000000400000 -> 0x000000000000d000
+         PageFlags(READ | WRITE | USER)
+[vspace] translate: the capability path and M3's paging agree
+[vspace] smap: enforced; AC is clear in ordinary kernel code, set inside a
+         UserAccess guard, and clear again after it
+[vspace] rights: WRITE withheld maps read-only (PageFlags(READ | USER));
+         no rights at all is refused with InsufficientRights
+[vspace] isolation: at 0x0000000000400000, thread A reads 0xaaaaaaaa11111111
+         and thread B reads 0xbbbbbbbb22222222; same address, different
+         frames, 8 cr3 reloads
+[vspace] unmap: the Frame and the PT both come back to their holders
+[vspace] revoke: 5 capabilities deleted, watermark 24576 -> 16
+[vspace] cr3 cost: 2166 cycles/switch within one address space (10004
+         skipped), 48173 cycles/switch across two (10046 reloads)
+```
+
+**The isolation line is the one that cannot be faked.** Every other
+check here would pass on a kernel with a single address space and
+careful bookkeeping. Two threads reading different bytes from the same
+virtual address would not.
+
+The two patterns are required literally by the runner, because a test
+printing the same value twice — or two zeroes — would satisfy a looser
+regex and prove nothing.
+
+**Changing address space costs 22×.** 2166 cycles within one, 48173
+across two. The figures are from emulation and the ratio is what
+matters, not the magnitudes; on real silicon the gap should be wider
+still, because the true cost is the cold TLB afterwards rather than the
+`mov cr3` itself. This is what pays for the rule that CR3 is reloaded
+only when the address space differs — and the two counters in the line
+are what make that rule testable. A kernel reloading on every switch
+would report `0 skipped`; one never reloading would report `0 reloads`.
+Requiring both to be non-zero rules out both.
+
+**Intermediate tables are supplied, never allocated.** The test maps a
+PDPT, then a PD, then a PT, then the Frame — four separate invocations,
+because the kernel refuses to spend a frame the caller did not offer
+([ADR 027](docs/adr/027-vspace-modeli.md)). M3's `paging::map` is used
+unchanged for this, with a `FrameSource` that always returns `None`; a
+missing table surfaces as an ordinary error. ADR 011's claim that the
+paging API is mechanism rather than policy was tested here and held.
+
+### Mapping into the kernel half — `make run-vskernel`, exit 33
+
+```
+[vspace] refused 0xffff800000000000 (the first kernel address): NotUserAddress
+[vspace] refused 0xffff800000001000 (inside the physical window): NotUserAddress
+[vspace] refused 0xffffc00000001000 (the kernel heap): NotUserAddress
+[vspace] refused 0xffffffff80000000 (the kernel image): NotUserAddress
+[vspace] and the paging layer's own half check is still there and still
+         separate: WrongHalf for a USER mapping at a kernel address
+[vspace] all four refused and the kernel's own mappings still work;
+         this is an error path, not a fault
+```
+
+**Exit 33, not 35.** A rejected request is a caller error, and from M8
+the caller is a user component. A kernel that died here would be worse
+than one that allowed the mapping — it would be a denial of service
+reachable from anywhere.
+
+What is being protected is not isolation but kernel integrity. Every
+address space shares the kernel's top-level page-table entries, one
+physical copy of each table beneath them. A user mapping placed in the
+kernel half would edit tables that *every other* address space is also
+walking.
+
+#### The check that was indistinguishable from its own absence
+
+The first version of this scenario passed with the capability layer's
+half check deleted.
+
+Both layers refuse a kernel address — `paging::map` with `WrongHalf`,
+the capability layer with its own test — and both were being reported
+as `NotUserAddress`. The log said "refused" and nothing said by whom.
+Mutation testing found it; the same shape as M5's `SlotNotEmpty`, where
+a guard turned into a no-op left nineteen scenarios green.
+
+They are now separate error values, because they are checking different
+things: ownership (a user VSpace may not edit shared tables) against
+consistency (the USER flag disagreeing with the address). Deleting
+either one now fails this scenario on the first address.
+
+Provoking the second error took two attempts, both instructive. A
+kernel address inside PMAP is already mapped, so `AlreadyMapped` comes
+back before the half check runs. And a kernel address with USER
+*withheld* is perfectly consistent — both halves of the statement agree
+— so there is nothing to report. What triggers it is a USER mapping at
+a kernel address, at a location nothing else has touched.
+
+### Address space isolation — `make run-vsisolation`, exit 35
+
+Isolation from the failing side. One address is mapped in B's VSpace
+and absent from A's; a thread in A reads it.
+
+```
+[vspace] 0x0000008000000000 in B: Ok(PhysAddr(102400)); in A: Err(NotMapped)
+[vspace] thread running in its own VSpace (cr3 0x0000000000009000);
+         reading 0x0000008000000000
+
+*** EXCEPTION: #PF page fault (vector 14) ***
+[trap] error_code=0x0000000000000000
+[trap] cr2=0x0000008000000000  (supervisor read not-present)
+```
+
+**Error code 0 is required, and that is not pedantry.** The faulting
+thread holds a `UserAccess` guard across the read. Without it SMAP
+would refuse first, and the scenario would end in #PF at exactly the
+same CR2 — looking like a pass while proving nothing about address
+spaces. Not-present and protection-violation are the same symptom from
+two unrelated causes; only the error code separates them.
+
+### Revoked address space — `make run-vsstale`, exit 35
+
+[ADR 028](docs/adr/028-vspace-yasam-dongusu.md) splits one question
+into two, because they have different answers.
+
+```
+[vspace] SetSpace on the running thread: ThreadBusy, as ADR 026 requires
+[vspace] victim running with cr3 0x0000000000009000
+[vspace] a thread tried to revoke the address space it is running in
+         (root 0x0000000000009000): VSpaceInUse, as ADR 028 case A requires
+[vspace] revoked an idle VSpace: 5 capabilities deleted
+[sched] thread at 0x0000000000010800 has a revoked address space;
+        suspended rather than switched into (ADR 028)
+[vspace] the thread was suspended rather than run: 1 stale detections,
+         state Suspended
+```
+
+**Case A — the VSpace in CR3 right now: refused.** Revoke resets the
+Untyped's watermark, so the live page tables would be handed out again
+while the CPU is still walking them. Not a fault but undefined
+behaviour, and one no interrupt could report, because reaching the IDT
+goes through those same tables.
+
+Reaching this case honestly took some thought. The check is "is this
+root in CR3", and by the time control returns to the test thread, CR3
+holds the kernel's PML4 again — which has no capability naming it,
+because `vm::init` built it rather than retyping it. So the attempt has
+to come from *inside*: the victim asks to destroy the address space it
+is executing in.
+
+**Case B — an idle thread's VSpace: allowed.** Nothing is walking those
+tables. The thread is stopped when something next tries to switch into
+it, which costs one comparison there rather than a sweep of every TCB
+at revoke time — ADR 019 already measured revoke in seconds.
+
+Staleness is detected by **address and generation together**. The
+address alone is not enough: revoke resets the watermark, so the next
+retype is *likely* to place a new object at exactly the old address,
+and the thread would resume in somebody else's address space with no
+fault to mark the moment. Precisely the problem
+[ADR 018](docs/adr/018-cptr-ve-cspace.md) solved for CPtrs, wearing a
+different hat.
+
+**Falling back silently to the kernel's address space was rejected.** A
+thread's address space is the definition of what it can see; changing
+it without telling anyone means the component is now looking at the
+kernel's memory. A protection mechanism that retreats quietly is worse
+than one that was never there — at least nobody trusts the second.
+
 
 ### Deliberate panic — `make run-panic`, exit 35
 
@@ -828,14 +1006,16 @@ kernel/src/cap/cnode.rs     Slot (32 B), the derivation list, copy/mint/delete/r
 kernel/src/cap/cptr.rs      CPtr resolution: two levels, two generations, no loop
 kernel/src/cap/untyped.rs   retype: two phases, atomic, always zeroes
 kernel/src/cap/boot.rs      Root Untypeds, the init CSpace, allocator retirement
-kernel/src/cap/tcb.rs       TCB: context, states, SetRegisters/ReadRegisters/SetPriority
-kernel/src/sched.rs     switch_context, round-robin, InterruptGuard, PreemptGuard
+kernel/src/cap/tcb.rs       TCB: context, states, SetRegisters/ReadRegisters/SetSpace
+kernel/src/cap/vspace.rs    VSpace: Frame and PageTable Map/Unmap, rights to permissions
+kernel/src/sched.rs     switch_context, round-robin, CR3 switching, the two guards
 kernel/src/apic.rs      LAPIC, timer calibrated against the TSC, legacy PIC masking
 kernel/src/memtest.rs   Frame allocator acceptance tests, run in-kernel
 kernel/src/vmtest.rs    Virtual memory acceptance tests and negative scenarios
 kernel/src/heaptest.rs  Kernel heap acceptance tests and negative scenarios
 kernel/src/captest.rs   Capability acceptance tests, the revoke measurement, two tripwires
 kernel/src/threadtest.rs  Thread and scheduler tests, the switch measurement, three scenarios
+kernel/src/vspacetest.rs  Address space tests, the CR3 measurement, three scenarios
 kernel/src/serial.rs    16550A COM1 driver, print!/println!
 kernel/src/panic.rs     #[panic_handler]: file:line, re-entry guard
 kernel/src/qemu.rs      isa-debug-exit, (value << 1) | 1
@@ -953,6 +1133,94 @@ M6:
 değiştirme maliyeti (switch başına 328 çevrim) ve testlerin artık
 deterministik olmadığı; 025'e iki ayrı kaydedilmiş hata — biri yazarken,
 biri çalıştırırken bulundu.
+
+M7:
+
+- [027 — VSpace: user adres uzayı bir capability](docs/adr/027-vspace-modeli.md)
+- [028 — Revoke edilmiş bir VSpace'e bağlı thread](docs/adr/028-vspace-yasam-dongusu.md)
+
+027 iki kez düzeltildi, ikisi de koşarak bulundu: "kökü revoke et"
+hiçbir şey silmiyordu, ve "iki kontrol de test ediliyor" iddiası
+mutasyonla yanlışlandı.
+
+İki eski ADR de bu milestone'da değişti. **[015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md)
+kapatıldı** — ara tabloların serbest bırakılması sorusu çözülmedi,
+sahipliği devredildi. **[014](docs/adr/014-cpu-ozellik-bitleri.md)
+düzeltildi**: SMAP borcunu M8'e yazmıştı, M7'de geldi.
+
+## What M7 cost: a borrowed assumption and a check that checked nothing
+
+### SMAP arrived a milestone early
+
+The known-gaps list had `stac`/`clac` filed under M8, to be written
+"once user mappings exist". The phrasing hides an assumption: that user
+mappings arrive with ring 3.
+
+**SMAP keys off the page's USER bit, not the privilege level of the
+code touching it.** M7 creates USER pages while every thread is still
+at CPL 0, so the first user mapping and the first SMAP violation
+arrived together — a milestone before the first ring-3 instruction.
+
+The acceptance test found it on its first run: `supervisor read
+protection-violation` on a page that was present, readable, and
+correctly mapped. Nothing was wrong with the mapping; SMAP was doing
+its job.
+
+ADR 014 had already specified the fix, down to preferring a RAII guard
+over hand-written pairs, and the reason it gave is the one that
+matters: an early `return` between `stac` and `clac` leaves AC set, and
+from that point SMAP protects nothing, silently. `cpu::UserAccess` is
+that guard. Only the milestone was wrong.
+
+**The general shape:** "feature X will be needed in milestone Y" can
+quietly assume that what *triggers* X is what Y *brings*. Here it was
+not.
+
+### "A VSpace" is not an object, so it cannot be revoked
+
+ADR 027's first draft said tearing down an address space meant revoking
+its root PageTable capability. The code was written that way, ran, and
+deleted nothing — `0 capabilities deleted`, watermark unmoved.
+
+Revoke removes a capability's *descendants*. The root, the three
+intermediate tables and the Frame are all children of the same
+**Untyped** — siblings, not a chain. The root is their peer and reaches
+none of them.
+
+The deeper point is that a VSpace is a *shape* built from capabilities,
+and nothing records that shape: the derivation tree does not know which
+tables belong to which root, because it does not need to. What owns all
+of it is the Untyped, and that is what gets revoked.
+
+This turned out to be an unplanned vindication of
+[ADR 020](docs/adr/020-retype-semantigi.md). Deciding that memory comes
+back by resetting a watermark, rather than object by object, has the
+side effect that destroying an address space is a single operation. A
+design that freed objects individually would have needed to record the
+VSpace's shape somewhere.
+
+### The check that was indistinguishable from its own absence
+
+ADR 027 claimed two independent guards stopped a user mapping landing
+in the kernel half, and that both were tested. Mutation testing
+disagreed: deleting the capability layer's check left
+`vspace-kernel-half` **passing**.
+
+Both layers refused the same four addresses, and both refusals were
+being reported as the same error. The log said "refused"; nothing said
+by whom.
+
+Exactly M5's `SlotNotEmpty` again, where turning a guard into a no-op
+left all nineteen scenarios green. Two milestones apart, same shape:
+
+> If deleting a check does not fail a test, the check is not being
+> tested, however many tests exercise the code path it sits on.
+
+The two errors are now distinct values, and the scenario requires both.
+Triggering the second one took two failed attempts — the first address
+was already mapped, and the second combination was not actually
+inconsistent — which is its own small argument for K5. Writing a test
+that provokes an error forces you to understand what the error *is*.
 
 ## What M6 cost: two mistakes about where interrupts are not
 
@@ -1221,10 +1489,13 @@ deleting the body of `TlbFlush::flush` entirely, `invlpg` and `mfence`
 both, leaves all fifteen scenarios passing. The experiment was run. What
 `TlbFlush` buys in this environment is compile-time only.
 
-**The heap has no lock and no reference to a budget.** Same shape as the
-frame allocator's gap: one CPU, interrupts disabled, one non-reentrant
-entry point. There is also an `IN_ALLOC` flag that panics if the mapping
-path ever allocates — not a lock, a tripwire for a future mistake.
+**The heap has no lock.** Same shape as the frame allocator's gap: one
+CPU, one non-reentrant entry point — though "interrupts disabled" is no
+longer part of the argument, since M6. What holds it together now is
+that nothing on an interrupt path allocates, which
+[ADR 022](docs/adr/022-kernelin-ayricalikli-kaynaklari.md)'s tripwire
+enforces rather than assumes. There is also an `IN_ALLOC` flag that
+panics if the mapping path ever allocates.
 
 **The heap never shrinks.** Freeing everything returns the live byte count
 to zero and leaves 12 MiB mapped; the free lists hold it for reuse within
@@ -1256,17 +1527,13 @@ means mapping the image's physical range read-only in the window, which
 costs a few extra page tables. **Due before M8.** See
 [ADR 010](docs/adr/010-hhdm-kaderi.md).
 
-**SMEP and SMAP are now on, but still protect nothing.** M3 left this as
-"enabled but untested"; M4 changed `QEMU_FLAGS` to
-`-cpu qemu64,+smep,+smap` and the boot log now reads `smep: enabled, smap:
-enabled`, which `run.py` requires in every scenario. What remains untested
-is the protection itself — there are no user mappings to protect until
-M8, so the bits are set and idle.
-
-**SMAP will need `stac`/`clac`.** Once user mappings exist, deliberate
-kernel access to user memory faults unless `EFLAGS.AC` is set. This should
-be an RAII guard, not hand-written pairs: a `Drop` impl makes it impossible
-for an early `return` to leave AC set. **M8.** See
+**SMAP is now enforcing something, and the `UserAccess` guard exists.**
+Both were filed under M8 and both arrived in M7, because SMAP keys off
+a page's USER bit rather than the privilege level of the code touching
+it: the first user mapping was the first SMAP violation.
+`vspace-test` shows AC clear in ordinary kernel code, set inside a
+guard, and clear again afterwards. **SMEP still protects nothing** —
+nothing executes from a user page until M8. See
 [ADR 014](docs/adr/014-cpu-ozellik-bitleri.md).
 
 **The stale-TLB check is advisory, and on QEMU the stale entry survived.**
@@ -1277,12 +1544,19 @@ result would also be legitimate, so the scenario reports instead of
 asserting. **Re-run on real hardware** to see what the architecture
 actually does here.
 
-**`unmap` does not free intermediate page tables.** Three frames stay out
-per 512 GiB of address space ever touched. Freeing them safely needs a
-per-table reference count, and a count that is wrong in the unmapping
-direction is a use-after-free in the page walker. **M5**, with the
-capability object model. See
-[ADR 015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md).
+**`unmap` does not free intermediate page tables — in the kernel half.**
+On the user side the question went away in M7: tables are PageTable
+capabilities now, `Unmap` hands one back to its holder, and the kernel
+never owned it to begin with
+([ADR 027](docs/adr/027-vspace-modeli.md) closed
+[ADR 015](docs/adr/015-ara-tablolar-serbest-birakilmiyor.md)).
+
+The kernel's own tables still have the original problem, because there
+the owner is the kernel. It has no practical instance: kernel mappings
+are built at boot and never removed, the heap only grows, and KSTACK
+slots are fixed, so nothing calls `unmap` on that path. The first thing
+that does — unmapping a dead thread's stack is the likely candidate,
+**M9** — brings the question back exactly as ADR 015 left it.
 
 **The frame allocator still has no lock.** Single CPU, interrupts disabled,
 every entry point funnelled through one non-reentrant function. Documented
@@ -1290,9 +1564,10 @@ in [ADR 007](docs/adr/007-bitmap-frame-allocator.md); becomes wrong the
 moment a second CPU starts.
 
 **`ACPI_RECLAIMABLE` is still untouched.** The tables have not been read
-yet. M6 did not need them — the LAPIC's base comes from the
-`IA32_APIC_BASE` MSR rather than from the MADT, which is enough for one
-CPU. **M7** needs the MADT to find the others. Unchanged from
+yet, and neither M6 nor M7 needed them: the LAPIC's base comes from the
+`IA32_APIC_BASE` MSR rather than the MADT, which is enough for one CPU.
+Finding the *other* CPUs needs the MADT, and that is whichever milestone
+brings SMP. Unchanged from
 [ADR 008](docs/adr/008-bootloader-reclaimable-dokunulmaz.md).
 
 **The serial port has no lock.** Interrupts are enabled now, so a handler
@@ -1307,9 +1582,27 @@ nothing is saved. Kernel threads do not use SSE — the build passes
 `-mno-sse` — so there is nothing to lose yet. **M8's** user threads make
 this mandatory.
 
-**Every thread shares the kernel's address space.** There is no VSpace
-field in the TCB, and a context switch changes RSP and RIP but not CR3.
-**M11**.
+**A thread's address space cannot be changed while it runs.** `SetSpace`
+is refused for a busy thread with `ThreadBusy`, for the same reason
+`SetRegisters` is: the scheduler is holding a reference, and moving CR3
+under a thread it is about to switch into would put it somewhere it
+never agreed to. Suspend first. That is also what keeps
+[ADR 028](docs/adr/028-vspace-yasam-dongusu.md)'s refusal to revoke a
+live VSpace from being a trap.
+
+**Nothing cleans up a thread's address space when the thread dies.**
+The VSpace outlives the TCB, and reclaiming it means revoking the
+Untyped it came from — which takes the stack and the TCB with it. That
+is correct but coarse, and it is the same gap as "threads cannot be
+destroyed" below. **M9.**
+
+**A VSpace's user half cannot be shared between threads.** Two threads
+can be given the same root capability and will then share everything,
+or different roots and share nothing. Anything in between — a shared
+buffer between two otherwise isolated components — needs the same Frame
+mapped into two VSpaces, which the capability model allows but nothing
+has exercised. ADR 020 named shared memory as a precondition for **M9**
+rather than something M7 provides.
 
 **The scheduler is policy, and policy does not belong in a microkernel.**
 Round-robin, a 10 ms quantum, and a priority field that is stored but
@@ -1339,10 +1632,10 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: device
+Deliberately absent, each belonging to a later milestone: **ring 3**
+(threads have their own address spaces but still run at CPL 0), device
 interrupts beyond the timer (the legacy PICs are masked and the IOAPIC
-is untouched), other CPUs, user-mode segments and ring 3, user space,
-and IPC.
+is untouched), other CPUs, user space, and IPC.
 
 Everything *present* but incomplete is in **Known gaps** above, with the
 milestone that owes it. Everything that cannot be verified under QEMU is

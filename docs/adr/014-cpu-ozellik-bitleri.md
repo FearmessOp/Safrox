@@ -92,7 +92,7 @@ test edilmemiş durumda.** Bilinen eksiklere yazıldı. `-cpu host` ya da
 genişletmek yerine eksik olarak kaydedildi, çünkü koruyacak bir user
 sayfası olmadan testin kanıtlayacağı şey de sınırlı.
 
-### SMAP ve kasıtlı user erişimi — M8'in borcu
+### SMAP ve kasıtlı user erişimi — M8 sanıldı, M7'de geldi
 
 SMAP açıkken kernel'in bir user sayfasını okuması ya da yazması #PF üretir.
 Bu istenen davranış, ama M8'de kernel'in user belleğine **kasıtlı** olarak
@@ -108,6 +108,32 @@ karşılaşan için kafa karıştırıcı.
 elle yazmak yerine bir RAII sarmalayıcı (`UserAccess` guard) tercih
 edilmeli: `Drop` ile `clac` garanti edilir ve erken `return` yüzünden
 AC'nin açık kalması imkânsızlaşır.
+
+#### M7 eki: borç bir milestone erken geldi
+
+Yukarıdaki paragraf çözümü doğru tarif etmiş, zamanlamayı yanlış. "M8'de
+kernel'in user belleğine erişmesi gerekecek" cümlesi, SMAP'in ne zaman
+devreye girdiği hakkında sessiz bir varsayım taşıyor: ring 3 ile
+birlikte.
+
+**SMAP sayfanın USER bitine bakar, erişen kodun ayrıcalık seviyesine
+değil.** M7 user adres uzayları kuruyor — yani USER işaretli sayfalar —
+ama her thread hâlâ CPL 0'da çalışıyor. İlk USER sayfası ile ilk SMAP
+ihlali aynı anda doğdu, ring 3'ten bir milestone önce.
+
+`vspace-test`'in ilk koşusu bunu `supervisor read protection-violation`
+olarak bildirdi: mevcut, okunabilir, doğru eşlenmiş bir sayfada. Hata
+eşlemede değildi; eşleme kusursuzdu ve SMAP görevini yapıyordu.
+
+`cpu::UserAccess` yazıldı, tam da yukarıda tarif edildiği gibi — RAII,
+`Drop` ile `clac`, ve ADR 025'in `InterruptGuard` kuralıyla aynı
+şekilde iç içe kullanıma güvenli (dıştaki bölgenin iznini iptal etmez).
+Kabul testi üçünü de doğruluyor: AC sıradan kernel kodunda temiz,
+guard içinde set, çıkışta yeniden temiz.
+
+**Genel ders:** "X özelliği Y milestone'unda gerekecek" dendiğinde,
+X'in neyi tetiklediği ile Y'nin ne getirdiğinin aynı şey olduğu
+varsayılıyor olabilir. Burada değildi.
 
 ## Elenen alternatifler
 
@@ -149,5 +175,6 @@ yerine panic ediyor.
   statikten okuyor.
 - **Bilinen eksik:** SMEP/SMAP `-cpu qemu64` altında desteklenmiyor, yani
   kod yolu çalışıyor ama koruma test edilmedi.
-- **M8'in borcu:** SMAP açıkken user belleğine kasıtlı erişim `stac`/`clac`
-  gerektirir; RAII guard ile yapılmalı.
+- ~~**M8'in borcu:**~~ **M7'de ödendi.** SMAP USER bitine bakar, CPL'e
+  değil, dolayısıyla borç ring 3'ten bir milestone önce geldi.
+  `cpu::UserAccess` guard'ı yazıldı ve `vspace-test` onu doğruluyor.

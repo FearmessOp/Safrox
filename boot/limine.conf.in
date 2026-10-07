@@ -18,6 +18,12 @@
 #  13 -> kernel heap        build/pythos-heaptest.iso   exit 33
 #  14 -> heap exhaustion    build/pythos-heapoom.iso    exit 35
 #  15 -> heap guard page    build/pythos-heapguard.iso  exit 35
+#  16..19 -> M5 capability scenarios
+#  20..23 -> M6 thread scenarios
+#  24 -> address spaces     build/pythos-vspacetest.iso exit 33
+#  25 -> kernel-half map    build/pythos-vskernel.iso   exit 33 (refused, not fatal)
+#  26 -> isolation          build/pythos-vsisolation.iso exit 35
+#  27 -> revoked vspace     build/pythos-vsstale.iso    exit 35
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -200,3 +206,49 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: thread-kill-running
+
+/PythOS (address space tests)
+    comment: A user VSpace built entirely out of capabilities: a root
+    comment: PageTable, three intermediate tables the caller supplies,
+    comment: and a Frame. Then the check that cannot be faked -- two
+    comment: threads reading the same virtual address and seeing
+    comment: different bytes. Plus rights narrowing into permissions,
+    comment: unmap returning both the Frame and the table to their
+    comment: holders, and the cost of a CR3 reload measured against a
+    comment: switch that skips one. Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-test
+
+/PythOS (mapping into the kernel half)
+    comment: Four attempts to map a Frame at a kernel address through a
+    comment: user VSpace. Every one must be refused with NotUserAddress:
+    comment: the kernel's top-level entries are shared by every address
+    comment: space, so such a mapping would edit tables that every other
+    comment: VSpace walks (ADR 027, K1). A caller error, not a kernel
+    comment: fault -- so this one exits 33, not 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-kernel-half
+
+/PythOS (address space isolation)
+    comment: Isolation from the failing side. An address is mapped in
+    comment: one VSpace and not the other; a thread in the second one
+    comment: reads it and must take a #PF with CR2 at that address.
+    comment: vspace-test shows two threads seeing different values;
+    comment: this shows that reaching across is not merely discouraged.
+    comment: Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-isolation
+
+/PythOS (revoked address space)
+    comment: ADR 028's two cases. Revoking the VSpace in CR3 right now is
+    comment: refused -- the CPU would walk page tables handed back to
+    comment: their Untyped. Revoking an idle one succeeds, and the thread
+    comment: bound to it is suspended when something next tries to switch
+    comment: into it, rather than silently dropped into the kernel's
+    comment: address space. Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-stale-cr3

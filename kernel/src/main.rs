@@ -69,6 +69,7 @@ mod sched;
 mod serial;
 mod threadtest;
 mod vmtest;
+mod vspacetest;
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
@@ -80,7 +81,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 const KERNEL_NAME: &str = "PythOS";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M6");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M7");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///
@@ -601,6 +602,26 @@ extern "C" fn kmain() -> ! {
     let lapic_hz = unsafe { apic::init() };
     let _ = lapic_hz;
 
+    // ---- Address spaces (M7) -------------------------------------------
+    //
+    // Snapshot which top-level entries the kernel occupies, so every
+    // VSpace created later can inherit exactly those -- and so that a
+    // *new* one appearing afterwards is caught rather than silently
+    // leaving older address spaces incomplete (ADR 027, K2).
+    //
+    // This has to come after `apic::init`, which maps the LAPIC into
+    // KMMIO. Running it earlier would record a set that the LAPIC
+    // mapping then added to, and the first VSpace creation would fail
+    // the very check this exists to perform. The ordering is load-
+    // bearing, so it is asserted rather than assumed: K2 compares
+    // against this snapshot on every `create_vspace`.
+    //
+    // SAFETY: Every kernel mapping now exists -- image, PMAP, stacks,
+    // heap and the LAPIC page.
+    unsafe {
+        cap::vspace::record_kernel_entries();
+    }
+
     // SAFETY: The IDT has handlers for every vector that can now fire,
     // and the scheduler has a current thread.
     unsafe {
@@ -702,7 +723,28 @@ extern "C" fn kmain() -> ! {
         threadtest::run();
     }
 
-    println!("[boot] M6 checks passed");
+    // M7 address-space scenarios. Longest token first, as above.
+    if cmdline.contains("vspace-kernel-half") {
+        println!("[boot] cmdline requested the kernel-half mapping test");
+        vspacetest::run_kernel_half();
+    }
+
+    if cmdline.contains("vspace-isolation") {
+        println!("[boot] cmdline requested the isolation test");
+        vspacetest::run_isolation();
+    }
+
+    if cmdline.contains("vspace-stale-cr3") {
+        println!("[boot] cmdline requested the revoked-vspace test");
+        vspacetest::run_stale_cr3();
+    }
+
+    if cmdline.contains("vspace-test") {
+        println!("[boot] cmdline requested the address space tests");
+        vspacetest::run();
+    }
+
+    println!("[boot] M7 checks passed");
     println!(
         "[boot] exiting QEMU (write {:#04x} -> exit status {})",
         qemu::EXIT_SUCCESS,

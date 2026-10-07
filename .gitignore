@@ -8,4 +8,4 @@
 /third_party/
 
 # Cargo.lock is committed: the kernel is a binary, and a reproducible build
-# needs pinned dependency versions.
+# needs pinned dependency versions.__pycache__/

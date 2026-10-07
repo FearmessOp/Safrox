@@ -186,6 +186,21 @@ static QUEUE_TAIL: AtomicU64 = AtomicU64::new(0);
 /// Total context switches, for the measurement.
 static SWITCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Switches that reloaded CR3 because the address space changed.
+static CR3_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Switches that left CR3 alone because both threads share a VSpace.
+///
+/// Counted separately rather than derived, and the acceptance test
+/// requires *both* to be non-zero. A single "CR3 switches" counter
+/// would be satisfied by an implementation that reloads on every
+/// switch -- which is correct but throws away the whole non-global TLB
+/// for nothing (ADR 027).
+static CR3_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Threads stopped because their address space had been revoked.
+static VSPACE_STALE: AtomicU64 = AtomicU64::new(0);
+
 /// Timer ticks taken.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -195,6 +210,33 @@ pub fn switch_count() -> u64 {
 
 pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Acquire)
+}
+
+pub fn cr3_switch_count() -> u64 {
+    CR3_SWITCHES.load(Ordering::Acquire)
+}
+
+pub fn cr3_skipped_count() -> u64 {
+    CR3_SKIPPED.load(Ordering::Acquire)
+}
+
+pub fn stale_vspace_count() -> u64 {
+    VSPACE_STALE.load(Ordering::Acquire)
+}
+
+/// Root page table of the running thread, or zero for the kernel's.
+///
+/// ADR 028's case A turns on this: revoking the VSpace that is in CR3
+/// right now would hand the live page tables back to their Untyped
+/// while the CPU is still walking them.
+pub fn current_vspace() -> u64 {
+    let phys = CURRENT.load(Ordering::Acquire);
+    if phys == 0 {
+        return 0;
+    }
+    // SAFETY: CURRENT names a live TCB.
+    let tcb = unsafe { tcb::tcb_at(crate::cap::ObjectRef(PhysAddr(phys))) };
+    tcb.vspace_root()
 }
 
 /// The running thread.
@@ -449,6 +491,59 @@ pub fn entry_trampoline() -> u64 {
     (thread_entry_trampoline as *const ()) as u64
 }
 
+/// Install `next`'s address space, if it differs from the current one.
+///
+/// Returns `false` if the thread's VSpace has been revoked, in which
+/// case the caller must not switch into it (ADR 028, case B).
+///
+/// # Safety
+///
+/// Interrupts must be disabled, and `next` must be a live TCB.
+unsafe fn switch_address_space(next: &tcb::Tcb) -> bool {
+    if !next.vspace_is_live() {
+        // The address space was revoked while this thread was not
+        // running. Switching in would put the CPU on page tables that
+        // belong to somebody else now.
+        VSPACE_STALE.fetch_add(1, Ordering::AcqRel);
+        return false;
+    }
+
+    let root = next.vspace_root();
+
+    // Zero means the kernel's own address space. The kernel PML4 is
+    // where every thread starts and where the boot thread stays.
+    let target = if root == 0 {
+        crate::memory::vm::kernel_pml4()
+    } else {
+        PhysAddr(root)
+    };
+
+    let active = crate::memory::paging::active_table().start();
+
+    if active.0 == target.0 {
+        // Same address space: leave CR3 alone.
+        //
+        // Not an optimisation to be measured and kept if it pays --
+        // writing CR3 discards every non-global TLB entry, and doing
+        // that to arrive at the mappings already in use is pure loss.
+        // The two counters exist so the test can tell this branch
+        // from the other one (ADR 027).
+        CR3_SKIPPED.fetch_add(1, Ordering::AcqRel);
+        return true;
+    }
+
+    // SAFETY: Every VSpace carries the kernel's top-level entries,
+    // copied by `vspace::create_vspace` and checked unchanged since
+    // boot (ADR 027, K2). So the code executing right now, its stack,
+    // the IDT and PMAP are all mapped identically in the new table --
+    // which is the precondition `load_table` demands.
+    unsafe {
+        crate::memory::paging::load_table(crate::memory::PhysFrame::containing(target));
+    }
+    CR3_SWITCHES.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
 /// Switch to `next`, making the current thread ready again.
 ///
 /// # Safety
@@ -460,6 +555,35 @@ unsafe fn switch_to(next: &'static mut tcb::Tcb) {
         "a context switch with interrupts enabled: an interrupt arriving \
          with RSP half-written has nowhere sensible to push (ADR 025)"
     );
+
+    // The address space goes first, and that ordering is the whole
+    // reason the kernel half is shared (ADR 027). CR3 changes while
+    // this code is still running; the instructions after it, the
+    // stack under it and the IDT above it must all still be reachable,
+    // and they are, because every VSpace carries the same upper half.
+    //
+    // Doing it after `switch_context` would not work at all: by then
+    // this function is not executing any more.
+    //
+    // SAFETY: Interrupts are disabled and `next` is a live TCB.
+    if !unsafe { switch_address_space(next) } {
+        // Revoked VSpace. Stop the thread rather than running it
+        // somewhere it does not belong, and say so -- ADR 028 rejected
+        // falling back to the kernel's address space silently.
+        //
+        // SAFETY: `next` is off the queue and not running.
+        unsafe {
+            next.set_state(ThreadState::Suspended);
+            next.clear_vspace();
+        }
+        println!(
+            "[sched] thread at {:#018x} has a revoked address space; \
+             suspended rather than switched into (ADR 028)",
+            // SAFETY: Every TCB is in the physical window.
+            unsafe { tcb::tcb_phys(next) }.0
+        );
+        return;
+    }
 
     let current_phys = CURRENT.load(Ordering::Acquire);
     // SAFETY: CURRENT names a live TCB.
@@ -688,5 +812,12 @@ pub fn report() {
         tick_count(),
         deferred_ticks(),
         ready_count()
+    );
+    println!(
+        "[sched] cr3: {} reloads, {} skipped (same address space), {} \
+         threads stopped for a revoked vspace",
+        cr3_switch_count(),
+        cr3_skipped_count(),
+        stale_vspace_count()
     );
 }

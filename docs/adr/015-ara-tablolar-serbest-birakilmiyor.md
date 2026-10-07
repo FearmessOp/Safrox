@@ -1,8 +1,9 @@
 # ADR 015 — `unmap` ara sayfa tablolarını serbest bırakmıyor
 
-Status: accepted (M3 implementation)
+Status: **superseded by [ADR 027](027-vspace-modeli.md) (M7)** — user
+tarafı için kapatıldı; kernel tarafı için hâlâ geçerli. Aşağıya bakın.
 
-İlgili: [ADR 011](011-sayfa-tablosu-api.md)
+İlgili: [ADR 011](011-sayfa-tablosu-api.md), [ADR 027](027-vspace-modeli.md)
 
 ## Bağlam
 
@@ -109,3 +110,42 @@ olmaktan uzak.
   çerçevenin sızdığı gün fark edilir.
 - M5'te kapability nesne modeliyle birlikte sayaçlar gelecek ve bu karar
   yeniden ele alınacak.
+
+## M7 eki: borç kapatıldı, ama ödenerek değil
+
+Yukarıdaki son madde iki milestone geç kaldı. M5 geldi ve sayaçlar
+gelmedi; borç M7'ye devroldu. Burada kapanıyor, ve **kapanma biçimi
+beklenenden farklı.**
+
+Bu ADR bir soru soruyordu: *kernel bir ara tabloyu ne zaman güvenle
+serbest bırakabilir?* Üç cevabı değerlendirdi (tara, say, bırakma) ve
+üçüncüsünü seçti.
+
+M7'de soru **ortadan kalktı.** Ara tablolar artık PageTable
+capability'leri (ADR 027). `Map` çağıranın sağladığı bir tabloyu
+ağaca yerleştiriyor; `Unmap` onu çıkarıyor ve capability sahibinde
+kalıyor. Kernel hiçbir zaman serbest bırakmıyor, çünkü hiçbir zaman
+sahip değil.
+
+"Kaç referans var" sorusunun yerini "bu tablo ağaçta mı" aldı, ve o
+tek bir girdi kontrolü. Sayaç gerekmiyor, tarama gerekmiyor, ve
+korkulan use-after-free yapısal olarak imkânsız: bir tablonun
+belleğini geri almanın tek yolu `revoke`, ve revoke her şeyi birden
+yıkıyor.
+
+Bu, kernel'den politika çıkarmanın ADR 011'den beri süren çizgisinin
+bir örneği. **Bir kaynak yönetimi sorusu çözülemiyorsa, kaynağın
+sahibini değiştirmek sorunun kendisini kaldırabilir.**
+
+### Hâlâ açık olan kısım
+
+Kernel'in **kendi yarısındaki** ara tablolar hâlâ bırakılmıyor, ve
+orada sahip kernel olduğu için soru aynen duruyor.
+
+Pratik bir örneği yok: kernel eşlemeleri boot'ta kuruluyor ve
+kaldırılmıyor, heap yalnızca büyüyor (ADR 016), ve KSTACK slotları
+sabit. Yani bu yolda hiç `unmap` çağrılmıyor.
+
+Bir gün çağrılırsa — bir thread öldüğünde stack'inin çözülmesi en
+olası aday, M9 — soru olduğu gibi geri gelecek. Bilinen eksiklere
+yazıldı, ve o zaman bu ADR'nin üç seçeneği hâlâ geçerli olacak.

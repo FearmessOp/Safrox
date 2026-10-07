@@ -251,6 +251,19 @@ THREAD_INIT_LINES = [
     ),
 ]
 
+# M7 records the kernel's top-level page-table entries on every boot,
+# before interrupts are enabled. Required everywhere: every VSpace
+# created later inherits exactly this set, and the check that it has
+# not changed since (ADR 027's K2) has nothing to compare against
+# without it.
+VSPACE_INIT_LINES = [
+    re.compile(
+        r"^\[vspace\] kernel half: \d+ of 256 top-level entries in use; "
+        r"every VSpace shares them",
+        re.M,
+    ),
+]
+
 # The poison pattern, as it appears when something follows a pointer into
 # reclaimed bootloader memory. Forbidden everywhere: 0xDE was chosen so that
 # a stale pointer produces a non-canonical address and an immediate fault
@@ -269,7 +282,7 @@ EXPECTATIONS = {
             *VM_INIT_LINES,
             *HEAP_INIT_LINES,
             *CAP_INIT_LINES,
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -288,7 +301,7 @@ EXPECTATIONS = {
             re.compile(r"^\[PANIC\] at \S+\.rs:\d+:\d+", re.M),
             re.compile(r"^\[PANIC\] deliberate panic requested", re.M),
         ],
-        forbidden=[re.compile(r"M6 checks passed", re.M)],
+        forbidden=[re.compile(r"M7 checks passed", re.M)],
     ),
     # --- M1: exception scenarios ----------------------------------------
     "int3": Expectation(
@@ -305,7 +318,7 @@ EXPECTATIONS = {
             # The whole point: the handler returned and the kernel carried on.
             re.compile(r"^\[fault\] returned from int3 -- handler resumed", re.M),
             re.compile(r"^\[boot\] execution continued past the breakpoint", re.M),
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[re.compile(r"KERNEL PANIC", re.M)],
     ),
@@ -324,7 +337,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
             re.compile(r"^\[PANIC\] unhandled exception: #PF page fault \(vector 14\)", re.M),
         ],
-        forbidden=[re.compile(r"M6 checks passed", re.M)],
+        forbidden=[re.compile(r"M7 checks passed", re.M)],
     ),
     "df": Expectation(
         name="double fault (#DF)",
@@ -343,7 +356,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
         ],
     ),
@@ -402,7 +415,7 @@ EXPECTATIONS = {
             # frames -- it panicked with "could not find 2 contiguous
             # frames for a CNode" when this ran to completion. Requiring
             # the line's *absence* keeps the two facts tied together.
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
         ],
     ),
     "doublefree": Expectation(
@@ -422,7 +435,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             # If this appeared, the allocator accepted the second free.
             re.compile(r"the allocator accepted a double free", re.M),
         ],
@@ -470,7 +483,7 @@ EXPECTATIONS = {
             # The copies outlived the memory they came from.
             re.compile(r"^\[vmtest\] reclaim: boot info survived", re.M),
             re.compile(r"^\[vmtest\] all virtual memory tests passed", re.M),
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -515,7 +528,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"the guard page did not fault", re.M),
         ],
     ),
@@ -544,7 +557,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"executing from an NX page succeeded", re.M),
         ],
     ),
@@ -600,7 +613,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"the stack overflow did not fault", re.M),
             # If the IST had not engaged, the handler would be running on
             # the dead stack -- and would fault again, into a triple fault.
@@ -685,7 +698,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[heaptest\] all kernel heap tests passed", re.M),
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -719,7 +732,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             # A null return instead of a panic: out of memory must be loud.
             re.compile(r"returned null instead of panicking", re.M),
             # The heap handing out more than its limit would mean the bound
@@ -748,7 +761,7 @@ EXPECTATIONS = {
             re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"the heap's upper guard page did not fault", re.M),
         ],
     ),
@@ -907,7 +920,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[captest\] all capability tests passed", re.M),
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[
             # Every invariant above is an assert, so a violation is a
@@ -972,7 +985,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"the ADR 022 tripwire is not working", re.M),
         ],
     ),
@@ -994,7 +1007,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"the ADR 022 retirement check is not working", re.M),
         ],
     ),
@@ -1134,7 +1147,7 @@ EXPECTATIONS = {
                 re.M,
             ),
             re.compile(r"^\[thread\] all thread tests passed", re.M),
-            re.compile(r"^\[boot\] M6 checks passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
         ],
         forbidden=[
             re.compile(r"KERNEL PANIC", re.M),
@@ -1170,7 +1183,7 @@ EXPECTATIONS = {
             re.compile(r"^\[trap\] unrecoverable; signalling QEMU", re.M),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"IST1: NOT ACTIVE", re.M),
             re.compile(r"the thread returned from an infinite recursion", re.M),
         ],
@@ -1201,7 +1214,7 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"does not work on the path that matters", re.M),
             re.compile(r"no timer interrupt arrived within the deadline", re.M),
         ],
@@ -1237,8 +1250,283 @@ EXPECTATIONS = {
             ),
         ],
         forbidden=[
-            re.compile(r"M6 checks passed", re.M),
+            re.compile(r"M7 checks passed", re.M),
             re.compile(r"instead of ThreadBusy", re.M),
+        ],
+    ),
+    # --- M7: address spaces ----------------------------------------------
+    "vspacetest": Expectation(
+        name="address spaces",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # 1. The kernel half is shared, and the boot thread runs in
+            #    the kernel's own address space.
+            re.compile(
+                r"^\[vspace\] kernel half: \d+ top-level entries, shared by "
+                r"every address space; cr3 is 0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # 2. An address space assembled entirely out of
+            #    capabilities: a root, three tables the caller supplied,
+            #    one Frame.
+            re.compile(
+                r"^\[vspace\] built from capabilities: 0x0{10}400000 -> "
+                r"0x[0-9a-f]{16} PageFlags\(",
+                re.M,
+            ),
+            # 3. The capability path and M3's paging agree. They are
+            #    reading the same tables, so a disagreement would mean
+            #    one of them is walking something else entirely.
+            re.compile(
+                r"^\[vspace\] translate: the capability path and M3's paging "
+                r"agree",
+                re.M,
+            ),
+            # 4. Rights become permissions, checked in both directions:
+            #    WRITE withheld maps read-only, and no rights at all is
+            #    refused rather than mapped untouchable.
+            re.compile(
+                r"^\[vspace\] rights: WRITE withheld maps read-only .*; no "
+                r"rights at all is refused with InsufficientRights",
+                re.M,
+            ),
+            # 5. The check that cannot be faked. Two threads, one
+            #    virtual address, two different values. Every other line
+            #    in this scenario would pass on a kernel with a single
+            #    address space and careful bookkeeping; this one would
+            #    not.
+            #
+            #    Both patterns are required literally. A test that
+            #    printed the same value twice, or two zeroes, would
+            #    satisfy a looser pattern and prove nothing.
+            re.compile(
+                r"^\[vspace\] isolation: at 0x0{10}400000, thread A reads "
+                r"0xaaaaaaaa11111111 and thread B reads 0xbbbbbbbb22222222; "
+                r"same address, different frames, [1-9]\d* cr3 reloads",
+                re.M,
+            ),
+            # 6. Unmap hands back both the Frame and the intermediate
+            #    table. This is ADR 015's question, answered by moving
+            #    the ownership rather than by counting references.
+            re.compile(
+                r"^\[vspace\] unmap: the Frame and the PT both come back to "
+                r"their holders and the address stops resolving",
+                re.M,
+            ),
+            # 7. Revoke returns the page tables to Untyped memory, and
+            #    takes the root capability with them.
+            #
+            #    The count must be non-zero, and that is the whole
+            #    point of requiring it. The first version of this test
+            #    revoked the root *PageTable* and reported "0
+            #    capabilities deleted" -- because the root, the three
+            #    intermediate tables and the Frame are all children of
+            #    the same Untyped. They are siblings, so revoking one
+            #    reaches none of the others. A pattern accepting `\d+`
+            #    would have passed on that.
+            re.compile(
+                r"^\[vspace\] revoke: [1-9]\d* capabilities deleted, "
+                r"watermark \d+ -> \d+; the page tables are Untyped memory "
+                r"again and the root capability is gone",
+                re.M,
+            ),
+            # 8-9. The measurement, and the two counters that make the
+            #      "reload CR3 only when it changes" rule testable at
+            #      all. Both figures must be non-zero: reloading on
+            #      every switch and never reloading are each wrong in
+            #      their own way, and one counter could not tell them
+            #      apart.
+            re.compile(
+                r"^\[vspace\] cr3 cost: \d+ cycles/switch within one address "
+                r"space \([1-9]\d* skipped\), \d+ cycles/switch across two "
+                r"\([1-9]\d* reloads\)",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vspace\] cr3 cost: the difference is \d+ cycles per "
+                r"switch -- measured under emulation",
+                re.M,
+            ),
+            re.compile(
+                r"^\[sched\] cr3: \d+ reloads, \d+ skipped \(same address "
+                r"space\), \d+ threads stopped for a revoked vspace",
+                re.M,
+            ),
+            re.compile(r"^\[vspace\] all address space tests passed", re.M),
+            re.compile(r"^\[boot\] M7 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+    "vskernel": Expectation(
+        name="mapping into the kernel half",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # All four refused, each one named. Requiring the
+            # individual lines rather than a summary means a loop that
+            # gave up after the first would fail here.
+            re.compile(
+                r"^\[vspace\] refused 0xffff800000000000 \(the first kernel "
+                r"address\): NotUserAddress",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vspace\] refused 0x[0-9a-f]{16} \(inside the physical "
+                r"window\): NotUserAddress",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vspace\] refused 0x[0-9a-f]{16} \(the kernel heap\): "
+                r"NotUserAddress",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vspace\] refused 0xffffffff80000000 \(the kernel "
+                r"image\): NotUserAddress",
+                re.M,
+            ),
+            # And the kernel is still standing afterwards. That is why
+            # this scenario exits 33 rather than 35: a rejected request
+            # is a caller error, and from M8 the caller is a user
+            # component. A kernel that died here would be worse than one
+            # that allowed the mapping -- it would be a denial of
+            # service reachable from any component.
+            # The kernel is still standing afterwards, which is the
+            # whole reason this scenario exits 33.
+            #
+            # It does not reach "M7 checks passed": the scenario calls
+            # `qemu::exit` itself rather than returning to `kmain`,
+            # because the point is made as soon as the four refusals
+            # have happened and the heap is still readable. Requiring
+            # the banner here would be requiring the scenario to be
+            # written differently for no reason.
+            re.compile(
+                r"^\[vspace\] all four refused and the kernel's own mappings "
+                r"still work; this is an error path, not a fault",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+        ],
+    ),
+    "vsisolation": Expectation(
+        name="address space isolation",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The mapping exists in one space and not the other, stated
+            # before the fault so the log carries the evidence either
+            # way.
+            re.compile(
+                r"^\[vspace\] 0x0000008000000000 in B: Ok\(PhysAddr\(\d+\)\); "
+                r"in A: Err\(NotMapped",
+                re.M,
+            ),
+            # The thread really is in its own address space: CR3 is not
+            # the kernel's. Without this the fault could be an ordinary
+            # unmapped-address fault in the kernel's space, which would
+            # say nothing about isolation.
+            re.compile(
+                r"^\[vspace\] thread running in its own VSpace \(cr3 "
+                r"0x[0-9a-f]{16}\); reading 0x0000008000000000",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\) \*\*\*", re.M),
+            # CR2 is the exact address, and the error code is 0:
+            # not-present, read, supervisor. A *present* page would mean
+            # the address resolved to something, which is the failure
+            # this scenario exists to rule out.
+            re.compile(r"^\[trap\] cr2=0x0000008000000000\b", re.M),
+            re.compile(r"^\[trap\] error_code=0x0{16}\b", re.M),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M7 checks passed", re.M),
+            re.compile(r"the two VSpaces are not isolated", re.M),
+        ],
+    ),
+    "vsstale": Expectation(
+        name="revoked address space",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # SetSpace on a running thread is refused, which is what
+            # keeps ADR 028's case A from trapping a caller: it is the
+            # reason a running thread can always be moved out of the way
+            # first.
+            re.compile(
+                r"^\[vspace\] SetSpace on the running thread: ThreadBusy",
+                re.M,
+            ),
+            # The victim really was running in its own address space.
+            re.compile(
+                r"^\[vspace\] victim running with cr3 0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # Case A, provoked the only way it can be: by the thread
+            # that is running in the address space it asks to destroy.
+            # Nothing outside can reach this branch, because control
+            # returning to the main thread means CR3 is the kernel's
+            # again -- and the kernel's PML4 has no capability naming
+            # it.
+            re.compile(
+                r"^\[vspace\] a thread tried to revoke the address space it "
+                r"is running in \(root 0x[0-9a-f]{16}\): VSpaceInUse",
+                re.M,
+            ),
+            # Case B: revoking an idle VSpace succeeds.
+            re.compile(
+                r"^\[vspace\] revoked an idle VSpace: \d+ capabilities "
+                r"deleted",
+                re.M,
+            ),
+            # And the thread bound to it is stopped rather than run --
+            # not silently dropped into the kernel's address space,
+            # which ADR 028 rejected as worse than stopping.
+            re.compile(
+                r"^\[sched\] thread at 0x[0-9a-f]{16} has a revoked address "
+                r"space; suspended rather than switched into",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vspace\] the thread was suspended rather than run: "
+                r"[1-9]\d* stale detections, state Suspended",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+            re.compile(
+                r"^\[PANIC\] vspace-stale-cr3 completed its checks",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"M7 checks passed", re.M),
+            # The failure this scenario exists to rule out: the
+            # scheduler switching into a thread whose page tables have
+            # been handed back to their Untyped.
+            re.compile(r"the scheduler switched into a thread", re.M),
+            # And the other one: a thread succeeding in destroying the
+            # address space it is executing in.
+            re.compile(r"instead of VSpaceInUse", re.M),
         ],
     ),
 }
