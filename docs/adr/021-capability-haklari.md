@@ -117,7 +117,22 @@ geri almak isteyenin aracı `revoke`.
 
 ## Badge: taşıyıcı kimliği
 
-Haklar dışında bir alan daha: **badge**, 64 bitlik bir etiket.
+Haklar dışında bir alan daha: **badge**, bir etiket.
+
+> **Düzeltme notu (M9 architect pass).** Bu bölüm başlangıçta
+> "64 bitlik bir etiket" diyordu. **Yanlış, ve sebebi slot
+> ölçüsü:** ADR 019'un slot düzeni 32 bayt (8 nesne + 8
+> tip/haklar/derinlik/generation + 16 derivation bağlantısı) ve
+> 64 bitlik bir alan daha sığmıyor.
+>
+> [ADR 037](037-badge.md) badge'i **32 bite** indirdi ve slot'un
+> mevcut `extra: u32` alanına yerleştirdi — CNode'da radix,
+> Untyped'da `size_bits` tutan alanın Endpoint/Notification
+> karşılığı.
+>
+> Bu düzeltme uygulamada değil, iki ADR'yi yan yana koyunca
+> çıktı. Aşağıdaki kurallar aynen geçerli; yalnızca genişlik
+> değişti.
 
 Bir Endpoint cap'ine badge takılabilir. O cap ile gönderilen her mesaj,
 alıcıya badge'i de iletir. Sunucu böylece "bu istek hangi istemciden"

@@ -3,9 +3,17 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M8 — Ring 3.** Code now runs at CPL 3, in its own
-address space, with its instructions in a page that is executable and
-not writable. It reaches the kernel through one `syscall` and comes
+**Current milestone: M9 — IPC (architect pass).** No code: the
+semantics of synchronous IPC, the message format and the IPC half of
+the syscall ABI are now fixed, in eight ADRs
+([033](docs/adr/033-rendezvous-semantigi.md)–[040](docs/adr/040-hizli-yol-yok.md)).
+The shape of the thing is in [docs/ipc.md](docs/ipc.md); what could
+not be settled is in
+[docs/m9-acik-sorular.md](docs/m9-acik-sorular.md).
+
+**Last milestone with code: M8 — Ring 3.** Code runs at CPL 3, in its
+own address space, with its instructions in a page that is executable
+and not writable. It reaches the kernel through one `syscall` and comes
 back through `sysret`; the timer preempts it; its XMM registers
 survive; and it enters the kernel on a stack no other thread shares.
 
@@ -1325,6 +1333,29 @@ M7:
 - [030 — Syscall ABI: tek giriş, hiç yeni çağrı](docs/adr/030-syscall-abi.md)
 - [031 — FPU/SSE durumu: her switch'te kaydet, lazy yapma](docs/adr/031-fpu-sse-durumu.md)
 - [032 — User tarafında W^X: `EXEC` bir hak değil, bir izin](docs/adr/032-user-tarafinda-wx.md)
+- [033 — Rendezvous: senkron IPC ve bekleyen kuyruğu](docs/adr/033-rendezvous-semantigi.md)
+- [034 — Mesaj formatı: register, tampon, message tag](docs/adr/034-mesaj-formati.md)
+- [035 — Capability transferi: en fazla dört, alıcının yerine](docs/adr/035-capability-transferi.md)
+- [036 — Call ve Reply: cevap hakkı sunucunun TCB'sinde](docs/adr/036-call-reply.md)
+- [037 — Badge: 32 bit, slot'ta, ve bir kez](docs/adr/037-badge.md)
+- [038 — Notification ve bağlı bekleme](docs/adr/038-notification-ve-bagli-bekleme.md)
+- [039 — Ölüm ve iptal: bloke bir thread'in başına gelenler](docs/adr/039-ipc-olum-ve-iptal.md)
+- [040 — Hızlı yol M9'da yok, ve yavaş yol ölçülecek](docs/adr/040-hizli-yol-yok.md)
+
+033–040 bir **architect pass**: kod yazılmadan önce IPC'nin
+semantiği sabitlendi. Üç eski ADR bu sırada düzeltildi —
+[021](docs/adr/021-capability-haklari.md)'in badge genişliği
+(64 → 32 bit, slot 32 bayta sığmıyor),
+[026](docs/adr/026-tcb-yasam-dongusu.md)'nın M9'a bıraktığı
+`Blocked` sorusu (kapandı), ve
+[034](docs/adr/034-mesaj-formati.md)'ün `reserved` alanı
+(12 → 11 bit, bağlı bekleme bir ayırt edici bit istedi).
+
+Hepsinin bir arada ne anlama geldiği [docs/ipc.md](docs/ipc.md)'de:
+bit-bit mesaj formatı, durum diyagramı ve bir istemci-sunucu
+alışverişinin on bir adımı. Karara bağlanamayan yedi nokta
+[docs/m9-acik-sorular.md](docs/m9-acik-sorular.md)'de, üçü
+uygulama başlamadan cevaplanmalı.
 
 027 iki kez düzeltildi, ikisi de koşarak bulundu: "kökü revoke et"
 hiçbir şey silmiyordu, ve "iki kontrol de test ediliyor" iddiası
@@ -1923,12 +1954,12 @@ milestone for every range, is in
 
 ## Not yet built
 
-Deliberately absent, each belonging to a later milestone: **IPC** (one
-syscall exists and dispatches capability invocations, but nothing can
-send a message), device interrupts beyond the timer (the legacy PICs
-are masked and the IOAPIC is untouched), other CPUs, a loader (M8's
-user programs are assembled by hand, byte by byte, because anything
-longer would need one), and a user-space scheduler.
+Deliberately absent, each belonging to a later milestone: **IPC's
+implementation** (M9's architect pass fixed the semantics; no code
+yet), device interrupts beyond the timer (the legacy PICs are masked
+and the IOAPIC is untouched), other CPUs, a loader (M8's user programs
+are assembled by hand, byte by byte, because anything longer would
+need one), and a user-space scheduler.
 
 Three things arrived in M8 as debts rather than features, and each is
 written down where it will be found:

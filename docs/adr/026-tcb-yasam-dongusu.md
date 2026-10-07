@@ -96,6 +96,28 @@ M9'da `Blocked` eklenecek (bir Endpoint'te bekliyor) ve o durumun
 revoke'u, Endpoint'in kuyruğundan çıkarmayı gerektirecek — bu ADR'nin
 M9'da yeniden ele alınması gereken yeri.
 
+> **Kapandı (M9 architect pass).**
+> [ADR 039](039-ipc-olum-ve-iptal.md) iki yeni durum ekledi
+> (`BlockedOnEndpoint`, `BlockedOnReply`) ve **ikisi de revoke
+> edilebilir** — bu ADR'nin `ThreadBusy` kuralı onlara
+> uygulanmıyor.
+>
+> Gerekçe, yukarıdaki gerekçenin tam tersi yönde işliyor:
+> `ThreadBusy` "scheduler bir referans tutuyor" diyordu. Bloke bir
+> thread'i scheduler tutmuyor — onu tutan bir Endpoint kuyruğu ya
+> da bir `reply_to` alanı, ve **ikisi de temizlenebilir.** O
+> temizliğin adı `cancel_ipc`.
+>
+> Yani bloke durumlar `Suspended`'a yakın: thread duruyor, ve
+> duran bir thread'i yok etmek güvenli.
+>
+> Bir de ters yönde bir ekleme var: ADR 039, **Endpoint** revoke
+> edildiğinde bekleyenlerin `EndpointBusy` ile reddedilmesini
+> değil, hepsinin uyandırılmasını seçti. Gerekçe bu ADR'den
+> farklı — bekleyenler başka bileşenlerin thread'leri olabilir ve
+> Endpoint'in sahibi onları suspend edemez, yani reddetmek bir DoS
+> vektörü olurdu.
+
 ## Kernel stack'inin sahipliği
 
 Her TCB'nin kendi kernel stack'i var. Stack, TCB'nin parçası **değil**

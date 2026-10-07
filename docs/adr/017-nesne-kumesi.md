@@ -94,11 +94,34 @@ kuyruğunun başı ve kuyruğu, artı durum bitleri. Mesajın kendisi burada
 durmuyor — gönderenin TCB'sinde duruyor, çünkü Endpoint'in boyutu mesaj
 sayısıyla büyümemeli.
 
+> **M9 architect pass: alanlar somutlaştı.** 32 baytın tamamı
+> [ADR 033](033-rendezvous-semantigi.md)'te dağıtıldı: `state: u8`
+> (+0), `queue_head: u64` (+8), `queue_tail: u64` (+16), 8 bayt
+> ayrılmış. Tahmin tuttu.
+>
+> Bir sürpriz çıktı ve 32 baytın yetmesinin sebebi o:
+> **gönderenler ve alıcılar için iki ayrı kuyruk gerekmiyor.** Bir
+> Endpoint'te aynı anda hem gönderen hem alıcı bekleyemez — biri
+> varsa diğeri gelir gelmez randevu olur. Tek kuyruk ve bir durum
+> alanı yetiyor. İki kuyruk dört işaretçi demek olurdu ve bu tavanı
+> delerdi.
+
 **Notification.** Asenkron sinyal. Endpoint'ten ayrı bir tip, çünkü
 semantiği farklı: gönderen bloke olmaz, sinyaller bir bit maskesinde
 birikir, ve bir kesme bunu doğrudan tetikleyebilir. İkisini tek tipte
 birleştirmek, her IPC'de "bu senkron mu asenkron mu" dalı demek olurdu —
 sıcak yolda gereksiz.
+
+> **M9 architect pass.** 64 baytın 24'ü kullanılıyor:
+> `signalled: u32` (+0), `waiter: u64` (+8), `bound_tcb: u64`
+> (+16). Kalan 40 bayt boş.
+>
+> `bound_tcb` [ADR 038](038-notification-ve-bagli-bekleme.md)'in
+> getirdiği alan: bir thread hem bir Endpoint'te bekleyip hem de
+> bu Notification'dan uyanabiliyor. M13'ün sürücüsü buna ihtiyaç
+> duyuyor — istek Endpoint'ten, kesme Notification'dan geliyor ve
+> ikisi için iki thread kullanmak sürücünün durumunu paylaşılan
+> hale getirirdi.
 
 **Frame.** User'a eşlenebilir fiziksel sayfa. 4 KiB sabit
 ([ADR 011](011-sayfa-tablosu-api.md)'in `map`'i yalnızca 4 KiB biliyor).
@@ -153,6 +176,17 @@ seL4'ün MCS olmayan dalı bunu TCB'nin içinde örtük tutar; biz de öyle
 yapacağız ([ADR 021](021-capability-haklari.md), `grantreply`).
 *Kapattığımız kapı:* cevap hakkının devredilebilmesi — bir sunucunun "bu
 isteği başkası cevaplasın" diyememesi.
+
+> **M9 architect pass: "örtük" somutlaştı.**
+> [ADR 036](036-call-reply.md) cevap hakkını **sunucunun
+> TCB'sinde** bir alan yaptı (`reply_to` + `reply_generation`),
+> çağıranın TCB'sinde değil. Sebep: sunucu `Reply` dediğinde kime
+> cevap vereceğini O(1)'de bulmalı, ve o bilgi çağıranda olsaydı
+> onu aramak gerekirdi.
+>
+> Ayrı bir Reply nesnesine karşı bir gerekçe daha çıktı: **her
+> `Call` bir allocation olurdu**, çünkü nesne bir Untyped'dan
+> retype edilmeli. Sıcak yolda.
 
 **VCPU.** Sanallaştırma. Kapsam dışı.
 
