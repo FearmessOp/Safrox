@@ -426,6 +426,28 @@ pub unsafe fn map_frame(
     //
     // Both checks are kept, and both are tested. Neither makes the
     // other redundant.
+    //
+    // # M11's mandatory mutation
+    //
+    // Deleting this check does **not** let a user mapping into the
+    // kernel half: the paging layer still refuses it, with
+    // `FlagsWrongHalf` (error 16) where this gives `NotUserAddress`
+    // (15). `vspace-user-kernel-half` fails on exactly that
+    // difference.
+    //
+    // Which is the interesting part. The mutation is caught, but by
+    // the *other* check -- so if the two shared an error code, it
+    // would have survived, and a reader would have concluded that
+    // one of them was redundant. ADR 027 argued for keeping both and
+    // M7 found by mutation that they must be distinguishable; this
+    // is the same finding arriving from the user path, and it is
+    // what the test asserts `15` rather than "an error".
+    //
+    // The checks differ in what they protect. Remove this one and
+    // the kernel half is still safe *today*, because every user
+    // mapping happens to carry the USER flag. It would stop being
+    // safe the moment something mapped into a user VSpace without
+    // it -- and nothing would then notice.
     if !layout::is_user(address.0) {
         return Err(CapError::NotUserAddress { address: address.0 });
     }

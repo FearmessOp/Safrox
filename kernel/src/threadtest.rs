@@ -1246,12 +1246,33 @@ fn recurse(depth: u64) -> ! {
 pub fn run_interrupt_alloc() -> ! {
     println!("[thread] allocating from inside a real timer interrupt");
 
-    ALLOCATE_IN_HANDLER.store(true, Ordering::Release);
-
+    // **The message first, the arming second**, and the order is the
+    // fix for an intermittent failure that predates M11 and was
+    // found while running the suite for it.
+    //
+    // Armed first, the next tick could arrive while `println!` was
+    // partway through its own line -- after the text, before the
+    // newline. The handler's message then landed mid-line:
+    //
+    //     [thread] armed; ...(must panic in the handler)[thread] inside
+    //
+    // and the runner's `^\[thread\] inside the timer handler` could
+    // not match, because there was no line start in front of it. The
+    // kernel had done exactly the right thing and the test said it
+    // had not.
+    //
+    // Printing first leaves no window: the handler cannot allocate
+    // until the flag is set, and the flag is set after the line is
+    // complete. A lock around the serial port would also work and
+    // would be the wrong fix -- the handler would then block on a
+    // lock the interrupted code holds, which is a deadlock rather
+    // than a garbled line.
     println!(
         "[thread] armed; waiting for the next timer tick (must panic in \
          the handler)"
     );
+
+    ALLOCATE_IN_HANDLER.store(true, Ordering::Release);
 
     // Bounded: if the timer is dead this fails rather than hanging.
     let deadline = read_tsc() + 20_000_000_000;

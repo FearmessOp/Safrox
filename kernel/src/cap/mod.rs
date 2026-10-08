@@ -415,6 +415,20 @@ pub enum CapError {
     /// reaching a *different* thread at the same address -- impossible
     /// to test for on its own.
     ReplyTargetGone,
+    /// No kernel stack slot is free for a new user thread (M11).
+    ///
+    /// **Not [`CapError::NotEnoughMemory`]**, and the distinction is
+    /// the one `vspace-user-exhaust` turns on. That error means "your
+    /// Untyped is empty" — a component's own budget, which ADR 022
+    /// says is the only thing a component can exhaust. This one means
+    /// the kernel's KSTACK region is full, which is a *shared*
+    /// resource and therefore a weaker guarantee.
+    ///
+    /// Collapsing them would make the budget test ambiguous: a run
+    /// that exhausted the shared pool would report the same code as
+    /// one that exhausted its own memory, and the claim "a component
+    /// can only starve itself" could not be checked.
+    NoKernelStack { limit: u64 },
     /// A Notification already has a waiter, or is already bound
     /// (ADR 038).
     NotificationBusy,
@@ -457,6 +471,12 @@ impl fmt::Display for CapError {
             CapError::DerivationTooDeep { depth } => {
                 write!(f, "DerivationTooDeep (would be {})", depth)
             }
+            CapError::NoKernelStack { limit } => write!(
+                f,
+                "NoKernelStack (all {} user kernel-stack slots are in use; \
+                 this is the kernel's region, not the caller's budget)",
+                limit
+            ),
             CapError::NotEnoughMemory { remaining, needed } => write!(
                 f,
                 "NotEnoughMemory (need {} bytes, {} remain)",

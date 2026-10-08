@@ -200,6 +200,19 @@ pub const IPC_FIELDS_START: usize = 136;
 /// nothing else moved — which is what the gap was for.
 pub const IPC_FIELDS_END: usize = 216;
 
+/// Where M11's CSpace fields end. Three fields, 24 bytes.
+///
+/// The same gap, used again. M8 left 256 - 136 = 120 bytes between
+/// the scheduler's state and the fxsave area; M9 took 80 of them and
+/// M11 takes 24 more, leaving 16.
+///
+/// That the room was there is not luck — ADR 029 reserved it
+/// deliberately so that a field added later would not move the
+/// fxsave area, which the assembly's alignment requirement depends
+/// on. Three milestones have now added fields without anything
+/// moving.
+pub const CSPACE_FIELDS_END: usize = 240;
+
 /// Size of an `fxsave` area: fixed by the architecture.
 ///
 /// Reference: Intel SDM Vol. 2A, "FXSAVE", Table 3-43.
@@ -634,8 +647,46 @@ pub struct Tcb {
     /// so a `debug_assert` guards the places that write either one.
     replying_server: u64,
 
+    // ---- M11: the thread's own CSpace (ADR 043) --------------------
+    //
+    // Until M11 every CPtr was resolved against the *init* CSpace,
+    // which was correct while every user thread was the test's own.
+    // It stops being correct the moment two components exist: one
+    // CSpace means every thread can name every capability, so
+    // "component B cannot reach component A's PageTable" would be a
+    // claim no test could falsify (ADR 023, K5).
+    //
+    // Three fields, and they mirror `vspace_root`/`vspace_slot`/
+    // `vspace_generation` exactly. Not a coincidence: both record
+    // "this thread is bound to that object, and that object is still
+    // the one it was" -- the address-plus-generation idiom of
+    // ADR 018, reused by ADR 028, ADR 036 and M10's IRQ handler.
+    /// Physical address of this thread's root CNode, or zero for the
+    /// init CSpace.
+    ///
+    /// Zero is a definition rather than a fallback: the boot thread
+    /// and the kernel's test threads *are* init, so init's CSpace is
+    /// theirs.
+    cspace_root: u64,
+
+    /// Physical address of the slot holding the root CNode
+    /// capability, so its generation can be re-read.
+    cspace_slot: u64,
+
+    /// Generation that slot had when `SetSpace` was called.
+    cspace_generation: u8,
+
+    /// Radix of the root CNode: it has `1 << radix` slots.
+    ///
+    /// Cached here so that resolving a CPtr does not have to read the
+    /// capability first. The root's size is fixed when the CSpace is
+    /// bound and cannot change without a new `SetSpace`.
+    cspace_radix: u8,
+
+    _pad5: [u8; 6],
+
     /// Reserved. Brings the fixed part to FXSAVE_OFFSET.
-    _reserved: [u8; FXSAVE_OFFSET - IPC_FIELDS_END],
+    _reserved: [u8; FXSAVE_OFFSET - CSPACE_FIELDS_END],
 
     /// FPU/SSE state, saved and restored on **every** switch (ADR 031).
     ///
@@ -775,6 +826,26 @@ const _: () = {
         "the IPC fields run into the fxsave area"
     );
 
+    // M11: the CSpace fields follow the IPC ones, in the same gap.
+    assert!(
+        core::mem::offset_of!(Tcb, cspace_root) == IPC_FIELDS_END,
+        "the CSpace fields do not start where the IPC fields ended"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, cspace_slot) == core::mem::offset_of!(Tcb, cspace_root) + 8,
+        "cspace_slot must follow cspace_root: they are read together \
+         on every staleness check"
+    );
+    assert!(
+        core::mem::offset_of!(Tcb, cspace_slot) + 8 + 8 == CSPACE_FIELDS_END,
+        "CSPACE_FIELDS_END disagrees with the fields; the reserved \
+         array is sized from it"
+    );
+    assert!(
+        CSPACE_FIELDS_END <= FXSAVE_OFFSET,
+        "the CSpace fields run into the fxsave area"
+    );
+
     // The buffer really is at the offset ADR 017 fixed, and really is
     // 128 words. ADR 034's length check is written against this.
     assert!(
@@ -858,6 +929,75 @@ impl Tcb {
     ///
     /// The third is the one that matters most, and the one an
     /// address-only check would miss.
+    /// This thread's root CNode, or zero for the init CSpace
+    /// (ADR 043).
+    pub fn cspace_root(&self) -> u64 {
+        self.cspace_root
+    }
+
+    /// Radix of that root: it has `1 << radix` slots.
+    pub fn cspace_radix(&self) -> u8 {
+        self.cspace_radix
+    }
+
+    /// Whether the CSpace capability this thread was given is still
+    /// the one it was given.
+    ///
+    /// The same three comparisons [`Tcb::vspace_is_live`] makes, for
+    /// the same reason: revoking returns memory to its Untyped and
+    /// resets the watermark (ADR 020), so the next retype is *likely*
+    /// to land a new object at the old address. A thread whose CSpace
+    /// was revoked would otherwise resolve its CPtrs through whatever
+    /// occupies that memory now — which is worse than failing, because
+    /// it is a capability system silently pointing at a stranger.
+    pub fn cspace_is_live(&self) -> bool {
+        if self.cspace_root == 0 {
+            // The init CSpace. Built by boot rather than retyped, so
+            // no capability names it and nothing can revoke it.
+            return true;
+        }
+        if self.cspace_slot == 0 {
+            return false;
+        }
+
+        // SAFETY: A non-zero `cspace_slot` is the physical address of
+        // a slot inside a live CNode, recorded by `set_cspace`. CNodes
+        // do not move, and PMAP maps all RAM.
+        let slot = unsafe {
+            &*crate::memory::phys_to_virt(PhysAddr(self.cspace_slot)).as_ptr::<super::cnode::Slot>()
+        };
+
+        !slot.is_empty()
+            && slot.cap_type() == CapType::CNode
+            && slot.generation() == self.cspace_generation
+            && slot.object().0 .0 == self.cspace_root
+    }
+
+    /// Bind this thread to a CSpace.
+    ///
+    /// # Safety
+    ///
+    /// `root` must name a live CNode of `1 << radix` slots, `slot` the
+    /// capability naming it, and the thread must not be busy.
+    unsafe fn set_cspace(&mut self, root: PhysAddr, slot: PhysAddr, generation: u8, radix: u8) {
+        self.cspace_root = root.0;
+        self.cspace_slot = slot.0;
+        self.cspace_generation = generation;
+        self.cspace_radix = radix;
+    }
+
+    /// Return this thread to the init CSpace.
+    ///
+    /// # Safety
+    ///
+    /// The thread must not be busy.
+    pub unsafe fn clear_cspace(&mut self) {
+        self.cspace_root = 0;
+        self.cspace_slot = 0;
+        self.cspace_generation = 0;
+        self.cspace_radix = 0;
+    }
+
     pub fn vspace_is_live(&self) -> bool {
         if self.vspace_root == 0 {
             // The kernel's address space. It cannot be revoked --
@@ -1615,6 +1755,20 @@ impl Tcb {
         self.vspace_root = 0;
         self.vspace_slot = 0;
         self.vspace_generation = 0;
+
+        // And the init CSpace, which is what zero means there
+        // (ADR 043). The symmetry is exact: the init CSpace is built
+        // by `cap::boot` rather than retyped, so no capability names
+        // it either.
+        //
+        // Written out rather than left to retype's zeroing for the
+        // reason the IPC reset above gives: the boot TCB reaches this
+        // path after a `configure` too, where the object is not
+        // freshly zeroed.
+        self.cspace_root = 0;
+        self.cspace_slot = 0;
+        self.cspace_generation = 0;
+        self.cspace_radix = 0;
     }
 
     /// Bind this thread to an address space.
@@ -1750,6 +1904,166 @@ pub unsafe fn set_registers(
     Ok(())
 }
 
+/// Kernel stack slots handed out to threads created from ring 3.
+///
+/// Slots 0 and 1 are IST1 and the main stack; the kernel's own tests
+/// use up to 11. User-created threads start well clear of those.
+const USER_KSTACK_FIRST: u64 = 32;
+
+/// How many such threads may exist. **A bound, deliberately.**
+///
+/// Without one, a component could create threads until the KSTACK
+/// region ran out and take the machine with it — so the limit is not
+/// tidiness, it is the same budget argument as ADR 022 applied to a
+/// resource that is *address space* rather than memory.
+///
+/// This is the one allocation in the kernel that a component triggers
+/// and does not pay for in frames, because the frames are its own
+/// (see [`set_user_registers`]) and only the virtual range is the
+/// kernel's. A proper answer gives each component a quota; M11 gives
+/// a global ceiling and says so.
+const USER_KSTACK_COUNT: u64 = 16;
+
+/// Next free slot.
+static NEXT_USER_KSTACK: AtomicU64 = AtomicU64::new(USER_KSTACK_FIRST);
+
+/// `TCB.SetUserRegisters`: give a thread a ring-3 entry point.
+///
+/// M6's [`set_registers`] takes a Rust `fn` pointer, which is a kernel
+/// address — exactly what a user thread must not start at. This takes
+/// two user-half addresses, which `configure_user` asserts.
+///
+/// # The kernel stack
+///
+/// A thread entering the kernel needs a stack in the kernel half, and
+/// **no capability names kernel-half memory** — that is ADR 027's K1
+/// seen from the other side. So the caller cannot supply the address.
+///
+/// It does supply the *frames*: `stack_frames` is a CNode holding
+/// [`KSTACK_FRAMES`] Frame capabilities from the caller's own Untyped,
+/// starting at `offset`. The kernel chooses the virtual range and maps
+/// them there. Authority over the memory stays with the component;
+/// authority over the address space stays with the kernel; and ADR
+/// 022's claim that the kernel allocates nothing for itself survives
+/// a component creating a thread.
+///
+/// # Safety
+///
+/// `tcb_slot` must hold a live TCB and `frames` a live CNode, and the
+/// caller must not hold another mutable borrow of either.
+pub unsafe fn set_user_registers(
+    tcb_slot: &Slot,
+    entry: u64,
+    user_stack: u64,
+    frames: &super::cnode::CNode,
+    offset: usize,
+) -> Result<(), CapError> {
+    count_invocation();
+
+    // Both addresses are the caller's, so both are checked here
+    // rather than asserted in `configure_user` — an assert is for a
+    // kernel mistake, and these are a user's.
+    if !crate::memory::layout::is_user(entry) || !crate::memory::layout::is_user(user_stack) {
+        return Err(CapError::NotUserAddress { address: entry });
+    }
+    if !user_stack.is_multiple_of(16) {
+        return Err(CapError::InvalidArgument);
+    }
+
+    let needed = KSTACK_FRAMES;
+    if offset
+        .checked_add(needed)
+        .is_none_or(|end| end > frames.len())
+    {
+        return Err(CapError::CPtrOutOfRange);
+    }
+
+    // Every frame validated before any is mapped: the two-phase shape
+    // ADR 020 uses for retype, for the same reason. A half-mapped
+    // kernel stack is worse than none.
+    for index in 0..needed {
+        // SAFETY: Index checked against `frames.len()` above.
+        let slot = unsafe { frames.slot(offset + index) };
+        if slot.is_empty() {
+            return Err(CapError::EmptySlot);
+        }
+        if slot.cap_type() != CapType::Frame {
+            return Err(CapError::WrongType {
+                found: slot.cap_type(),
+            });
+        }
+        // A device frame as a kernel stack would put the kernel's
+        // saved registers in MMIO space.
+        if slot.is_device() {
+            return Err(CapError::InvalidArgument);
+        }
+    }
+
+    // SAFETY: Caller's guarantee.
+    let tcb = unsafe { from_slot(tcb_slot) }?;
+    if tcb.state().is_busy() {
+        return Err(CapError::ThreadBusy {
+            state: tcb.state().name(),
+        });
+    }
+
+    // Claim a stack slot. `fetch_add` and then check, so two threads
+    // racing here cannot be handed the same range.
+    let stack_slot = NEXT_USER_KSTACK.fetch_add(1, Ordering::AcqRel);
+    if stack_slot >= USER_KSTACK_FIRST + USER_KSTACK_COUNT {
+        return Err(CapError::NoKernelStack {
+            limit: USER_KSTACK_COUNT,
+        });
+    }
+
+    let (_, bottom, top) = crate::memory::layout::kstack_slot(stack_slot);
+
+    for index in 0..needed {
+        // SAFETY: Index checked, and the loop above established the
+        // slot holds a live, non-device Frame.
+        let slot = unsafe { frames.slot(offset + index) };
+        let frame = crate::memory::PhysFrame::containing(slot.object().0);
+        let page =
+            crate::memory::VirtAddr::new(bottom.0 + (index as u64) * crate::memory::FRAME_SIZE);
+
+        // SAFETY: The kernel's tables are live; the address is inside
+        // a KSTACK slot this call has just claimed and nothing else
+        // has mapped; the frame is a live Frame capability.
+        unsafe {
+            let table = crate::memory::vm::kernel_table();
+            let mut source = crate::memory::heap::reserve_frames();
+            let flags = crate::memory::paging::PageFlags::READ
+                | crate::memory::paging::PageFlags::WRITE
+                | crate::memory::paging::PageFlags::GLOBAL;
+            match crate::memory::paging::map(table, page, frame, flags, &mut source) {
+                Ok(tlb) => tlb.flush(),
+                // The slot was never handed out before, so this can
+                // only mean the intermediate tables could not be
+                // built -- out of the *heap's* reserve, not the
+                // caller's Untyped, which is why it is not
+                // `NotEnoughMemory` either.
+                Err(_) => {
+                    return Err(CapError::NoKernelStack {
+                        limit: USER_KSTACK_COUNT,
+                    })
+                }
+            }
+        }
+    }
+
+    // SAFETY: The kernel stack was just mapped and is this thread's
+    // alone; the user addresses were checked above.
+    unsafe {
+        tcb.configure_user(entry, user_stack, 0, top, bottom, stack_slot);
+    }
+
+    Ok(())
+}
+
+/// Frames one kernel stack needs.
+const KSTACK_FRAMES: usize =
+    (crate::memory::layout::KSTACK_SIZE / crate::memory::FRAME_SIZE) as usize;
+
 /// `ReadRegisters`: what is this thread doing?
 ///
 /// Allowed in any state. For a `Running` thread the answer is stale the
@@ -1774,23 +2088,41 @@ pub unsafe fn read_registers(slot: &Slot) -> Result<ThreadRegisters, CapError> {
     })
 }
 
-/// `SetSpace`: give a thread an address space.
+/// `SetSpace`: give a thread an address space and a CSpace.
 ///
 /// Refused for a busy thread, for the same reason `SetRegisters` is:
 /// the scheduler holds a reference to it, and changing CR3 under a
 /// thread it is about to switch into would put that thread in an
 /// address space it never agreed to (ADR 026, ADR 028).
 ///
-/// Passing `None` returns the thread to the kernel's address space.
-/// That is what keeps ADR 028's refusal to revoke a live VSpace from
-/// being a trap: the running thread can always move out of the way
-/// first, so the two-step sequence always terminates.
+/// Passing `None` for either returns the thread to the kernel's
+/// address space, or to the init CSpace. For the VSpace that is what
+/// keeps ADR 028's refusal to revoke a live one from being a trap:
+/// the running thread can always move out of the way first, so the
+/// two-step sequence always terminates.
+///
+/// # Why both in one call (M11, ADR 043)
+///
+/// M7's version took only a VSpace, because there was only one
+/// CSpace. From M11 a component gives a thread *both* — and they are
+/// not independent: a thread with its own address space and somebody
+/// else's capabilities is not a component, it is a confusion.
+///
+/// One call also means there is no window in which a thread has one
+/// and not the other. That matters because the gap would be visible:
+/// a thread is startable the moment both are set, and a scheduler
+/// that caught it halfway would run it with a CSpace naming
+/// capabilities for an address space it is not in.
 ///
 /// # Safety
 ///
-/// Both slots must hold live capabilities, and the caller must not hold
-/// another mutable borrow of the TCB.
-pub unsafe fn set_space(tcb_slot: &Slot, vspace_slot: Option<&Slot>) -> Result<(), CapError> {
+/// All slots must hold live capabilities, and the caller must not
+/// hold another mutable borrow of the TCB.
+pub unsafe fn set_space(
+    tcb_slot: &Slot,
+    vspace_slot: Option<&Slot>,
+    cspace_slot: Option<&Slot>,
+) -> Result<(), CapError> {
     count_invocation();
 
     // SAFETY: Caller's guarantee.
@@ -1802,29 +2134,56 @@ pub unsafe fn set_space(tcb_slot: &Slot, vspace_slot: Option<&Slot>) -> Result<(
         });
     }
 
-    match vspace_slot {
-        None => {
-            // SAFETY: The thread is not busy, so the scheduler is not
-            // about to switch into it.
-            unsafe {
-                tcb.clear_vspace();
-            }
-        }
+    // Both arguments are validated **before** either is written, so a
+    // refused call leaves the thread exactly as it was. The same
+    // two-phase shape as `retype` (ADR 020): a caller that asked for
+    // something impossible should not find its thread half-changed.
+    let vspace = match vspace_slot {
+        None => None,
         Some(slot) => {
             let root = super::vspace::root_address(slot)?;
-
             // The slot's own physical address, so the staleness check
             // can look at it later. A TCB has no CSpace to resolve a
             // CPtr through, and the slot's address is stable: slots
             // live inside CNode objects, and a CNode does not move.
             let slot_phys = PhysAddr(core::ptr::from_ref(slot) as u64 - crate::memory::pmap_base());
-
-            // SAFETY: `root_address` established that the slot holds a
-            // live PageTable, and the thread is not busy.
-            unsafe {
-                tcb.set_vspace(root, slot_phys, slot.generation());
-            }
+            Some((root, slot_phys, slot.generation()))
         }
+    };
+
+    let cspace = match cspace_slot {
+        None => None,
+        Some(slot) => {
+            if slot.is_empty() {
+                return Err(CapError::EmptySlot);
+            }
+            if slot.cap_type() != CapType::CNode {
+                return Err(CapError::WrongType {
+                    found: slot.cap_type(),
+                });
+            }
+            let root = slot.object().0;
+            let slot_phys = PhysAddr(core::ptr::from_ref(slot) as u64 - crate::memory::pmap_base());
+            Some((root, slot_phys, slot.generation(), slot.as_radix()))
+        }
+    };
+
+    // Everything checked; nothing below can fail.
+    match vspace {
+        // SAFETY: The thread is not busy, so the scheduler is not
+        // about to switch into it.
+        None => unsafe { tcb.clear_vspace() },
+        // SAFETY: `root_address` established a live PageTable.
+        Some((root, slot, generation)) => unsafe { tcb.set_vspace(root, slot, generation) },
+    }
+
+    match cspace {
+        // SAFETY: As above.
+        None => unsafe { tcb.clear_cspace() },
+        // SAFETY: The checks above established a live CNode.
+        Some((root, slot, generation, radix)) => unsafe {
+            tcb.set_cspace(root, slot, generation, radix)
+        },
     }
 
     Ok(())

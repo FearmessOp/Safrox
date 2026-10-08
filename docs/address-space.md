@@ -177,3 +177,103 @@ adresi LA57 altında da kanoniktir, ama kernel yarısının başlangıcı
 **Karar: M3'te LA57 kullanılmayacak.** Limine'in paging mode isteği 4
 seviyeyi talep edecek. Gerekçe ve ileride açmanın maliyeti
 [ADR 009](adr/009-adres-uzayi-yerlesimi.md)'da.
+
+## Bir bileşen kendi adres uzayını nasıl kurar (M11)
+
+M7 bir adres uzayını capability'lerden kurdu, kernel içinden. M11
+aynı şeyi CPL 3'ten yapıyor. Kernel tarafında tek bir yeni satır
+mantık yok — M7'nin fonksiyonları baştan capability alacak şekilde
+yazıldığı için ([ADR 011](adr/011-sayfa-tablosu-api.md)'in mekanizma
+/ politika ayrımının ödülü) — ama **çözümlemenin nereden
+başladığı** değişti.
+
+### Her thread kendi CSpace'inden çözüyor
+
+M8'den M10'a kadar dispatcher her CPtr'yi init CSpace'inde
+çözüyordu. İki bileşen olduğu anda bu bir izolasyon deliği: tek
+CSpace, her thread'in her capability'yi adlandırabilmesi demek.
+M11'den itibaren her TCB'nin kendi kökü var
+([ADR 043](adr/043-user-space-vspace-yonetimi.md)):
+
+```
+Tcb {
+    cspace_root: u64,       // kök CNode'un fiziksel adresi, ya da 0
+    cspace_slot: u64,       // capability'nin bulunduğu slotun adresi
+    cspace_generation: u8,  // o slotun generation'ı (ADR 018)
+    cspace_radix: u8,
+}
+```
+
+Sıfır init CSpace'i demek — bir geçici çözüm değil, bir tanım: boot
+thread'i init'in kendisi. `vspace_root` üçlüsüyle birebir aynı
+şekil, ve aynı sebeple: ikisi de "bu thread şu nesneye bağlı, ve o
+nesne hâlâ aynı nesne" diyor.
+
+### Bir CPtr başka bir CSpace'te ne demek?
+
+**Hiçbir şey demek değil diye bir kural yok.** Orada ne varsa onu
+adlandırır.
+
+Bu, M11'in en pahalı dersi oldu. `vspace-user-foreign`'ın ilk hâli
+B'ye A'nın VSpace CPtr'sini verdi ve B başardı — çünkü iki
+CSpace'in şekli aynıydı ve `0x1` her ikisinde de "kendi leaf'imin
+1. slotu" demekti. İzolasyon çalışıyordu; test yanlıştı.
+
+İzolasyonu göstermek asimetriyi **kurmayı** gerektiriyor: A'nın
+VSpace'i için B'nin hiç kullanmadığı bir indekste ikinci bir
+capability. B'nin oradaki slotu boş, sonuç `EmptySlot` — yasak
+değil, **yok**.
+
+### Bileşenin yapabildikleri
+
+Dokuz invocation, ve hepsi M7'nin fonksiyonlarını değişmeden
+çağırıyor:
+
+| invocation | hedef | ne yapar |
+|---|---|---|
+| `Untyped.Retype` | Untyped | kendi bütçesinden nesne üretir |
+| `PageTable.CreateVSpace` | PageTable | taze bir kökü adres uzayı yapar |
+| `PageTable.Map` | PageTable | ara tablo yerleştirir |
+| `PageTable.Unmap` | VSpace | ara tabloyu geri alır |
+| `Frame.Map` | Frame | sayfa eşler (izinlerle) |
+| `Frame.Unmap` | VSpace | eşlemeyi kaldırır |
+| `TCB.SetUserRegisters` | TCB | ring 3 giriş noktası + yığın |
+| `TCB.SetSpace` | TCB | VSpace **ve** CSpace, tek çağrıda |
+| `TCB.Resume` | TCB | çalıştırır |
+
+`Unmap`'lerin hedefi nesne değil **adres uzayı**: aynı Frame birden
+çok uzaya eşlenebiliyor, capability hangisinden çıkarılacağını
+söylemiyor.
+
+### Kernel yığını: bileşen ödüyor, kernel yerleştiriyor
+
+Kernele giren bir thread'in kernel yarısında bir yığına ihtiyacı
+var. Kernel-yarısı belleğini hiçbir capability adlandırmıyor — K1
+öbür taraftan — yani bileşen adresi veremez, vermemeli.
+
+Verdiği **frame'ler**. `SetUserRegisters` dört Frame'i bir CNode'da
+alıyor, kernel sanal aralığı seçip haritalıyor. Bellek üzerindeki
+yetki bileşende, adres uzayı üzerindeki yetki kernelde.
+
+KSTACK bölgesi sonlu, ve tükenmesi `NoKernelStack` (hata 30) —
+**`NotEnoughMemory` değil**. İkincisi "senin bütçen bitti" demek,
+birincisi "paylaşılan bir havuz bitti": farklı iddialar, ve
+`vspace-user-exhaust` tam olarak hangisi olduğunu kontrol ediyor.
+
+### Bir bileşen çocuğunun kodunu nasıl yüklüyor
+
+Çocuğun kod frame'i ebeveynin Untyped'ından yeni çıktı; kernel
+oraya bir şey yazmış olamaz. **Yükleyici ebeveyn olmak zorunda** —
+gerçek bir yükleyicinin yaptığı da bu, ve M12 bunu genelleştirecek.
+
+```
+1. frame'i EBEVEYNİN uzayına yazılabilir eşle
+2. çocuğun komutlarını yaz
+3. eşlemeyi kaldır
+4. ÇOCUĞUN uzayına çalıştırılabilir eşle
+```
+
+Hiçbir adımda, hiçbir uzayda ikisi birden değil — ve ebeveyn
+dikkatli olduğu için değil: yazılabilir-ve-çalıştırılabilir diye
+bir kodlama yok ([ADR 032](adr/032-w-xor-x.md)). Bir bileşen
+çocuğu için W+X sayfa kuramıyor, isteseler bile.

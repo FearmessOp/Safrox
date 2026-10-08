@@ -74,6 +74,7 @@ mod threadtest;
 mod usertest;
 mod vmtest;
 mod vspacetest;
+mod vspaceuser;
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
@@ -762,6 +763,42 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("thread-test") {
         println!("[boot] cmdline requested the thread tests");
         threadtest::run();
+    }
+
+    // M11 user-space address-space scenarios.
+    //
+    // **Before** M7's block, not after, and the reason is the rule
+    // M9c arrived at the hard way: `contains` does not care about
+    // word boundaries. Every token here begins `vspace-user-`, and
+    // `vspace-user-kernel-half` contains neither `vspace-kernel-half`
+    // nor `vspace-test` -- but `vspace-user-test` would match a
+    // hypothetical `vspace-user` check, and M7's `vspace-test` is
+    // checked last within its own block for the same reason.
+    //
+    // Ordering within this block: the longest first.
+    if cmdline.contains("vspace-user-kernel-half") {
+        println!("[boot] cmdline requested the user kernel-half test");
+        vspaceuser::run_kernel_half();
+    }
+
+    if cmdline.contains("vspace-user-foreign") {
+        println!("[boot] cmdline requested the foreign-vspace test");
+        vspaceuser::run_foreign();
+    }
+
+    if cmdline.contains("vspace-user-exhaust") {
+        println!("[boot] cmdline requested the budget exhaustion test");
+        vspaceuser::run_exhaust();
+    }
+
+    if cmdline.contains("vspace-user-ro") {
+        println!("[boot] cmdline requested the read-only enforcement test");
+        vspaceuser::run_read_only();
+    }
+
+    if cmdline.contains("vspace-user-test") {
+        println!("[boot] cmdline requested the user address space tests");
+        vspaceuser::run();
     }
 
     // M7 address-space scenarios. Longest token first, as above.

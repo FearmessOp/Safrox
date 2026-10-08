@@ -2762,6 +2762,246 @@ EXPECTATIONS = {
             re.compile(r"never woke", re.M),
         ],
     ),
+    # ---- M11: user-space address space management ----------------------
+    #
+    # One positive scenario, three negatives and the read-only
+    # enforcement check. Three of the five exit 33, including two
+    # negatives: a refused request is an outcome, not a fault.
+    "vsusertest": Expectation(
+        name="a component manages its own address space",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *CPU_INIT_LINES,
+            *VM_INIT_LINES,
+            *HEAP_INIT_LINES,
+            *CAP_INIT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The component really has its own CSpace. Without this
+            # the scenario would be M8 with extra steps -- and the
+            # foreign-access negative below would be untestable.
+            re.compile(
+                r"^\[vsuser\] component built: own CNode \(root radix \d+, "
+                r"leaf radix \d+\), own Untyped of [1-9]\d* KiB, own "
+                r"VSpace; the kernel mapped only its code and stack",
+                re.M,
+            ),
+            # 1-4. The mapping sequence, with the address and the
+            #      pattern both named. A bare "it worked" would pass
+            #      on a kernel that mapped something else somewhere
+            #      else.
+            re.compile(
+                r"^\[vsuser\] the component retyped a Frame and three "
+                r"tables from its own Untyped, mapped them at "
+                r"0x0000008000000000, wrote 0x5ec00ded11112222 and read "
+                r"it back, then unmapped",
+                re.M,
+            ),
+            # The refusal, which is ADR 027's rule seen from ring 3.
+            # Required text: a kernel that silently allocated the
+            # intermediate table would pass every other line here,
+            # and the component would never know its budget had been
+            # spent by someone else.
+            re.compile(
+                r"^\[vsuser\] the kernel refused to supply a missing "
+                r"intermediate table \(MissingPageTable\); the component "
+                r"supplied all three itself",
+                re.M,
+            ),
+            # 5. **The milestone's result.** The child's own pattern,
+            #    required by value: the parent could report success
+            #    for three invocations on a kernel where Resume did
+            #    nothing, and only a report from the child itself
+            #    rules that out.
+            re.compile(
+                r"^\[vsuser\] a ring 3 component built a second component "
+                r"-- its own CSpace, VSpace and TCB, all from its own "
+                r"Untyped -- and started it; the child reported "
+                r"0xc1d0000033334444 from cpl 3",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vsuser\] all user-space address space tests passed",
+                re.M,
+            ),
+            # The invocations went through the capability path, and
+            # some returned errors -- the MissingPageTable and the
+            # second Unmap, both deliberate.
+            re.compile(
+                r"^\[syscall\] [1-9]\d* calls \([1-9]\d* returned an error\)",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # The scenario's own diagnoses, each naming a way the run
+            # could have proved nothing.
+            re.compile(r"never ran", re.M),
+            re.compile(r"the kernel produced a page table", re.M),
+        ],
+    ),
+    "vsuserkernel": Expectation(
+        name="a component maps into the kernel half",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # All four refused, and the kernel's own mappings still
+            # working. The second half is why this exits 33: a user
+            # mapping in the kernel half would be visible in *every*
+            # address space, because the top-level entries are shared
+            # (ADR 027) -- so a failure here is not one component's
+            # problem.
+            re.compile(
+                r"^\[vsuser\] all 4 refused with NotUserAddress and the "
+                r"kernel's own mappings still work; this is an error "
+                r"path, not a fault",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            re.compile(r"rather than an error", re.M),
+        ],
+    ),
+    "vsuserforeign": Expectation(
+        name="a component reaches for another's address space",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # B was given the pointer rather than guessing it. Stated
+            # before the result, so the log carries the premise: if B
+            # had had to guess, a failure would say nothing.
+            re.compile(
+                r"^\[vsuser\] B was handed the CPtr 0x[0-9a-f]{16}, which "
+                r"names A's VSpace in A's CSpace\. B will use it unchanged\.",
+                re.M,
+            ),
+            # **The claim**, in two halves that must both appear. The
+            # failure alone would be consistent with Frame.Map being
+            # broken; the control is what makes it about isolation.
+            re.compile(
+                r"^\[vsuser\] B's attempt on A's VSpace failed in CPtr "
+                r"resolution \(error \d+\), and the identical call into "
+                r"B's own VSpace succeeded\. The pointer is not forbidden "
+                r"-- it names nothing in B's CSpace\.",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vsuser\] isolation holds at the capability level",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # The failure this scenario exists to rule out.
+            re.compile(r"The two components are not isolated", re.M),
+            # And the weaker outcome: a refusal from inside the
+            # mapping rather than from resolution.
+            re.compile(r"comes from inside the mapping", re.M),
+        ],
+    ),
+    "vsuserexhaust": Expectation(
+        name="a component exhausts its own budget",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The budget is finite and stated, so "it ran out" is a
+            # fact about a known quantity rather than about an
+            # unknown one.
+            re.compile(
+                r"^\[vsuser\] the component holds [1-9]\d* KiB and will "
+                r"retype \d+ page tables \(\d+ KiB\) from it",
+                re.M,
+            ),
+            # **ADR 022's claim, measured.** The root Untypeds
+            # unchanged is the load-bearing half: a clean error on
+            # its own would be satisfied by a kernel that spent
+            # somebody else's memory and then gave up.
+            re.compile(
+                r"^\[vsuser\] the component exhausted its own [1-9]\d* KiB "
+                r"cleanly \(error \d+\), the root Untypeds still hold "
+                r"[1-9]\d* KiB -- unchanged -- and the kernel heap did "
+                r"not move",
+                re.M,
+            ),
+            re.compile(
+                r"^\[vsuser\] a component can starve itself and nothing "
+                r"else",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # The three failures the scenario names.
+            re.compile(r"the last call still succeeded", re.M),
+            re.compile(r"while a component spent its own budget", re.M),
+            re.compile(r"while a component exhausted its own Untyped", re.M),
+        ],
+    ),
+    "vsuserro": Expectation(
+        name="a component writes to its own read-only page",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            re.compile(
+                r"^\[vsuser\] mapping 0x[0-9a-f]{16} read-only, then "
+                r"writing to it; expected #PF with the user and write "
+                r"bits set",
+                re.M,
+            ),
+            re.compile(
+                r"^\*\*\* EXCEPTION: #PF page fault \(vector 14\)",
+                re.M,
+            ),
+            # **User, write, protection-violation.** All three words,
+            # and each rules out a different wrong reason for the
+            # fault:
+            #
+            #   "user"       -- it happened at CPL 3, not in the
+            #                   kernel;
+            #   "write"      -- it was the store, not the read before
+            #                   it;
+            #   "protection" -- the page is PRESENT. A not-present
+            #                   fault would mean the mapping was
+            #                   never made, and the scenario would
+            #                   have proved that Frame.Map failed
+            #                   rather than that ReadOnly was
+            #                   enforced.
+            re.compile(
+                r"^\[trap\] cr2=0x[0-9a-f]{16}  \(user write "
+                r"protection-violation\)",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M9a checks passed", re.M),
+            # The failure this exists to rule out: the write
+            # succeeding means ReadOnly reached the page table as
+            # something writable.
+            re.compile(r"did not fault", re.M),
+            # A supervisor fault would mean the write happened in the
+            # kernel rather than in ring 3.
+            re.compile(r"\(supervisor write", re.M),
+        ],
+    ),
 }
 
 

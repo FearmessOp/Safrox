@@ -3,15 +3,58 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M10 — user-space interrupt handling.** A
-hardware interrupt now reaches a thread at CPL 3. Everything before
-this was the kernel talking to itself; a driver needs the other
-direction, and this is it:
+**Current milestone: M11 — user-space address space management.** A
+component at CPL 3 now manages its own memory, and — the result the
+milestone turns on — **builds a second component**:
 
 ```
-[irq] ring 3: a thread at cpl 3 blocked in Wait, a hardware interrupt
-on vector 38 arrived, and the thread resumed with badge 0x00a50000
+[vsuser] a ring 3 component built a second component -- its own
+CSpace, VSpace and TCB, all from its own Untyped -- and started it;
+the child reported 0xc1d0000033334444 from cpl 3
 ```
+
+Everything the parent did, it did with capabilities it holds: it
+retyped the objects out of its own 256 KiB budget, asked the kernel
+to make a page table into an address space, supplied every
+intermediate table itself, and **loaded the child's code** — mapping
+the frame writable in its own space, writing, unmapping, then mapping
+it executable in the child's. At no point is any page both, and not
+because the parent was careful: there is no encoding for
+writable-and-executable ([ADR 032](docs/adr/032-w-xor-x.md)).
+
+**The work was not the page-table invocations.** Exposing
+`Frame.Map` to ring 3 is a dispatcher arm. The milestone's real
+change is that **each thread now resolves CPtrs through its own
+CSpace** ([ADR 043](docs/adr/043-user-space-vspace-yonetimi.md)),
+and the reason is in the negatives. Until M11 every CPtr resolved in
+the init CSpace, which was correct while every user thread was the
+kernel test's own and becomes an isolation hole with two components:
+one CSpace means every thread can name every capability, so
+"component B cannot reach component A's page table" would have been
+a claim no test could falsify.
+
+It nearly was one anyway. The first version of that test handed B
+the CPtr naming A's VSpace and B **succeeded** — because the two
+CSpaces have the same shape, so the same bits name *B's own* VSpace
+in B's. Isolation was working; the test was wrong. A CPtr does not
+mean *nothing* in another CSpace, it means whatever is at those
+indices there, and showing isolation needs that asymmetry
+constructed deliberately. It now resolves to an empty slot:
+`EmptySlot`, not a refusal — **the capability is not forbidden, it
+is unnameable**.
+
+Two invocations had to be added that
+[ADR 043](docs/adr/043-user-space-vspace-yonetimi.md)'s list of
+seven had missed, and the second drew a boundary worth stating. A
+thread entering the kernel needs a stack in the kernel half, and
+kernel-half memory is named by no capability — so a component
+cannot supply the address. It supplies the **frames**, out of its
+own budget; the kernel chooses where they go. Authority over the
+memory stays with the component, authority over the address space
+stays with the kernel, and
+[ADR 022](docs/adr/022-kernel-bellek-ayirmaz.md)'s claim that the
+kernel allocates nothing for itself survives a component creating a
+thread.
 
 The kernel's part is **four steps and there is no fifth**: find the
 line's owner, mask the line, signal a Notification, acknowledge the
@@ -238,6 +281,140 @@ cloned into `third_party/` automatically.
 | `make toolchain-check` | Report tool availability |
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
+
+## M11 acceptance criteria
+
+Five scenarios. Four exit 33, including two of the three negatives:
+a refused request is an outcome, not a fault, and from M8 the caller
+is a user component — a kernel that died on a bad argument would be
+a denial of service reachable by anyone.
+
+### 1. `make run-vsusertest` — a component manages its own memory
+
+```
+[vsuser] the component retyped a Frame and three tables from its own
+Untyped, mapped them at 0x0000008000000000, wrote 0x5ec00ded11112222
+and read it back, then unmapped
+[vsuser] the kernel refused to supply a missing intermediate table
+(MissingPageTable); the component supplied all three itself
+[vsuser] a ring 3 component built a second component -- its own
+CSpace, VSpace and TCB, all from its own Untyped -- and started it;
+the child reported 0xc1d0000033334444 from cpl 3
+```
+
+The refusal is checked **before** the successful mapping, and the
+order is load-bearing: afterwards the tables exist and it cannot be
+provoked. A scenario that only showed mapping working would be
+consistent with a kernel that allocates intermediate tables silently
+— which is exactly what [ADR 027](docs/adr/027-vspace-modeli.md)
+refuses to do, and what every other line here would fail to notice.
+
+The child's report is the one that cannot be faked. Everything
+before it would pass on a kernel where `Resume` returned success and
+scheduled nothing; this value came from the child's own `Echo`, at
+CPL 3, in an address space its parent built out of its own budget.
+
+### 2. `make run-vsuserkernel` — the kernel half, refused (33)
+
+Four addresses — PMAP, the heap, the stacks, the image — each
+refused with `NotUserAddress`, and the kernel still running
+afterwards. A user mapping in the kernel half would be visible in
+**every** address space, because the top-level entries are shared,
+so this is not one component's problem.
+
+### 3. `make run-vsuserforeign` — isolation, at the capability level
+
+```
+[vsuser] B's attempt on A's VSpace failed in CPtr resolution (error
+3), and the identical call into B's own VSpace succeeded. The
+pointer is not forbidden -- it names nothing in B's CSpace.
+```
+
+Both halves are required. The failure alone would be consistent with
+`Frame.Map` being broken; the control — the same call, the same
+Frame, the same address, only the VSpace argument differing —
+is what makes it about isolation.
+
+### 4. `make run-vsuserexhaust` — a component starves only itself
+
+```
+[vsuser] the component exhausted its own 256 KiB cleanly (error 11),
+the root Untypeds still hold 173056 KiB -- unchanged -- and the
+kernel heap did not move
+```
+
+[ADR 022](docs/adr/022-kernel-bellek-ayirmaz.md) has claimed since M5
+that the kernel allocates nothing for itself. True, but only ever
+exercised from inside the kernel. The unchanged figures are the
+claim: a component spent every byte it had and the rest of the
+machine did not move.
+
+Error **11** by name, not "an error". M11 added
+`NoKernelStack` (30) precisely so the two exhaustions stay
+distinguishable — with one code, a run that exhausted a shared pool
+would be indistinguishable from one that exhausted its own, and the
+property being tested is exactly which.
+
+### 5. `make run-vsuserro` — read-only, enforced (35)
+
+The component maps a Frame `ReadOnly`, reads it successfully, then
+writes — and takes a #PF with the **user**, **write** and
+**protection-violation** bits all set. Each of the three rules out a
+different wrong reason for the fault, and the third is the subtle
+one: a *not-present* fault would mean the mapping was never made,
+and the scenario would have shown that `Frame.Map` failed rather
+than that `ReadOnly` was enforced.
+
+Its own scenario rather than part of the first, because a ring-3 #PF
+stops this kernel and would have ended that scenario at its third
+criterion. The alternative — checking only that `Frame.Map`
+*accepted* `ReadOnly` — would test that an argument was accepted
+rather than that a permission was enforced, which is a check
+indistinguishable from its own absence.
+
+### K5 in M11: the mutation died, and the killer was the other check
+
+Removing the `NotUserAddress` check in `map_frame` does **not** let
+a user mapping into the kernel half. The paging layer still refuses
+it — with `FlagsWrongHalf` (16) where the deleted check gave
+`NotUserAddress` (15) — and `vspace-user-kernel-half` fails on
+exactly that difference.
+
+So the mutation is caught, but by the *other* check. If the two
+shared an error code it would have survived, and a reader would have
+concluded one of them was redundant. ADR 027 argued for keeping both
+and M7 found by mutation that they must be distinguishable; this is
+the same finding arriving from the user path.
+
+They differ in what they protect. Remove the ownership check and the
+kernel half is still safe *today*, because every user mapping
+happens to carry the USER flag. It stops being safe the moment
+something maps into a user VSpace without it — and nothing would
+notice.
+
+### What M11 cost: four findings about the tests
+
+Recorded in full in
+[ADR 043](docs/adr/043-user-space-vspace-yonetimi.md); the shortest
+version of the one that mattered is that **`vspace-user-foreign`
+proved nothing in its first form.** B was handed the CPtr naming A's
+VSpace and succeeded — because both CSpaces have the same shape, so
+the same bits named B's own VSpace. Isolation was working and the
+test was wrong.
+
+A CPtr does not mean *nothing* in a foreign CSpace. It means
+whatever is at those indices there, which is a sharper reading of
+[ADR 018](docs/adr/018-cptr-cozumleme.md) than the first draft had,
+and it means showing isolation requires building the asymmetry on
+purpose.
+
+Two others are worth the line. Pooling twenty invocations into one
+report slot with "last write wins" let a failure be overwritten by a
+later success — the symptom was not a failed assertion but a #PF in
+ring 3, with the parent writing through a mapping that had failed.
+And asserting on the child immediately after `Resume` blamed the
+kernel for a race the test created: the child had been *scheduled*,
+not *run*.
 
 ## M10 acceptance criteria
 

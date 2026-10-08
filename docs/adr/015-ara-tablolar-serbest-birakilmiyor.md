@@ -1,9 +1,35 @@
 # ADR 015 — `unmap` ara sayfa tablolarını serbest bırakmıyor
 
-Status: **superseded by [ADR 027](027-vspace-modeli.md) (M7)** — user
-tarafı için kapatıldı; kernel tarafı için hâlâ geçerli. Aşağıya bakın.
+Status: **closed** — [ADR 027](027-vspace-modeli.md) (M7) user
+tarafını, [ADR 043](043-user-space-vspace-yonetimi.md) (M11) kernel
+tarafını kapattı.
 
-İlgili: [ADR 011](011-sayfa-tablosu-api.md), [ADR 027](027-vspace-modeli.md)
+İlgili: [ADR 011](011-sayfa-tablosu-api.md),
+[ADR 027](027-vspace-modeli.md),
+[ADR 043](043-user-space-vspace-yonetimi.md)
+
+## Kapanış (M11)
+
+Soru şuydu: `unmap` ara sayfa tablolarını serbest bırakmalı mı?
+
+M7 user tarafını kapattı — tablolar artık PageTable capability'si ve
+`unmap_table` onları sahibine geri veriyor. Kernel tarafı açık
+kalmıştı ve M11'de kapandı. Cevap "serbest bırakmıyoruz" değil,
+**"sorunun bir örneği yok"**:
+
+Kernelin sayfa tabloları boot'ta kuruluyor ve hiç kaldırılmıyor.
+Heap yalnızca büyüyor (ADR 016), KSTACK slotları sabit, PMAP ve
+image eşlemeleri kalıcı. `unmap` kernel yarısında **çağrılmıyor**.
+
+Bir gün çağrılırsa cevap user tarafının cevabı olacak: tabloyu
+sahibine geri ver. O yığın bir TCB'ye ait, TCB bir Untyped'dan
+geliyor, ve Untyped revoke edildiğinde tablolar da dönüyor —
+ADR 020'nin watermark kararı bunu zaten çözüyor.
+
+Yani sorunun doğru hâli "kernel bir tabloyu ne zaman serbest
+bırakmalı" değil, **"kernel bir tabloya hiç sahip olmamalı"** idi.
+Kapsam yoluyla kapanıyor, uygulama yoluyla değil — ve bu bir
+erteleme değil, bir cevap.
 
 ## Bağlam
 

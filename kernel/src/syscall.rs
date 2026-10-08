@@ -250,6 +250,11 @@ fn encode_error(error: CapError) -> u64 {
         // component that has learned what 21 means must not find it
         // meaning something else after a kernel upgrade.
         CapError::IrqAlreadyOwned { .. } => 29,
+        // M11. Appended, as always. Distinct from `NotEnoughMemory`
+        // (11) on purpose: one means the caller's own budget is
+        // spent, the other that a kernel-wide pool is. See
+        // `CapError::NoKernelStack`.
+        CapError::NoKernelStack { .. } => 30,
     };
     ERROR_FLAG | code
 }
@@ -301,6 +306,98 @@ pub enum Method {
     /// the context there like any other switch, and the return to
     /// ring 3 happens whenever the thread is resumed.
     Wait = 4,
+
+    // ---- M11: a component manages its own address space (ADR 043)
+    //
+    // Seven invocations, and **no new kernel logic behind any of
+    // them**. M7 wrote `map_frame`, `map_table` and the rest to take
+    // capabilities and check rights; opening them to user space is a
+    // resolution layer and nothing more. That is the dividend of
+    // ADR 011's mechanism/policy split, collected four milestones
+    // later.
+    /// `Frame.Map`: place this Frame in a VSpace.
+    ///
+    /// Target: the Frame. Arguments: the VSpace's CPtr, the address,
+    /// the permissions.
+    FrameMap = 5,
+
+    /// `Frame.Unmap`: remove whatever is mapped at an address.
+    ///
+    /// Target: the **VSpace**, not the Frame — and that is not an
+    /// oversight. One Frame can be mapped into several address spaces
+    /// (ADR 027), so a Frame capability does not say which mapping is
+    /// meant. The address space plus the address does.
+    FrameUnmap = 6,
+
+    /// `PageTable.Map`: supply an intermediate table.
+    ///
+    /// Target: the PageTable being inserted. Arguments: the VSpace's
+    /// CPtr, the address it covers, the level (3 = PDPT, 2 = PD,
+    /// 1 = PT).
+    PageTableMap = 7,
+
+    /// `PageTable.Unmap`: take an intermediate table back out.
+    ///
+    /// Target: the VSpace, for the reason [`Method::FrameUnmap`]
+    /// gives.
+    PageTableUnmap = 8,
+
+    /// `Untyped.Retype`: turn memory into objects.
+    ///
+    /// The invocation that makes a component self-sufficient. Without
+    /// it a component must ask init for every object it needs, which
+    /// turns init into an allocator — exactly what ADR 020 avoided by
+    /// making an Untyped a watermark rather than a heap.
+    ///
+    /// Four arguments, which is why M11 widened the ABI: the type,
+    /// `size_bits` and count packed into one word, and the
+    /// destination as a CNode CPtr plus an offset.
+    Retype = 9,
+
+    /// `TCB.SetSpace`: give a thread an address space and a CSpace.
+    ///
+    /// **What makes a component able to create another component.**
+    /// Scenario 5 is one user thread building a second and starting
+    /// it, which is M12's root task in miniature.
+    SetSpace = 10,
+
+    /// `TCB.Resume`: make a configured thread runnable.
+    Resume = 11,
+
+    /// `PageTable.CreateVSpace`: turn a fresh root into an address
+    /// space.
+    ///
+    /// **Not in ADR 043's list of seven**, and its absence was found
+    /// by writing scenario 5 rather than by reading the code. The
+    /// claim "no new kernel logic" survives — `create_vspace` is M7's,
+    /// unchanged — but the claim "seven invocations are enough to
+    /// build a component" did not. A component can retype a
+    /// PageTable and map it as an *intermediate* table; it had no way
+    /// to make one a root, so the address space it was supposed to
+    /// give its child could not exist.
+    ///
+    /// The kernel half is copied in by `create_vspace`, which is why
+    /// this cannot be "the user writes a PML4 itself": the entries
+    /// that make interrupts deliverable are not the caller's to
+    /// write.
+    CreateVSpace = 12,
+
+    /// `TCB.SetUserRegisters`: entry point and stack for a ring-3
+    /// thread.
+    ///
+    /// M6's `SetRegisters` takes a Rust `fn` pointer and is useless
+    /// here — a kernel address is exactly what a user thread must not
+    /// start at. This takes two user-half addresses, which
+    /// `configure_user` already asserts.
+    ///
+    /// **The kernel stack is not an argument**, and that is the
+    /// boundary this invocation makes visible. A thread entering the
+    /// kernel needs a stack in the kernel half; kernel-half memory is
+    /// named by no capability (ADR 027's K1 is the same rule seen
+    /// from the other side), so a component cannot supply one and
+    /// must not be able to. The kernel assigns it. See
+    /// [`crate::cap::tcb::set_user_registers`] for what that costs.
+    SetUserRegisters = 13,
 }
 
 impl Method {
@@ -310,6 +407,15 @@ impl Method {
             2 => Some(Method::SetPriority),
             3 => Some(Method::Echo),
             4 => Some(Method::Wait),
+            5 => Some(Method::FrameMap),
+            6 => Some(Method::FrameUnmap),
+            7 => Some(Method::PageTableMap),
+            8 => Some(Method::PageTableUnmap),
+            9 => Some(Method::Retype),
+            10 => Some(Method::SetSpace),
+            11 => Some(Method::Resume),
+            12 => Some(Method::CreateVSpace),
+            13 => Some(Method::SetUserRegisters),
             _ => None,
         }
     }
@@ -320,6 +426,15 @@ impl Method {
             Method::SetPriority => "SetPriority",
             Method::Echo => "Echo",
             Method::Wait => "Wait",
+            Method::FrameMap => "Frame.Map",
+            Method::FrameUnmap => "Frame.Unmap",
+            Method::PageTableMap => "PageTable.Map",
+            Method::PageTableUnmap => "PageTable.Unmap",
+            Method::Retype => "Untyped.Retype",
+            Method::SetSpace => "TCB.SetSpace",
+            Method::Resume => "TCB.Resume",
+            Method::CreateVSpace => "PageTable.CreateVSpace",
+            Method::SetUserRegisters => "TCB.SetUserRegisters",
         }
     }
 
@@ -339,6 +454,16 @@ impl Method {
         match self {
             Method::ReadRegisters | Method::SetPriority => Some(CapType::Tcb),
             Method::Wait => Some(CapType::Notification),
+            Method::FrameMap => Some(CapType::Frame),
+            // Both `Unmap`s target the address space rather than the
+            // object being unmapped; see `Method::FrameUnmap`.
+            Method::FrameUnmap | Method::PageTableMap | Method::PageTableUnmap => {
+                Some(CapType::PageTable)
+            }
+            Method::Retype => Some(CapType::Untyped),
+            Method::SetSpace | Method::Resume => Some(CapType::Tcb),
+            Method::CreateVSpace => Some(CapType::PageTable),
+            Method::SetUserRegisters => Some(CapType::Tcb),
             Method::Echo => None,
         }
     }
@@ -390,7 +515,25 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     // show two user threads enter on *different* stacks (ADR 029).
     let kernel_rsp = frame as *const SyscallFrame as u64;
 
-    let result = dispatch(frame.rdi, frame.rsi, frame.rdx, frame.r10, kernel_rsp);
+    // Four argument registers from M11, not two (ADR 043). `syscall`
+    // destroys RCX and R11, leaving RDX, R10, R8 and R9 -- ADR 034
+    // counted them for IPC and the invocation path had been using
+    // only the first two. `Frame.Map` needs three and
+    // `Untyped.Retype` four, so the registers that were already there
+    // are now used.
+    //
+    // The alternative was packing permissions into an address's low
+    // bits, which are free because the address is page-aligned. It
+    // works and it is wrong: `0x400000 | 2` is not an address, and
+    // one day somebody treats it as one.
+    let args = Args {
+        arg0: frame.rdx,
+        arg1: frame.r10,
+        arg2: frame.r8,
+        arg3: frame.r9,
+    };
+
+    let result = dispatch(frame.rdi, frame.rsi, args, kernel_rsp);
 
     match result {
         Ok(value) => {
@@ -408,6 +551,58 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     }
 }
 
+/// The four argument registers, grouped.
+///
+/// A struct rather than four parameters, because `dispatch` already
+/// had five and M11 would have made it seven. Grouping them also puts
+/// the ABI in one place: a reader asking "what is in R8" finds the
+/// answer here rather than counting positional arguments.
+#[derive(Clone, Copy)]
+struct Args {
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+}
+
+/// The CSpace the calling thread resolves its CPtrs through
+/// (ADR 043).
+///
+/// **This function is M11's actual subject.** Until now the
+/// dispatcher used `boot::init_cspace()` unconditionally, which was
+/// correct while every user thread was the test's own and becomes an
+/// isolation hole the moment two components exist: one CSpace means
+/// every thread can name every capability, so "component B cannot
+/// reach component A's PageTable" would be a claim no test could
+/// falsify.
+///
+/// A zero `cspace_root` means the init CSpace. That is a definition
+/// rather than a fallback — the boot thread and the kernel's own test
+/// threads *are* init.
+fn current_cspace() -> Result<crate::cap::cptr::CSpace, CapError> {
+    // SAFETY: We are servicing a syscall, so there is a current
+    // thread, and nothing else holds a borrow of it on this path.
+    let tcb = unsafe { crate::sched::current() };
+
+    let root = tcb.cspace_root();
+    if root == 0 {
+        return Ok(crate::cap::boot::init_cspace());
+    }
+
+    // The capability that was handed over may have been revoked
+    // since. Address plus generation, the ADR 018 idiom: without the
+    // generation a revoked-and-reused CNode would resolve this
+    // thread's CPtrs through a stranger's capabilities, which is
+    // worse than failing.
+    if !tcb.cspace_is_live() {
+        return Err(CapError::StaleCPtr);
+    }
+
+    // SAFETY: `cspace_is_live` just confirmed the slot still holds
+    // the CNode this thread was bound to, with `1 << radix` slots.
+    Ok(unsafe { crate::cap::cptr::CSpace::new(crate::memory::PhysAddr(root), tcb.cspace_radix()) })
+}
+
 /// Resolve the capability, check the method, and perform it.
 ///
 /// Split out of [`syscall_dispatch`] so the error paths are ordinary
@@ -415,11 +610,11 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
 fn dispatch(
     cptr_bits: u64,
     method_bits: u64,
-    arg0: u64,
-    _arg1: u64,
+    args: Args,
     kernel_rsp: u64,
 ) -> Result<u64, CapError> {
     let method = Method::from_bits(method_bits).ok_or(CapError::InvalidArgument)?;
+    let arg0 = args.arg0;
 
     // Echo first: it names no capability, so resolving one would be
     // asking a question with no answer.
@@ -442,6 +637,7 @@ fn dispatch(
         // the wrong place rather than as a silent drop.
         if !crate::usertest::record_forge_result(cptr_bits, arg0)
             && !crate::irqtest::record_user_report(cptr_bits, arg0)
+            && !crate::vspaceuser::record_step(cptr_bits, arg0)
         {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);
         }
@@ -454,17 +650,27 @@ fn dispatch(
     }
 
     let cptr = CPtr(cptr_bits);
-    let space = crate::cap::boot::init_cspace();
+
+    // **The calling thread's own CSpace**, not init's (ADR 043).
+    //
+    // This one line is what the M11 negatives rest on. While every
+    // user thread was the kernel test's own, `init_cspace()` was
+    // correct and indistinguishable from a hardcoded assumption; with
+    // two components it is an isolation hole, because one CSpace
+    // means every thread can name every capability.
+    let space = current_cspace()?;
 
     let required = method
         .capability_type()
         .expect("Echo is handled before resolution and names no capability");
 
-    // SAFETY: The CSpace is live from boot. `resolve_typed` validates
-    // every field of the CPtr -- reserved bits, both indices, both
-    // generations, and that the root slot holds a CNode (ADR 018) --
-    // so a forged pointer returns an error rather than reaching an
-    // object. No other mutable borrow of the slot is held here.
+    // SAFETY: `current_cspace` returned a live CSpace -- either init's,
+    // or one whose generation it just rechecked. `resolve_typed`
+    // validates every field of the CPtr -- reserved bits, both
+    // indices, both generations, and that the root slot holds a CNode
+    // (ADR 018) -- so a forged pointer returns an error rather than
+    // reaching an object. No other mutable borrow of the slot is held
+    // here.
     let slot = unsafe { crate::cap::cptr::resolve_typed(&space, cptr, required) }?;
 
     // Which method ran, recorded for the report. A single counter
@@ -514,8 +720,314 @@ fn dispatch(
             let mask = unsafe { crate::cap::ipc::wait(slot) }?;
             Ok(mask as u64)
         }
+
+        // ---- M11: address spaces, from ring 3 -----------------------
+        //
+        // Every arm below calls an M7 function unchanged. That is the
+        // claim ADR 043 makes and the reward ADR 011 predicted: the
+        // functions were written to take capabilities and check
+        // rights, so opening them to user space is a resolution
+        // layer and nothing else.
+        Method::FrameMap => {
+            // RDI the Frame, RDX the VSpace root, R10 the address,
+            // R8 the permissions.
+            //
+            // SAFETY: The target slot holds a Frame and this one must
+            // hold a PageTable, so they cannot be the same slot -- a
+            // slot has one type. No aliasing `&mut Slot` arises.
+            let root = unsafe { resolve_aux(&space, args.arg0, CapType::PageTable) }?;
+            let permissions = decode_permissions(args.arg2)?;
+
+            // SAFETY: `resolve_typed` established the target slot
+            // holds a live Frame and `resolve_aux` that the root slot
+            // holds a live PageTable. They are distinct slots -- a
+            // slot has one type -- so no aliasing arises, and nothing
+            // else borrows either here.
+            unsafe {
+                crate::cap::vspace::map_frame(
+                    root,
+                    slot,
+                    crate::memory::VirtAddr(args.arg1),
+                    permissions,
+                )
+            }?;
+            Ok(0)
+        }
+        Method::FrameUnmap => {
+            // The target is the **address space**, not the Frame: one
+            // Frame may be mapped in several VSpaces (ADR 027), and a
+            // Frame capability does not say which one is meant.
+            //
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live PageTable, and nothing else borrows it here.
+            let frame = unsafe {
+                crate::cap::vspace::unmap_frame(slot, crate::memory::VirtAddr(args.arg0))
+            }?;
+
+            // The physical address is **not** returned, for
+            // `ReadRegisters`' reason: it is a fact about the
+            // machine's layout, and ring 3 has no use for it that
+            // ring 3 could not get by asking its own allocator. The
+            // caller already holds the Frame capability; that is the
+            // Frame.
+            let _ = frame;
+            Ok(0)
+        }
+        Method::PageTableMap => {
+            // RDI the table being inserted, RDX the root, R10 the
+            // address, R8 the level (3 = PDPT, 2 = PD, 1 = PT).
+            //
+            // **The one arm where both capabilities have the same
+            // type**, and therefore the one where the caller can name
+            // the same slot twice. Every other pair differs -- Frame
+            // and PageTable, Untyped and CNode, TCB and PageTable and
+            // CNode -- so a slot's single type keeps them apart. Here
+            // it does not, and resolving one slot twice would hand
+            // out two `&mut` to it.
+            //
+            // The CPtrs are compared *before* resolution, because
+            // forming the second reference is already the error. The
+            // comparison is exact rather than conservative: two CPtrs
+            // that both resolve successfully reach the same slot only
+            // if their index pairs are equal, and then their
+            // generations must both equal the slot's and so equal
+            // each other (ADR 018). Equal slot therefore means equal
+            // bits.
+            if args.arg0 == cptr_bits {
+                return Err(CapError::InvalidArgument);
+            }
+
+            // SAFETY: Not the target slot, by the check above, and
+            // the only other reference in scope is to that slot.
+            let root = unsafe { resolve_aux(&space, args.arg0, CapType::PageTable) }?;
+            let level = u8::try_from(args.arg2).map_err(|_| CapError::InvalidArgument)?;
+
+            // The kernel does **not** produce the table (ADR 027): a
+            // missing intermediate is `MissingPageTable`, and the
+            // caller offers one. That is why this invocation exists at
+            // all, and why a component's page tables come out of its
+            // own budget.
+            //
+            // SAFETY: Both slots hold live PageTables by resolution
+            // and are distinct, as argued above.
+            unsafe {
+                crate::cap::vspace::map_table(root, slot, crate::memory::VirtAddr(args.arg1), level)
+            }?;
+            Ok(0)
+        }
+        Method::PageTableUnmap => {
+            // Target the address space, as `FrameUnmap`.
+            let level = u8::try_from(args.arg1).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: As `FrameUnmap`.
+            let table = unsafe {
+                crate::cap::vspace::unmap_table(slot, crate::memory::VirtAddr(args.arg0), level)
+            }?;
+            let _ = table;
+            Ok(0)
+        }
+        Method::Retype => {
+            // RDI the Untyped, RDX what to make, R10 how many, R8 the
+            // destination CNode, R9 the offset within it.
+            //
+            // `arg0` carries two fields: the type in the low byte and
+            // `size_bits` in the next. ADR 043 put the compound on the
+            // destination instead; it moved here during
+            // implementation, for a reason better than preference. An
+            // offset packed into the destination CPtr would land in
+            // the CPtr's reserved field, and resolution *requires*
+            // that field to be zero (ADR 018) -- so that packing is
+            // not merely ugly, it is unrepresentable.
+            //
+            // Type and size_bits are not addresses and are not
+            // independent: together they are one answer to "what
+            // object". Packing them is not the mistake ADR 043
+            // rejected, which was making a value that is not an
+            // address look like one.
+            let cap_type = decode_retype_target(args.arg0 & 0xFF)?;
+            let size_bits = ((args.arg0 >> 8) & 0xFF) as u8;
+            let count = usize::try_from(args.arg1).map_err(|_| CapError::InvalidArgument)?;
+            let offset = usize::try_from(args.arg3).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: The target slot holds an Untyped and this one
+            // must hold a CNode, so they are distinct slots.
+            let dest_slot = unsafe { resolve_aux(&space, args.arg2, CapType::CNode) }?;
+            // SAFETY: The capability says how many slots the object
+            // has, and `resolve_aux` established it is a live CNode.
+            let dest = unsafe {
+                crate::cap::cnode::CNode::new(dest_slot.object().0, dest_slot.as_radix())
+            };
+
+            // **This is where ADR 022's budget claim becomes
+            // testable.** Until now every retype ran inside the
+            // kernel, so "a component can only spend its own memory"
+            // was true but unobserved. A component exhausting its
+            // Untyped from ring 3 observes it.
+            //
+            // SAFETY: The target slot holds a live Untyped and
+            // `dest` a live CNode; they are distinct slots because
+            // their types differ, so the mutable borrow of the
+            // Untyped does not alias the CNode.
+            unsafe {
+                crate::cap::untyped::retype(slot, cap_type, size_bits, count, &dest, offset)
+            }?;
+            Ok(0)
+        }
+        Method::SetSpace => {
+            // Both spaces, always. The kernel-side function takes
+            // `Option` so boot can set one at a time; ring 3 does not
+            // get that, because a thread with one and not the other
+            // is a state with no use and a window with a hazard
+            // (ADR 043). There is also no CPtr that means "none" --
+            // zero is a perfectly good pointer to slot 0 of slot 0 --
+            // so an optional argument would need a flag word to
+            // disambiguate, for a case nobody wants.
+            // SAFETY: Three required types -- TCB for the target,
+            // PageTable here, CNode below -- and a slot has one type,
+            // so the three references cannot name the same slot.
+            let vspace = unsafe { resolve_aux(&space, args.arg0, CapType::PageTable) }?;
+            // SAFETY: As above.
+            let cspace = unsafe { resolve_aux(&space, args.arg1, CapType::CNode) }?;
+
+            // SAFETY: All three slots hold live capabilities of the
+            // required types, and nothing else borrows the TCB here.
+            unsafe { tcb::set_space(slot, Some(vspace), Some(cspace)) }?;
+            Ok(0)
+        }
+        Method::Resume => {
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live TCB, and nothing else borrows it on this path.
+            let thread = unsafe { tcb::from_slot(slot) }?;
+            // SAFETY: `thread` is that live TCB.
+            unsafe { crate::sched::resume(thread) }?;
+            Ok(0)
+        }
+        Method::CreateVSpace => {
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live PageTable. `create_vspace` refuses a table that is
+            // already mapped somewhere, so the "nothing has mapped
+            // it" half of its contract is checked rather than
+            // assumed.
+            unsafe { crate::cap::vspace::create_vspace(slot) }?;
+            Ok(0)
+        }
+        Method::SetUserRegisters => {
+            // RDI the TCB, RDX the entry point, R10 the user stack,
+            // R8 the CNode of kernel-stack frames, R9 the offset.
+            //
+            // The frames are the caller's and the virtual range is
+            // the kernel's; see `set_user_registers` for why that
+            // split is forced rather than chosen.
+            let offset = usize::try_from(args.arg3).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: The target slot holds a TCB and this one must
+            // hold a CNode, so they are distinct slots.
+            let frames_slot = unsafe { resolve_aux(&space, args.arg2, CapType::CNode) }?;
+            // SAFETY: The capability says how many slots the object
+            // has, and resolution established it is a live CNode.
+            let frames = unsafe {
+                crate::cap::cnode::CNode::new(frames_slot.object().0, frames_slot.as_radix())
+            };
+
+            // SAFETY: The target slot holds a live TCB and `frames` a
+            // live CNode; they are distinct slots because their types
+            // differ.
+            unsafe { tcb::set_user_registers(slot, args.arg0, args.arg1, &frames, offset) }?;
+            Ok(0)
+        }
+
         // Handled above, before the capability was resolved.
         Method::Echo => unreachable!("Echo is handled before resolution"),
+    }
+}
+
+/// Resolve a second capability named by an argument register.
+///
+/// The target CPtr arrives in RDI and is resolved by `dispatch`; the
+/// invocations M11 adds name a second object -- the address space to
+/// map into, the CNode to retype into -- and it resolves **through the
+/// same CSpace**. That is the whole of negative (b): a component that
+/// does not hold a capability for another component's page table
+/// cannot produce a CPtr that reaches it, because the indices walk
+/// from its own root.
+///
+/// # Safety
+///
+/// As [`crate::cap::cptr::resolve_typed`]: the caller must not hold
+/// another mutable borrow of the resolved slot. Every caller here
+/// resolves slots of differing types, and a slot has one type.
+unsafe fn resolve_aux(
+    space: &crate::cap::cptr::CSpace,
+    bits: u64,
+    required: CapType,
+) -> Result<&'static mut crate::cap::cnode::Slot, CapError> {
+    // SAFETY: Caller's guarantee; `resolve_typed` validates every
+    // field of the pointer before it reaches an object.
+    unsafe { crate::cap::cptr::resolve_typed(space, CPtr(bits), required) }
+}
+
+/// Decode the permissions argument of `Frame.Map` (ADR 032).
+///
+/// Three values, and the fourth combination -- writable *and*
+/// executable -- has no encoding. W^X is not enforced here; it is
+/// unrepresentable, which is a stronger statement and the reason
+/// [`crate::cap::vspace::MapPermissions`] is an enum rather than a
+/// flags word.
+fn decode_permissions(bits: u64) -> Result<crate::cap::vspace::MapPermissions, CapError> {
+    match bits {
+        0 => Ok(crate::cap::vspace::MapPermissions::ReadOnly),
+        1 => Ok(crate::cap::vspace::MapPermissions::ReadWrite),
+        2 => Ok(crate::cap::vspace::MapPermissions::ReadExecute),
+        _ => Err(CapError::InvalidArgument),
+    }
+}
+
+/// Decode the object type of `Untyped.Retype`.
+///
+/// Written out rather than reusing `CapType::from_bits`, and the
+/// difference matters: these numbers are a **user-visible ABI**, and
+/// inheriting them from an internal enum's discriminants would mean a
+/// renumbering inside the kernel silently changed what ring 3 asks
+/// for. The match is exhaustive, so a type added later cannot be
+/// forgotten here -- it has to be refused or allowed on purpose.
+fn decode_retype_target(bits: u64) -> Result<CapType, CapError> {
+    let requested = match bits {
+        1 => CapType::Untyped,
+        2 => CapType::CNode,
+        3 => CapType::Tcb,
+        4 => CapType::Endpoint,
+        5 => CapType::Notification,
+        6 => CapType::Frame,
+        7 => CapType::PageTable,
+        8 => CapType::IrqHandler,
+        9 => CapType::IrqControl,
+        _ => return Err(CapError::InvalidArgument),
+    };
+
+    match requested {
+        CapType::Untyped
+        | CapType::CNode
+        | CapType::Tcb
+        | CapType::Endpoint
+        | CapType::Notification
+        | CapType::Frame
+        | CapType::PageTable => Ok(requested),
+
+        // `Null` is the absence of a capability, not a thing to make.
+        CapType::Null => Err(CapError::InvalidArgument),
+
+        // An IRQHandler comes from `IRQControl.Get` and nowhere else
+        // (ADR 041): the kernel hands out a line, and a handler
+        // object conjured from memory would name no line. Retype
+        // *can* produce the object -- it has a size -- which is
+        // exactly why the refusal is written here rather than left to
+        // chance.
+        CapType::IrqHandler => Err(CapError::InvalidArgument),
+
+        // The one capability naming no object at all. There is
+        // exactly one, created at boot; `object_layout` would refuse
+        // it anyway, and saying so here makes the reason visible.
+        CapType::IrqControl => Err(CapError::InvalidArgument),
     }
 }
 

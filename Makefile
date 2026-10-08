@@ -698,3 +698,58 @@ run-irquser: $(ISO_IRQUSER)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_IRQUSER) --expect irquser -- $(QEMU_FLAGS)
 
 test: run-irquser
+
+
+
+# ---- M11: user-space address space management -------------------------
+#
+# Five scenarios: the positive one, three negatives and the read-only
+# enforcement check. Appended rather than merged into an existing
+# list, which is this Makefile's rule (ADR 023, K7) and the reason
+# every milestone's additions stay legible as a block.
+#
+# Entry numbers continue from M10's 50.
+
+ISO_VSUSERTEST    := $(BUILD_DIR)/pythos-vsusertest.iso
+ISO_VSUSERKERNEL  := $(BUILD_DIR)/pythos-vsuserkernel.iso
+ISO_VSUSERFOREIGN := $(BUILD_DIR)/pythos-vsuserforeign.iso
+ISO_VSUSEREXHAUST := $(BUILD_DIR)/pythos-vsuserexhaust.iso
+ISO_VSUSERRO      := $(BUILD_DIR)/pythos-vsuserro.iso
+
+ALL_ISOS += $(ISO_VSUSERTEST) $(ISO_VSUSERKERNEL) $(ISO_VSUSERFOREIGN) \
+            $(ISO_VSUSEREXHAUST) $(ISO_VSUSERRO)
+
+.PHONY: run-vsusertest run-vsuserkernel run-vsuserforeign
+.PHONY: run-vsuserexhaust run-vsuserro
+
+$(ISO_VSUSERTEST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,51)
+
+$(ISO_VSUSERKERNEL): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,52)
+
+$(ISO_VSUSERFOREIGN): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,53)
+
+$(ISO_VSUSEREXHAUST): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,54)
+
+$(ISO_VSUSERRO): $(KERNEL) boot/limine.conf.in $(LIMINE_EXE)
+	$(call build_iso,$@,55)
+
+run-vsusertest: $(ISO_VSUSERTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSERTEST) --expect vsusertest -- $(QEMU_FLAGS)
+
+run-vsuserkernel: $(ISO_VSUSERKERNEL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSERKERNEL) --expect vsuserkernel -- $(QEMU_FLAGS)
+
+run-vsuserforeign: $(ISO_VSUSERFOREIGN)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSERFOREIGN) --expect vsuserforeign -- $(QEMU_FLAGS)
+
+run-vsuserexhaust: $(ISO_VSUSEREXHAUST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSEREXHAUST) --expect vsuserexhaust -- $(QEMU_FLAGS)
+
+run-vsuserro: $(ISO_VSUSERRO)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSERRO) --expect vsuserro -- $(QEMU_FLAGS)
+
+test: run-vsusertest run-vsuserkernel run-vsuserforeign run-vsuserexhaust run-vsuserro

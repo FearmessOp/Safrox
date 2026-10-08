@@ -575,3 +575,95 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: irq-user
+
+
+
+/+PythOS (M11: a component manages its own address space)
+    comment: M7 built an address space out of capabilities from inside
+    comment: the kernel; M8 put code in ring 3. This is both at once: a
+    comment: component at CPL 3 retypes a Frame and three page tables
+    comment: out of its OWN Untyped, maps them, writes through the
+    comment: mapping, reads it back, and unmaps.
+    comment: Before the successful mapping it deliberately maps with no
+    comment: intermediate tables, and the kernel must answer
+    comment: MissingPageTable rather than conjuring one (ADR 027). That
+    comment: order is load-bearing -- afterwards the tables exist and
+    comment: the refusal cannot be provoked.
+    comment: Then the part that is the milestone's real result: the
+    comment: component builds a SECOND component. Its own CSpace, its
+    comment: own VSpace, its own TCB, all from its own budget -- and it
+    comment: loads the child's code itself, mapping the frame writable
+    comment: in its own space, writing, unmapping, and remapping it
+    comment: executable in the child's. No step has it both.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-user-test
+
+
+/+PythOS (M11: a component maps into the kernel half)
+    comment: Four kernel addresses -- PMAP, the heap, the stacks and the
+    comment: image -- each refused with NotUserAddress. The component
+    comment: holds the Frame and its own VSpace, so the refusal is the
+    comment: kernel's judgement about the ADDRESS rather than a missing
+    comment: capability.
+    comment: Exit 33, not 35, and that is the point: a refused request
+    comment: is a caller error, and from M8 the caller is a user
+    comment: component. A kernel that died here would be a denial of
+    comment: service reachable by anyone.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-user-kernel-half
+
+
+/+PythOS (M11: a component reaches for another's address space)
+    comment: The capability-level proof of isolation, and the scenario
+    comment: the whole per-thread CSpace change exists to make possible.
+    comment: B is handed the exact CPtr that names A's VSpace in A's
+    comment: CSpace -- the same bits, no guessing -- and uses it. The
+    comment: walk starts from B's own root, where those indices lead
+    comment: somewhere else, so resolution fails.
+    comment: B then makes the IDENTICAL call into its own VSpace, which
+    comment: succeeds. Without that control the failure above would be
+    comment: consistent with Frame.Map simply being broken.
+    comment: Before M11 this could not have failed at all: one CSpace
+    comment: meant B's pointer would have reached A's page table.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-user-foreign
+
+
+/+PythOS (M11: a component exhausts its own budget)
+    comment: ADR 022 has claimed since M5 that the kernel allocates
+    comment: nothing for itself and every object comes out of somebody's
+    comment: Untyped. True, but only ever exercised from inside the
+    comment: kernel. Here a component at CPL 3 retypes until its own
+    comment: Untyped is empty.
+    comment: Three things are checked and the third is the claim: the
+    comment: exhaustion is clean (NotEnoughMemory, no panic), the kernel
+    comment: is still running, and the root Untypeds and the heap's
+    comment: reserve are BYTE-FOR-BYTE unchanged. A component can starve
+    comment: itself and nothing else.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-user-exhaust
+
+
+/+PythOS (M11: a component writes to its own read-only page)
+    comment: The component maps a Frame ReadOnly, reads it successfully,
+    comment: then writes -- and takes a #PF. Exit 35.
+    comment: Its own scenario rather than part of vspace-user-test,
+    comment: because a ring 3 #PF stops this kernel and would have ended
+    comment: that scenario at its third criterion with the rest never
+    comment: running.
+    comment: The alternative was to check only that Frame.Map ACCEPTED
+    comment: ReadOnly, which would test that the argument was accepted
+    comment: rather than that the permission was enforced -- a check
+    comment: indistinguishable from its own absence (ADR 023, K5).
+    comment: The read before the write matters too: a page that could
+    comment: not be read either would make the fault ambiguous.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: vspace-user-ro

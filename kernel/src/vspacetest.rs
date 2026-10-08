@@ -299,8 +299,9 @@ fn build_thread(
         // SAFETY: Index in range.
         let root = unsafe { cnode.slot(space.root_slot) };
         // SAFETY: Both slots hold live capabilities and the thread is
-        // not running.
-        unsafe { tcb::set_space(tcb_slot, Some(root)) }.expect("SetSpace failed");
+        // not running. `None` for the CSpace: M7's threads are the
+        // test's own and keep the init CSpace (ADR 043).
+        unsafe { tcb::set_space(tcb_slot, Some(root), None) }.expect("SetSpace failed");
     }
 
     tcb_slot_index
@@ -1376,7 +1377,7 @@ pub fn run_stale_cr3() -> ! {
     // SAFETY: Index in range.
     let boot_slot = unsafe { cnode.slot(boot_tcb_slot) };
     // SAFETY: Both slots hold live capabilities; expected to fail.
-    match unsafe { tcb::set_space(boot_slot, Some(root)) } {
+    match unsafe { tcb::set_space(boot_slot, Some(root), None) } {
         Err(CapError::ThreadBusy { .. }) => {
             println!(
                 "[vspace] SetSpace on the running thread: ThreadBusy, as \

@@ -144,17 +144,72 @@ pub fn mov_rdx_imm(value: u64) -> [u8; 10] {
     bytes
 }
 
+/// Encode `mov rbx, imm64` (`48 bb + 8 bytes`).
+///
+/// RBX because it is callee-saved and `syscall` does not touch it:
+/// a value parked here survives an invocation, which RCX and R11 do
+/// not (ADR 030).
+pub fn mov_rbx_imm(value: u64) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[0] = 0x48;
+    bytes[1] = 0xbb;
+    bytes[2..].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+/// Encode `mov r10, imm64` (`49 ba + 8 bytes`) — invocation arg1.
+pub fn mov_r10_imm(value: u64) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[0] = 0x49;
+    bytes[1] = 0xba;
+    bytes[2..].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+/// Encode `mov r8, imm64` (`49 b8 + 8 bytes`) — invocation arg2 (M11).
+pub fn mov_r8_imm(value: u64) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[0] = 0x49;
+    bytes[1] = 0xb8;
+    bytes[2..].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+/// Encode `mov r9, imm64` (`49 b9 + 8 bytes`) — invocation arg3 (M11).
+pub fn mov_r9_imm(value: u64) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[0] = 0x49;
+    bytes[1] = 0xb9;
+    bytes[2..].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
 /// A buffer a user program is assembled into before being copied to a
 /// Frame.
+///
+/// One page since M11. M8's programs were a handful of syscalls and
+/// 512 bytes was generous; M11's component builds a second component,
+/// which is thirty-odd invocations at about ninety bytes each — six
+/// `mov r64, imm64` for the arguments, the `syscall`, and five more
+/// to report the result.
+///
+/// 4096 is the real ceiling rather than a round number: these are
+/// copied into a single Frame, so a program larger than a page could
+/// not be loaded whatever this said. `write_program` checks the same
+/// bound from the other side.
+///
+/// `emit` asserts rather than truncating, which is how the 2 KiB
+/// version of this was caught — as a panic naming the buffer, not as
+/// a user program that stopped halfway through its last invocation.
 pub struct Program {
-    bytes: [u8; 512],
+    bytes: [u8; 4096],
     length: usize,
 }
 
 impl Program {
     pub fn new() -> Program {
         Program {
-            bytes: [0; 512],
+            bytes: [0; 4096],
             length: 0,
         }
     }
@@ -477,8 +532,10 @@ pub fn build_user_thread(
     // SAFETY: Index in range.
     let root = unsafe { cnode.slot(space.root_slot) };
     // SAFETY: Both slots hold live capabilities; the thread is not
-    // running.
-    unsafe { tcb::set_space(tcb_slot, Some(root)) }.expect("SetSpace failed");
+    // running. `None` for the CSpace: M8's user threads are the
+    // test's own and resolve through the init CSpace, which is what
+    // zero means (ADR 043). M11's threads are given their own.
+    unsafe { tcb::set_space(tcb_slot, Some(root), None) }.expect("SetSpace failed");
 
     tcb_slot_index
 }
