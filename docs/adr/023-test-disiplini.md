@@ -299,6 +299,46 @@ yerine teşhisle düşüyor.
   bakıldı ve düşük iterasyon sayıları (31770) yarışın hâlâ gerçek
   olduğunu, sadece artık yakalandığını gösterdi.
 
+### K9 — Kabul koşusu `distclean`'den başlar
+
+M12'den sonra, yeniden adlandırma teslimi sırasında yakalandı.
+`make test` geçiyordu; `make distclean && make test` geçmiyordu:
+
+```
+error: couldn't read `kernel/src/../../build/roottask.bin`
+make: *** [Makefile:449: clippy] Error 101
+```
+
+Sebep, `clippy`'nin `$(ROOTTASK_BIN)`'e bağlı olmamasıydı. M12
+`$(KERNEL)`'e bu bağımlılığı vermişti — kernel, root task imajını
+`include_bytes!` ile gömüyor ([ADR 044](044-root-task-ve-bootstrap-protokolu.md)) — ama clippy de kernel'i
+*derliyor*, ve `test: fmt clippy run ...` sırasında clippy her şeyden
+önce koşuyor.
+
+İlginç olan, hatanın neden M12'de görünmediği. Çünkü `build/` önceki
+koşulardan kalmıştı: dosya zaten oradaydı, hiçbir kuralın onu
+üretmesi gerekmedi, ve eksik kenar hiçbir belirti vermedi. **Kalıntı
+artefakt, eksik bağımlılığı birebir taklit eder** — tıpkı var olan
+bir dosya gibi davranır, ta ki temiz bir ağaçta aranana kadar.
+
+Bu K5'in yapısının build sistemine taşınmış hali: eksik bir kenar,
+kendi yokluğundan ayırt edilemez. Ve K7'nin kardeşi — K7 Makefile'ın
+nasıl *yazıldığıyla*, K9 nasıl *koşturulduğuyla* ilgili.
+
+Kural:
+
+> Bir milestone'un kabul koşusu `distclean`'den başlamalı, ve rapor
+> bunu komutun kendisiyle göstermeli. "`make test` geçti" bir
+> bağımlılık iddiası taşımaz; yalnızca o anki `build/` içeriğiyle
+> geçtiğini söyler.
+
+Yan ders, bu olayda iki kez ortaya çıktı: düzeltme `clippy:` kuralına
+yazılamaz. O kural `ROOTTASK_BIN` tanımından ~320 satır önce
+ayrıştırılıyor ve make önkoşul listesini **ayrıştırma anında**
+genişletiyor; oraya yazılsa boş dizgeye açılır, hata vermez, uyarmaz.
+M12 aynı tuzağı `$(KERNEL)` için belgelemişti. İkinci kez, kimsenin
+bakmayı düşünmediği bir hedefte.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -335,6 +375,8 @@ başarısız oldu.
   `make -n` ile doğrulanır.
 - **K8:** Bir test, ölçtüğü olayın gerçekleşmesine dayanmalı, o olayın
   zamanlamasına değil. Kararsız bir arıza tek yeşil koşuyla kapanmaz.
+- **K9:** Kabul koşusu `distclean`'den başlar; kalıntı bir artefakt
+  eksik bir bağımlılığı gizler. Rapor komutu olduğu gibi göstermeli.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten

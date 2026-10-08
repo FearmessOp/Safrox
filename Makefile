@@ -849,3 +849,42 @@ run-rootdies: $(ISO_ROOTDIES)
 test: run-roottest run-rootnountyped run-rootdies
 
 .PHONY: roottask run-roottest run-rootnountyped run-rootdies
+
+
+
+# ---- M12 follow-up: clippy builds the kernel too -----------------------
+#
+# `make distclean && make test` failed where a plain `make test` did
+# not, and the difference is the whole lesson.
+#
+# `test: fmt clippy run ...` runs clippy before any rule has built the
+# kernel. clippy *compiles* kernel/src/main.rs, which embeds the root
+# task image with `include_bytes!` (ADR 044). On a tree that already
+# had build/ from an earlier run the file was simply there, so the
+# missing edge was invisible. From a clean tree:
+#
+#     error: couldn't read `kernel/src/../../build/roottask.bin`
+#     make: *** [Makefile:449: clippy] Error 101
+#
+# $(KERNEL) was given this prerequisite when M12 landed; clippy was
+# not, because "the thing that builds the kernel" was read as the
+# single target named $(KERNEL). clippy builds it as well, and so
+# would `cargo check` or `cargo doc` if either were ever wired in.
+#
+# Appended rather than written into the `clippy:` rule above, and not
+# only out of K7 politeness: that rule is parsed some 320 lines before
+# ROOTTASK_BIN is defined, and make expands a prerequisite list when
+# it parses the rule. Written there it would expand to the empty
+# string -- no error, no warning, no dependency -- which is precisely
+# the silent failure recorded for $(KERNEL) a few lines above. The
+# same trap, caught a second time, in a target nobody thought to look
+# at.
+#
+# `fmt` is deliberately NOT given this prerequisite. The two were
+# measured against a tree with build/ removed: `cargo fmt --check`
+# passes, `cargo clippy` fails. rustfmt parses the source, it does not
+# expand macros, so it never reads the embedded file. Adding the edge
+# anyway would be a dependency that can never fire -- indistinguishable
+# from its own absence (ADR 023, K5) -- and would make `make fmt`, the
+# cheapest check in the tree, build the root task first.
+clippy: $(ROOTTASK_BIN)
