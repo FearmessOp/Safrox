@@ -1,0 +1,57 @@
+# The serial driver: the first user-space device driver.
+#
+# A separate crate for the reason the root task is one — the compiler
+# enforces what the design claims. This binary links against `core`
+# and the ABI and nothing else; if a line of it needed a kernel type
+# it would not build.
+#
+# It is loaded by the **root task**, not by the kernel. The kernel has
+# no ELF loader and should not have one: loading is a component's job
+# (ADR 043). So this is built to a flat image, embedded in the root
+# task's .rodata, and copied into a frame the root task maps.
+cargo-features = ["trim-paths"]
+
+[package]
+name = "serial-driver"
+version = "0.1.0"
+edition = "2021"
+description = "Safrox serial driver: the first device driver outside the kernel"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "serial-driver"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+safrox-abi = { path = "../abi" }
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = true
+codegen-units = 1
+# `s` rather than `2`: this image is embedded in the root task's
+# image, which the kernel maps into a fixed number of frames. Size is
+# the binding constraint and the driver is not on a hot path — every
+# byte it writes costs a syscall and an 87 µs UART transfer, so a few
+# cycles of code quality are invisible.
+opt-level = "s"
+lto = false
+trim-paths = "all"
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+trim-paths = "all"

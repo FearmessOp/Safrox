@@ -783,25 +783,66 @@ unsafe fn release_ipc_references(slot: &Slot) {
                 );
             }
         }
+        CapType::IoPort => {
+            // **M13, and the arm `driver-restart` turns on.**
+            //
+            // Exactly the same shape as the IrqHandler arm above, for
+            // exactly the same reason: an IoPort names authority held
+            // in a kernel-side table (ADR 045), and a capability that
+            // stops existing must hand that authority back.
+            //
+            // The consequence of forgetting is specific and would not
+            // look like a leak. The issued-range table would keep the
+            // dead driver's 0x3F8..=0x3FF entry forever, so the
+            // *replacement* driver's `Issue` would be refused with
+            // `IoPortsAlreadyOwned` — a system that cannot restart a
+            // driver it has just killed. Crash-only recovery would be
+            // a claim with a counterexample in the same milestone.
+            //
+            // SAFETY: The slot holds a live IoPort and interrupts are
+            // disabled, so no invocation can be partway through
+            // reading the range table.
+            let released = unsafe { crate::cap::ioport::release_range(slot) };
+            if released {
+                // SAFETY: As above; the object is still readable.
+                let port = unsafe { crate::cap::ioport::port_at(slot.object()) };
+                crate::println!(
+                    "[ioport] capability at {} deleted; ports \
+                     {:#06x}..={:#06x} released after {} access(es), and \
+                     may be issued again (ADR 045)",
+                    slot.object(),
+                    port.first(),
+                    port.last(),
+                    port.accesses()
+                );
+            }
+        }
         // Everything else: an object nothing in the IPC layer holds a
         // reference to. Listed rather than matched with `_` so that a
         // new CapType is a build failure here -- which is exactly how
         // the Notification arm above came to be missing.
         //
-        // That has now paid off twice. Making this match exhaustive
-        // in M9c produced `non-exhaustive patterns: CapType::IrqHandler
-        // not covered`, which is the arm directly above; adding
-        // `IrqControl` in M10 produced the same error again, and the
-        // answer that time was genuinely "nothing to do" -- IRQControl
-        // names no object and holds no reference. The value of the
-        // exhaustive match is that both conclusions had to be reached
-        // deliberately.
+        // That has now paid off three times. Making this match
+        // exhaustive in M9c produced `non-exhaustive patterns:
+        // CapType::IrqHandler not covered`, which is the arm above;
+        // adding `IrqControl` in M10 produced the same error again,
+        // and the answer that time was genuinely "nothing to do" --
+        // IRQControl names no object and holds no reference. M13
+        // produced it twice at once, and the two answers differed:
+        // `IoPortControl` has nothing to release, `IoPort` has a
+        // table entry whose loss would break `driver-restart`.
+        //
+        // The value of the exhaustive match is that all of those
+        // conclusions had to be reached deliberately. A `_ => {}`
+        // would have given the right answer for three of them and
+        // silently the wrong one for the fourth.
         CapType::Null
         | CapType::Untyped
         | CapType::CNode
         | CapType::Frame
         | CapType::PageTable
-        | CapType::IrqControl => {}
+        | CapType::IrqControl
+        | CapType::IoPortControl => {}
     }
 }
 

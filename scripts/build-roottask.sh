@@ -100,7 +100,7 @@ fi
 # linker script asserts the same bound, and they are written down
 # in both places so that a change has to be made twice on purpose
 # rather than once by accident.
-MAX=8192
+MAX=16384
 SIZE=$(stat -c %s "$OUT")
 if [ "$SIZE" -gt "$MAX" ]; then
     echo "roottask image is $SIZE bytes; the kernel maps $MAX." >&2

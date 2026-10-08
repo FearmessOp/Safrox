@@ -18,6 +18,7 @@
 pub mod boot;
 pub mod cnode;
 pub mod cptr;
+pub mod ioport;
 pub mod ipc;
 pub mod irq;
 pub mod tcb;
@@ -56,6 +57,20 @@ pub enum CapType {
     /// cannot be retyped into existence — which is why `fixed_size`
     /// returns `None` for it and `object_layout` refuses it outright.
     IrqControl = 9,
+    /// Authority to hand out I/O port ranges (M13, ADR 045).
+    ///
+    /// The second capability with **no object behind it**, and for
+    /// the same reason as [`CapType::IrqControl`]: what it names is
+    /// not memory but the right to give ranges away. There is
+    /// exactly one, created at boot.
+    IoPortControl = 10,
+    /// Access to a range of I/O ports (M13, ADR 045).
+    ///
+    /// x86's ports are not in the address space, so ADR 017's device
+    /// Untyped — which works by mapping a Frame — cannot express
+    /// them. The kernel executes `in`/`out` on the holder's behalf
+    /// after checking the range; the holder's IOPL stays 0.
+    IoPort = 11,
 }
 
 impl CapType {
@@ -75,6 +90,8 @@ impl CapType {
             7 => Some(CapType::PageTable),
             8 => Some(CapType::IrqHandler),
             9 => Some(CapType::IrqControl),
+            10 => Some(CapType::IoPortControl),
+            11 => Some(CapType::IoPort),
             _ => None,
         }
     }
@@ -92,6 +109,8 @@ impl CapType {
             CapType::PageTable => "PageTable",
             CapType::IrqHandler => "IRQHandler",
             CapType::IrqControl => "IRQControl",
+            CapType::IoPortControl => "IOPortControl",
+            CapType::IoPort => "IOPort",
         }
     }
 
@@ -105,12 +124,18 @@ impl CapType {
             CapType::Frame => Some(FRAME_SIZE),
             CapType::PageTable => Some(PAGE_TABLE_SIZE),
             CapType::IrqHandler => Some(IRQ_HANDLER_SIZE),
+            CapType::IoPort => Some(IOPORT_SIZE),
             // `Untyped` and `CNode` have a size the caller chooses;
-            // `Null` and `IrqControl` have no object at all, which is
-            // a third thing this `None` is quietly standing for. The
-            // distinction is enforced in `object_layout`, which
-            // refuses both rather than asking here.
-            CapType::Null | CapType::Untyped | CapType::CNode | CapType::IrqControl => None,
+            // `Null`, `IrqControl` and `IoPortControl` have no object
+            // at all, which is a third thing this `None` is quietly
+            // standing for. The distinction is enforced in
+            // `object_layout`, which refuses them rather than asking
+            // here.
+            CapType::Null
+            | CapType::Untyped
+            | CapType::CNode
+            | CapType::IrqControl
+            | CapType::IoPortControl => None,
         }
     }
 
@@ -165,6 +190,9 @@ pub const PAGE_TABLE_SIZE: usize = 4096;
 /// Authority over one interrupt line.
 pub const IRQ_HANDLER_SIZE: usize = 32;
 
+/// Authority over a range of I/O ports (ADR 045).
+pub const IOPORT_SIZE: usize = 32;
+
 /// One capability slot. ADR 019's derivation list lives inside it.
 pub const SLOT_SIZE: usize = 32;
 
@@ -201,6 +229,11 @@ const _: () = {
     assert!(
         IRQ_HANDLER_SIZE <= 32,
         "IRQHandler exceeds the 32-byte ceiling in ADR 017"
+    );
+    assert!(
+        IOPORT_SIZE <= 32,
+        "IOPort exceeds the 32-byte ceiling ADR 045 inherited from \
+         ADR 017's table: it holds two ports and a counter"
     );
     assert!(
         SLOT_SIZE == 32,
@@ -446,6 +479,23 @@ pub enum CapError {
     /// solved by a multiplexer that owns it.
     IrqAlreadyOwned { irq: u8 },
 
+    // ---- M13: I/O ports (ADR 045) ----
+    /// Part of the requested range already belongs to another IoPort
+    /// (ADR 045).
+    ///
+    /// The one-owner rule of ADR 041, applied to ports. Two
+    /// components driving one UART is a state with no answer to "who
+    /// set DLAB", and sharing a device is a multiplexer's job.
+    IoPortsAlreadyOwned { first: u16, last: u16 },
+    /// The port is outside the capability's range.
+    ///
+    /// **Not an authority failure in the usual sense** — the caller
+    /// holds a perfectly good IoPort capability, just not for this
+    /// port. Carrying the range it *does* cover turns "refused" into
+    /// "refused, and here is what you may reach", which is the
+    /// difference between a diagnosable error and a mystery.
+    PortNotInRange { port: u16, first: u16, last: u16 },
+
     /// Size, alignment or type combination is not valid.
     InvalidArgument,
 }
@@ -569,6 +619,20 @@ impl fmt::Display for CapError {
                  multiplexer's job -- ADR 041)",
                 irq
             ),
+            CapError::IoPortsAlreadyOwned { first, last } => write!(
+                f,
+                "IoPortsAlreadyOwned ({:#06x}..={:#06x} overlaps a range \
+                 already issued; a device has one owner, and sharing is a \
+                 user-space multiplexer's job -- ADR 045)",
+                first, last
+            ),
+            CapError::PortNotInRange { port, first, last } => write!(
+                f,
+                "PortNotInRange ({:#06x} is outside {:#06x}..={:#06x}; the \
+                 capability is live, it just does not cover this port -- \
+                 ADR 045)",
+                port, first, last
+            ),
             CapError::InvalidArgument => write!(f, "InvalidArgument"),
         }
     }
@@ -624,8 +688,8 @@ pub fn report_sizes() {
         NOTIFICATION_SIZE
     );
     println!(
-        "[cap] Frame {} B, PageTable {} B, IRQHandler {} B",
-        FRAME_SIZE, PAGE_TABLE_SIZE, IRQ_HANDLER_SIZE
+        "[cap] Frame {} B, PageTable {} B, IRQHandler {} B, IOPort {} B",
+        FRAME_SIZE, PAGE_TABLE_SIZE, IRQ_HANDLER_SIZE, IOPORT_SIZE
     );
     println!(
         "[cap] limits: retype count <= {}, derivation depth <= {}",

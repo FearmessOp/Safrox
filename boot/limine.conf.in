@@ -732,3 +732,72 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: root-dies
+
+
+/+Safrox (M13: the serial driver is a component)
+    comment: The milestone. Every log line from M0 to M12 was written
+    comment: by the kernel's own 16550A driver; that code is now a
+    comment: user component holding three capabilities -- an IOPort
+    comment: for 0x3F8..=0x3FF, an IRQHandler for line 4, and an
+    comment: Endpoint. A third component sends it bytes and they reach
+    comment: the wire by a path the kernel never touches.
+    comment: The kernel drives zero peripheral devices. What it still
+    comment: touches is counted and named: LAPIC (the scheduler's
+    comment: clock), I/O APIC (routing), the 8259 (masked once), and
+    comment: isa-debug-exit (the test harness's way out). COM1 remains
+    comment: as an emergency console -- two registers, no
+    comment: configuration while a driver owns it (ADR 046).
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: driver-test
+
+/+Safrox (M13: the driver dies)
+    comment: The driver's capabilities are revoked while it runs, and
+    comment: the system stays up. This is the claim the architecture
+    comment: exists to make and the one that is hardest to believe
+    comment: without seeing: in a monolithic kernel this is not a test
+    comment: but a panic.
+    comment: What makes it work is nothing the driver does. Its
+    comment: authority was three capabilities; when they stopped
+    comment: existing, so did it. IRQ 4 is released and masked by
+    comment: `release_line`, the port window by `release_range`, and
+    comment: both run from `delete`'s own path -- so forgetting them
+    comment: is not possible the way forgetting a cleanup call is.
+    comment: Exit 33: a dead component is not a kernel fault.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: driver-dies
+
+/+Safrox (M13: a driver is replaced)
+    comment: After the first driver dies, the root task builds a
+    comment: second from the same image and derives fresh
+    comment: capabilities for the same hardware. Crash-only recovery:
+    comment: nothing is repaired, and the replacement's objects are
+    comment: new ones.
+    comment: The client never learns anything happened, because it
+    comment: holds a capability for the *Endpoint* rather than for
+    comment: the driver -- and the Endpoint belongs to the root task,
+    comment: so it outlived both. A client bound to its server would
+    comment: have had to be told.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: driver-restart
+
+/+Safrox (M13: a component with no authority)
+    comment: A component holding only an Endpoint tries to write to
+    comment: COM1, claim IRQ 4, and issue itself a port range. All
+    comment: three are refused.
+    comment: This is a different claim from the driver's range check,
+    comment: which is why it is a separate scenario: that one asks
+    comment: whether a capability's range binds its holder, this one
+    comment: whether a component with no capability can reach the
+    comment: hardware anyway. The answers come back as EmptySlot --
+    comment: a component cannot *name* what it was never given
+    comment: (ADR 018), so the isolation is structural rather than
+    comment: enforced.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: driver-hostile

@@ -84,6 +84,14 @@ pub struct BootInfo {
     pub untyped_first_slot: u32,
 
     /// Where the one IRQControl capability is (ADR 041).
+    ///
+    /// M13's IOPortControl is the obvious neighbour for this field
+    /// and is deliberately **not** here: it is appended at the end of
+    /// the struct, past `lost_bytes`. Inserting it would shift every
+    /// field below, and a root task built against the old layout
+    /// would go on reading the old offsets — getting
+    /// `root_cnode_slot` where it expected its own TCB. The rule for
+    /// struct offsets is the rule for method numbers.
     pub irq_control_slot: u32,
     /// The root task's own CNode, named within its own CSpace.
     ///
@@ -142,6 +150,63 @@ pub struct BootInfo {
     /// which is precisely the unfalsifiable arithmetic ADR 044
     /// refused.
     pub lost_bytes: u64,
+
+    /// Leaf index of the one IOPortControl capability (M13, ADR 045).
+    ///
+    /// Appended at the end, after [`lost_bytes`](Self::lost_bytes),
+    /// because every field above it is already an ABI. `header_size`
+    /// is what lets an older root task notice it is reading a newer
+    /// header and skip to the descriptors correctly.
+    ///
+    /// Authority to hand out I/O port ranges. One exists, created at
+    /// boot; nothing can retype a second, which is what makes the
+    /// range table's one-owner rule meaningful.
+    pub ioport_control_slot: u32,
+
+    /// Which acceptance scenario the kernel was started for.
+    ///
+    /// Zero means the ordinary one. M13's negatives need the root
+    /// task to behave differently — kill its driver, start a second,
+    /// hand a component authority it should not have — and the root
+    /// task is a separate binary with no other way to be told.
+    ///
+    /// **This is a test affordance and is written down as one.** The
+    /// alternative was four root-task images selected at build time,
+    /// which would mean four things to keep in step and three of them
+    /// exercised only by one scenario each. One image that branches
+    /// is less code and, more importantly, makes the common path the
+    /// one every scenario runs through.
+    ///
+    /// It also happens to occupy the padding `#[repr(C)]` would have
+    /// inserted here anyway, so it costs nothing — but it is named
+    /// rather than left as `reserved`, because a reserved field
+    /// quietly given a meaning is how an ABI stops being one.
+    pub scenario: u32,
+}
+
+/// Values for [`BootInfo::scenario`].
+///
+/// **Zero keeps M12's meaning**, and that was a correction rather
+/// than a first instinct. The obvious numbering made the new
+/// milestone's scenario the default, which would have changed what
+/// an unmodified root task does — and M12's bootstrap protocol is
+/// something this milestone is supposed to leave alone. A new field
+/// whose zero value means "behave as before" is the only kind that
+/// can be added to a live ABI without reading every caller.
+pub mod scenario {
+    /// M12's: build two children and let them exchange a message.
+    ///
+    /// The default, because it is what a root task did before this
+    /// field existed.
+    pub const ROOT_TEST: u32 = 0;
+    /// Build a serial driver and a client and let them talk.
+    pub const DRIVER_TEST: u32 = 1;
+    /// Build a driver, then revoke it and show the system survives.
+    pub const DRIVER_DIES: u32 = 2;
+    /// As [`DRIVER_DIES`], then build a second driver in its place.
+    pub const DRIVER_RESTART: u32 = 3;
+    /// Give a component no port or IRQ authority and watch it try.
+    pub const DRIVER_HOSTILE: u32 = 4;
 }
 
 /// One Untyped the root task holds. 16 bytes.
@@ -245,6 +310,50 @@ pub mod method {
     ///
     /// Rights may be narrowed but never widened (ADR 021).
     pub const COPY: u64 = 17;
+
+    // ---- M13: the first user-space driver (ADR 045) ----
+    //
+    // Appended, as every block before them was. A component that has
+    // learned what 17 means must keep being right about it.
+    /// `IRQControl.Get`: claim an interrupt line (ADR 041).
+    ///
+    /// **M10 built this and never opened it**, the same shape as
+    /// `Send` in M12 and `CreateVSpace` in M11: a function that took
+    /// capabilities, checked rights, and had no door. M13 needs it,
+    /// because the driver is a component and its line has to be
+    /// claimed from ring 3.
+    pub const IRQ_CONTROL_GET: u64 = 18;
+    /// `IRQHandler.SetNotification`: where this line's interrupts go.
+    pub const IRQ_SET_NOTIFICATION: u64 = 19;
+    /// `IRQHandler.Ack`: the driver is finished; reopen the line.
+    pub const IRQ_ACK: u64 = 20;
+    /// `IOPortControl.Issue`: carve out a port range (ADR 045).
+    pub const IOPORT_ISSUE: u64 = 21;
+    /// `IOPort.In8`: read a byte from a port in range.
+    pub const IOPORT_IN8: u64 = 22;
+    /// `IOPort.Out8`: write a byte to a port in range.
+    pub const IOPORT_OUT8: u64 = 23;
+    /// `Notification.Bind`: deliver this Notification's signals to a
+    /// thread even while it waits on an Endpoint (ADR 038).
+    ///
+    /// What makes a driver able to wait for **both** a client request
+    /// and its device at once, which is the shape every driver has.
+    pub const NOTIFICATION_BIND: u64 = 24;
+    /// `TCB.Suspend`: stop a thread without destroying it.
+    ///
+    /// Needed by `driver-dies`: a TCB cannot be revoked while the
+    /// scheduler holds it (ADR 026), so killing a driver is suspend
+    /// then revoke.
+    pub const TCB_SUSPEND: u64 = 25;
+    /// `CNode.Revoke`: delete every capability derived from this one.
+    ///
+    /// The invocation `driver-dies` and `driver-restart` turn on.
+    /// Targets the **CNode** holding the capability, with the index
+    /// as an argument, for the reason `Mint` does: the authority to
+    /// revoke lives where the capability lives.
+    pub const CNODE_REVOKE: u64 = 26;
+    /// `CNode.Delete`: remove one capability.
+    pub const CNODE_DELETE: u64 = 27;
 }
 
 /// Object types, as `Retype` names them.
@@ -268,6 +377,16 @@ pub mod cap_type {
     pub const FRAME: u64 = 6;
     /// A page table, at any level.
     pub const PAGE_TABLE: u64 = 7;
+    // There is deliberately no `IRQ_HANDLER` or `IO_PORT` here.
+    //
+    // Both objects exist and both have a size, so `retype` *could*
+    // produce them — which is exactly why their absence is written
+    // down rather than left to the reader. An IRQHandler comes from
+    // `IRQControl.Get` and an IOPort from `IOPortControl.Issue`,
+    // because what they name is a line and a port range rather than
+    // memory. One conjured from an Untyped would name nothing, and
+    // the one-owner rule would have been bypassed rather than
+    // enforced (ADR 041, ADR 045).
 }
 
 /// Mapping permissions (ADR 032).
@@ -355,6 +474,17 @@ pub mod error {
     pub const IRQ_ALREADY_OWNED: u64 = 29;
     /// **A kernel-wide pool ran out**, not the caller's budget.
     pub const NO_KERNEL_STACK: u64 = 30;
+    /// Part of the requested port range already has an owner
+    /// (M13, ADR 045).
+    pub const IO_PORTS_ALREADY_OWNED: u64 = 31;
+    /// The port is outside this capability's range (M13, ADR 045).
+    ///
+    /// **Scenario 5's error code.** Distinct from
+    /// [`INSUFFICIENT_RIGHTS`]: the caller holds a perfectly good
+    /// IOPort capability with the right bits, it simply does not
+    /// cover the port asked for. Collapsing the two would make the
+    /// test unable to say which guard refused it.
+    pub const PORT_NOT_IN_RANGE: u64 = 32;
 }
 
 /// Whether a returned value encodes an error.

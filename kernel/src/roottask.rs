@@ -63,7 +63,17 @@ static ROOT_TASK_IMAGE: &[u8] = include_bytes!("../../build/roottask.bin");
 ///
 /// Checked against the real size below, so the constant cannot drift
 /// away from the file.
-const ROOT_CODE_PAGES: usize = 2;
+/// **Four from M13**, and the increase is a real one rather than
+/// headroom. The root task now embeds the serial driver's flat image
+/// in its own `.rodata` (`include_bytes!`), because the kernel has
+/// no ELF loader and must not grow one — loading is a component's
+/// job (ADR 043), so the component that loads the driver has to
+/// carry it.
+///
+/// Two pages failed the link, which is the guard working: the
+/// message named the limit rather than producing a program with its
+/// tail missing.
+const ROOT_CODE_PAGES: usize = 4;
 
 const _: () = assert!(
     ROOT_CODE_PAGES * 4096 >= 7432,
@@ -108,6 +118,11 @@ const SLOT_OWN_TCB: usize = 1;
 const SLOT_OWN_VSPACE: usize = 2;
 /// The one IRQControl (ADR 041).
 const SLOT_IRQ_CONTROL: usize = 3;
+/// The one IOPortControl (M13, ADR 045).
+///
+/// Slot 4: 0..3 are taken and the Untypeds start at 8, so the gap
+/// was left for exactly this.
+const SLOT_IOPORT_CONTROL: usize = 4;
 /// First slot of the handed-over Untypeds. They are consecutive.
 const SLOT_UNTYPED_FIRST: usize = 8;
 
@@ -575,6 +590,7 @@ pub unsafe fn start() {
     // be a root task the kernel could still outvote.
     let untyped_count = hand_over_untypeds(&leaf);
     hand_over_irq_control(&leaf);
+    hand_over_ioport_control(&leaf);
 
     // ---- 3. Its address space ----------------------------------------
     let (code_frames, bootinfo_frame) = build_address_space(parent, &cnode, &leaf);
@@ -729,6 +745,37 @@ fn hand_over_irq_control(leaf: &CNode) {
         let dest = leaf.slot(SLOT_IRQ_CONTROL);
         cnode::copy(source, dest, source.rights())
             .expect("could not hand IRQControl to the root task");
+    }
+}
+
+/// Copy the IOPortControl capability into the root task's leaf.
+///
+/// **The capability that makes M13 possible**, and the pair to
+/// `hand_over_irq_control` above: a serial driver needs both a line
+/// and a port range, and after this the kernel holds neither
+/// exclusively — it keeps a copy it uses for nothing but the
+/// emergency console's two registers (ADR 046).
+///
+/// `copy` rather than a move, because the capability is seeded as a
+/// root in the kernel's own CSpace and that root is what the
+/// derivation list hangs from. Handing the original over would leave
+/// the kernel's slot empty and the root task's capability parentless.
+fn hand_over_ioport_control(leaf: &CNode) {
+    note_privileged_op("hand over IOPortControl");
+    let objects = object_cnode();
+    // SAFETY: boot seeded this slot with the one IOPortControl.
+    let source = unsafe { objects.slot(boot::IOPORT_CONTROL_SLOT) };
+    assert_eq!(
+        source.cap_type(),
+        CapType::IoPortControl,
+        "object slot {} does not hold the IOPortControl capability",
+        boot::IOPORT_CONTROL_SLOT
+    );
+    // SAFETY: Both slots live and distinct.
+    unsafe {
+        let dest = leaf.slot(SLOT_IOPORT_CONTROL);
+        cnode::copy(source, dest, source.rights())
+            .expect("could not hand IOPortControl to the root task");
     }
 }
 
@@ -1031,6 +1078,11 @@ fn write_boot_info(frame: ObjectRef, untyped_count: u32, accounting: &Accounting
         untyped_count,
         untyped_first_slot: SLOT_UNTYPED_FIRST as u32,
         irq_control_slot: SLOT_IRQ_CONTROL as u32,
+        ioport_control_slot: SLOT_IOPORT_CONTROL as u32,
+        // Which scenario this boot is for (M13). Zero is M12's
+        // behaviour, so this field changes nothing unless a test
+        // asks it to.
+        scenario: crate::roottest::scenario(),
         root_cnode_slot: SLOT_OWN_CNODE as u32,
         tcb_slot: SLOT_OWN_TCB as u32,
         vspace_slot: SLOT_OWN_VSPACE as u32,

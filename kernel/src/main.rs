@@ -55,6 +55,8 @@ mod apic;
 mod cap;
 mod captest;
 mod cpu;
+mod drivertest;
+mod emergency;
 mod faults;
 mod gdt;
 mod heaptest;
@@ -71,7 +73,6 @@ mod qemu;
 mod roottask;
 mod roottest;
 mod sched;
-mod serial;
 mod syscall;
 mod threadtest;
 mod usertest;
@@ -198,14 +199,22 @@ fn linker_symbol(symbol: &'static u8) -> u64 {
 /// `no_mangle` so the linker script can find it by name.
 #[unsafe(no_mangle)]
 pub extern "C" fn kstart() -> ! {
-    // Serial first: without it there is no way to report anything at all,
-    // including a failure to bring up serial.
-    let uart_ok = serial::init();
+    // The emergency console first: without it there is no way to
+    // report anything at all, including a failure to bring it up.
+    //
+    // **This is the one place the kernel configures a UART while the
+    // system is healthy** (ADR 046, state 1), and the reason is that
+    // there is nobody to ask. A driver is a component, components are
+    // built by the root task, and the root task has not started. From
+    // here until a panic, the kernel touches LSR and THR and nothing
+    // else.
+    let uart_ok = emergency::init();
 
     println!();
     println!("{} {}", KERNEL_NAME, KERNEL_VERSION);
     println!(
-        "[boot] serial: COM1 115200 8N1 ({})",
+        "[boot] emergency console: COM1 115200 8N1 ({}); the serial \
+         *driver* is a user component (ADR 045)",
         if uart_ok {
             "self-test ok"
         } else {
@@ -213,11 +222,11 @@ pub extern "C" fn kstart() -> ! {
         }
     );
     // `ready()` must agree with what `init()` just told us; if it does not,
-    // the driver's state tracking is broken and later code cannot trust it.
+    // the console's state tracking is broken and later code cannot trust it.
     assert_eq!(
-        serial::ready(),
+        emergency::ready(),
         uart_ok,
-        "serial readiness flag disagrees with init() result"
+        "console readiness flag disagrees with init() result"
     );
 
     // If the bootloader did not honour the revision we asked for, every
@@ -1034,9 +1043,36 @@ extern "C" fn kmain() -> ! {
     // So the root task runs when a root scenario asked for it, and
     // the "no scenario" boot — `make run` — gets it too, because
     // that one is the real system rather than a test of it.
+    // M13's four scenarios need the root task too, and they need it
+    // told *which* one — the root task is a separate binary and
+    // BootInfo is the only channel (ADR 044). Selected before
+    // `start`, because `start` is what writes the field.
+    //
+    // `driver-dies` and `driver-restart` are checked before
+    // `driver-test`, and `driver-restart` before `driver-dies`:
+    // `contains` does not care about word boundaries, so the longer
+    // token has to win. That is the lesson M9c paid for and M12
+    // repeated.
+    let driver_scenario = if cmdline.contains("driver-restart") {
+        Some(safrox_abi::scenario::DRIVER_RESTART)
+    } else if cmdline.contains("driver-hostile") {
+        Some(safrox_abi::scenario::DRIVER_HOSTILE)
+    } else if cmdline.contains("driver-dies") {
+        Some(safrox_abi::scenario::DRIVER_DIES)
+    } else if cmdline.contains("driver-test") {
+        Some(safrox_abi::scenario::DRIVER_TEST)
+    } else {
+        None
+    };
+
+    if let Some(which) = driver_scenario {
+        roottest::select_scenario(which);
+    }
+
     let wants_root_task = cmdline.contains("root-test")
         || cmdline.contains("root-no-untyped")
         || cmdline.contains("root-dies")
+        || driver_scenario.is_some()
         || cmdline.is_empty();
 
     if wants_root_task {
@@ -1062,6 +1098,27 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("root-test") {
         println!("[boot] cmdline requested the root task tests");
         roottest::run();
+    }
+
+    // M13. Same ordering discipline as above: longer tokens first.
+    if cmdline.contains("driver-restart") {
+        println!("[boot] cmdline requested the driver-restart test");
+        drivertest::run_restart();
+    }
+
+    if cmdline.contains("driver-hostile") {
+        println!("[boot] cmdline requested the hostile-component test");
+        drivertest::run_hostile();
+    }
+
+    if cmdline.contains("driver-dies") {
+        println!("[boot] cmdline requested the dead-driver test");
+        drivertest::run_dies();
+    }
+
+    if cmdline.contains("driver-test") {
+        println!("[boot] cmdline requested the serial driver tests");
+        drivertest::run();
     }
 
     println!("[boot] M9a checks passed");

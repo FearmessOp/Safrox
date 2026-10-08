@@ -255,6 +255,9 @@ fn encode_error(error: CapError) -> u64 {
         // spent, the other that a kernel-wide pool is. See
         // `CapError::NoKernelStack`.
         CapError::NoKernelStack { .. } => 30,
+        // M13. Appended, as every block above was.
+        CapError::IoPortsAlreadyOwned { .. } => 31,
+        CapError::PortNotInRange { .. } => 32,
     };
     ERROR_FLAG | code
 }
@@ -463,6 +466,85 @@ pub enum Method {
     /// minted. Giving a capability away without altering it is the
     /// common case; attaching an identity to it is the special one.
     Copy = 17,
+
+    // ---- M13: the first user-space driver (ADR 045, ADR 047) ----
+    //
+    // Ten invocations. **Three of them are doors onto code M10
+    // already wrote** — `IRQControl.Get`, `SetNotification` and `Ack`
+    // have taken capabilities and checked rights since M10 and have
+    // never been reachable from ring 3. The same shape as `Send` in
+    // M12 and `CreateVSpace` in M11, and by now the pattern is worth
+    // naming: a mechanism built inside the kernel and exercised only
+    // by kernel tests looks finished and is not, because the thing
+    // it exists for cannot reach it.
+    /// `IRQControl.Get`: claim an interrupt line (ADR 041).
+    ///
+    /// Target: the IRQControl capability. Arguments: the line, the
+    /// Untyped to carve the handler from, the destination CNode and
+    /// the index within it.
+    IrqControlGet = 18,
+
+    /// `IRQHandler.SetNotification`: where this line's interrupts go.
+    ///
+    /// Target: the IRQHandler. Argument: a Notification CPtr.
+    IrqSetNotification = 19,
+
+    /// `IRQHandler.Ack`: the driver is finished; reopen the line.
+    ///
+    /// **The kernel does not know when this should be called**
+    /// (ADR 042) — the driver reads its device's status register and
+    /// decides. That is why this is an invocation rather than
+    /// something the interrupt path does on the driver's behalf.
+    IrqAck = 20,
+
+    /// `IOPortControl.Issue`: carve out a port range (ADR 045).
+    ///
+    /// Target: the IOPortControl. Arguments: the first and last
+    /// ports packed into one word, the Untyped, the destination
+    /// CNode, the index.
+    ///
+    /// The two ports share a register for `Retype`'s reason: they
+    /// are one answer, not two — a range is meaningless with either
+    /// end missing — and neither is an address.
+    IoPortIssue = 21,
+
+    /// `IOPort.In8`: read a byte from a port in range.
+    ///
+    /// Returns the byte. It cannot collide with the error encoding:
+    /// a byte is eight bits and `ERROR_FLAG` is bit 63 — the same
+    /// argument `Wait` and `Recv` make about badges.
+    IoPortIn8 = 22,
+
+    /// `IOPort.Out8`: write a byte to a port in range.
+    IoPortOut8 = 23,
+
+    /// `Notification.Bind`: tie a Notification to a thread (ADR 038).
+    ///
+    /// **M9c built bound waiting and M13 is its first real user.**
+    /// A driver has to wait for a client request *and* its device at
+    /// the same time; without binding it would have to choose, and
+    /// either choice makes it deaf to the other.
+    ///
+    /// Target: the Notification. Argument: a TCB CPtr.
+    NotificationBind = 24,
+
+    /// `TCB.Suspend`: stop a thread without destroying it.
+    ///
+    /// ADR 026 refuses to revoke a TCB the scheduler is holding, so
+    /// killing a component is two steps. That refusal is right — the
+    /// alternative is tearing down a thread whose registers the CPU
+    /// is using — and it means `driver-dies` has to suspend first.
+    TcbSuspend = 25,
+
+    /// `CNode.Revoke`: delete every capability derived from one.
+    ///
+    /// Target: the CNode holding it; argument: the index. The
+    /// authority to revoke lives where the capability lives, which
+    /// is `Mint`'s arrangement and for the same reason.
+    CNodeRevoke = 26,
+
+    /// `CNode.Delete`: remove one capability.
+    CNodeDelete = 27,
 }
 
 impl Method {
@@ -485,6 +567,16 @@ impl Method {
             15 => Some(Method::Recv),
             16 => Some(Method::Mint),
             17 => Some(Method::Copy),
+            18 => Some(Method::IrqControlGet),
+            19 => Some(Method::IrqSetNotification),
+            20 => Some(Method::IrqAck),
+            21 => Some(Method::IoPortIssue),
+            22 => Some(Method::IoPortIn8),
+            23 => Some(Method::IoPortOut8),
+            24 => Some(Method::NotificationBind),
+            25 => Some(Method::TcbSuspend),
+            26 => Some(Method::CNodeRevoke),
+            27 => Some(Method::CNodeDelete),
             _ => None,
         }
     }
@@ -508,6 +600,16 @@ impl Method {
             Method::Recv => "Endpoint.Recv",
             Method::Mint => "CNode.Mint",
             Method::Copy => "CNode.Copy",
+            Method::IrqControlGet => "IRQControl.Get",
+            Method::IrqSetNotification => "IRQHandler.SetNotification",
+            Method::IrqAck => "IRQHandler.Ack",
+            Method::IoPortIssue => "IOPortControl.Issue",
+            Method::IoPortIn8 => "IOPort.In8",
+            Method::IoPortOut8 => "IOPort.Out8",
+            Method::NotificationBind => "Notification.Bind",
+            Method::TcbSuspend => "TCB.Suspend",
+            Method::CNodeRevoke => "CNode.Revoke",
+            Method::CNodeDelete => "CNode.Delete",
         }
     }
 
@@ -539,6 +641,18 @@ impl Method {
             Method::SetUserRegisters => Some(CapType::Tcb),
             Method::Send | Method::Recv => Some(CapType::Endpoint),
             Method::Mint | Method::Copy => Some(CapType::CNode),
+            Method::IrqControlGet => Some(CapType::IrqControl),
+            Method::IrqSetNotification | Method::IrqAck => Some(CapType::IrqHandler),
+            Method::IoPortIssue => Some(CapType::IoPortControl),
+            Method::IoPortIn8 | Method::IoPortOut8 => Some(CapType::IoPort),
+            Method::NotificationBind => Some(CapType::Notification),
+            Method::TcbSuspend => Some(CapType::Tcb),
+            // Both target the CNode that *holds* the capability, not
+            // the capability itself — so that the authority to
+            // destroy lives in the same place as the authority to
+            // hand out (`Mint`). A component holding a capability but
+            // not its CNode can use it and cannot revoke it.
+            Method::CNodeRevoke | Method::CNodeDelete => Some(CapType::CNode),
             Method::Echo => None,
         }
     }
@@ -713,6 +827,7 @@ fn dispatch(
         if !crate::usertest::record_forge_result(cptr_bits, arg0)
             && !crate::irqtest::record_user_report(cptr_bits, arg0)
             && !crate::vspaceuser::record_step(cptr_bits, arg0)
+            && !crate::drivertest::record_step(cptr_bits, arg0)
             && !crate::roottest::record_step(cptr_bits, arg0)
         {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);
@@ -1038,27 +1153,46 @@ fn dispatch(
             Ok(0)
         }
         Method::Recv => {
-            // Also blocks. Returns the **badge** of the capability
-            // the sender used (ADR 037), which is how a server tells
-            // its clients apart without trusting them.
+            // Also blocks. Returns **the badge in the low 32 bits
+            // and the message label above them** (ADR 047).
             //
-            // The message words are not returned. They live in the
-            // IPC buffer, which is inside the TCB and not mapped
-            // into any component's address space — so there is
-            // nowhere for a component to read them from yet. The
-            // badge fits in a register and a component can act on
-            // it, which is enough for "the two talked"; the words
-            // need the buffer mapped, and that is M13.
+            // M12 returned the badge alone and left a note saying
+            // the words needed the IPC buffer mapped, which is
+            // M13's problem. M13 looked at it and did not map the
+            // buffer: that reopens ADR 034, and the thing actually
+            // needed was far smaller.
+            //
+            // A driver needs to know **who** is asking and **what**
+            // they want. The badge answers the first and cannot
+            // answer the second — it is fixed when the capability
+            // is minted (ADR 037), so a client cannot vary it per
+            // message, and that immutability is exactly its value.
+            // The label is the one field a sender chooses, so it
+            // carries the request.
+            //
+            // The split is the protocol's whole shape: what the
+            // client can choose is data, what it cannot is
+            // identity. A server may distrust the label freely — a
+            // malformed one spoils only that request — while
+            // trusting the badge completely.
+            //
+            // Both fit, and the packing cannot collide with the
+            // error encoding: a badge is 32 bits, a label is 32,
+            // and ERROR_FLAG is bit 63. The label is masked to 31
+            // bits so the top bit stays clear.
             //
             // SAFETY: `resolve_typed` established the slot holds a
             // live Endpoint, and nothing else borrows the current
             // TCB on this path.
             let delivery = unsafe { crate::cap::ipc::recv(slot) }?;
 
-            // The badge cannot collide with the error encoding: it
-            // is 32 bits (ADR 037) and ERROR_FLAG is bit 63. The
-            // same argument `Wait` makes.
-            Ok(delivery.badge as u64)
+            // The label out of the tag, where ADR 034 put it and
+            // where the kernel has never read it — "the application's
+            // own opcode" is the tag's own description of the field.
+            // Returning it does not make the kernel interpret it; it
+            // makes it *reachable*, which it was not.
+            let label = (delivery.tag.label() as u64) & 0x7FFF_FFFF;
+            Ok((delivery.badge as u64) | (label << 32))
         }
 
         Method::Mint | Method::Copy => {
@@ -1098,6 +1232,171 @@ fn dispatch(
         }
 
         // Handled above, before the capability was resolved.
+        // ---- M13: interrupts and ports, from ring 3 ----------------
+        //
+        // The first three arms call M10 functions unchanged, which is
+        // ADR 043's dividend collected a second time: they were
+        // written to take capabilities and check rights, so opening
+        // them is a resolution layer and nothing more.
+        Method::IrqControlGet => {
+            // RDI the IRQControl, RDX the line, R10 the Untyped,
+            // R8 the destination CNode, R9 the index.
+            let irq = u8::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+            let offset = usize::try_from(args.arg3).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: The target holds an IRQControl and these must
+            // hold an Untyped and a CNode, so all three are distinct
+            // slots — a slot has one type.
+            let untyped = unsafe { resolve_aux(&space, args.arg1, CapType::Untyped) }?;
+            // SAFETY: As above.
+            let dest_slot = unsafe { resolve_aux(&space, args.arg2, CapType::CNode) }?;
+            // SAFETY: The capability says how many slots the object
+            // has, and resolution established it is a live CNode.
+            let dest = unsafe {
+                crate::cap::cnode::CNode::new(dest_slot.object().0, dest_slot.as_radix())
+            };
+
+            // SAFETY: All three slots are live and of the required
+            // types, hence distinct.
+            unsafe { crate::cap::irq::irq_control_get(slot, irq, untyped, &dest, offset) }?;
+            Ok(0)
+        }
+        Method::IrqSetNotification => {
+            // SAFETY: The target holds an IRQHandler and this must
+            // hold a Notification: distinct types, distinct slots.
+            let ntfn = unsafe { resolve_aux(&space, args.arg0, CapType::Notification) }?;
+            // SAFETY: Both slots live and of the required types.
+            unsafe { crate::cap::irq::set_notification(slot, ntfn) }?;
+            Ok(0)
+        }
+        Method::IrqAck => {
+            // SAFETY: `resolve_typed` established a live IRQHandler.
+            unsafe { crate::cap::irq::ack(slot) }?;
+            Ok(0)
+        }
+
+        Method::IoPortIssue => {
+            // RDI the IOPortControl, RDX the range, R10 the Untyped,
+            // R8 the destination CNode, R9 the index.
+            //
+            // Both ports in one word for `Retype`'s reason: a range
+            // is one answer rather than two, meaningless with either
+            // end missing, and neither end is an address.
+            let first = (args.arg0 & 0xFFFF) as u16;
+            let last = ((args.arg0 >> 16) & 0xFFFF) as u16;
+            // Anything above bit 32 is a caller who thinks this
+            // argument means something else. Refusing beats
+            // truncating silently.
+            if args.arg0 >> 32 != 0 {
+                return Err(CapError::InvalidArgument);
+            }
+            let offset = usize::try_from(args.arg3).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: Three required types — IOPortControl for the
+            // target, Untyped here, CNode below — and a slot has one
+            // type, so the three references cannot name one slot.
+            let untyped = unsafe { resolve_aux(&space, args.arg1, CapType::Untyped) }?;
+            // SAFETY: As above.
+            let dest_slot = unsafe { resolve_aux(&space, args.arg2, CapType::CNode) }?;
+            // SAFETY: Resolution established a live CNode with this
+            // radix.
+            let dest = unsafe {
+                crate::cap::cnode::CNode::new(dest_slot.object().0, dest_slot.as_radix())
+            };
+
+            // SAFETY: All three live and distinct, as argued above.
+            unsafe { crate::cap::ioport::issue(slot, first, last, untyped, &dest, offset) }?;
+            Ok(0)
+        }
+        Method::IoPortIn8 => {
+            let port = u16::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+            // SAFETY: `resolve_typed` established a live IoPort.
+            let value = unsafe { crate::cap::ioport::in8(slot, port) }?;
+            // Eight bits cannot collide with ERROR_FLAG at bit 63 —
+            // the argument `Wait` and `Recv` make about badges.
+            Ok(value as u64)
+        }
+        Method::IoPortOut8 => {
+            let port = u16::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+            let value = (args.arg1 & 0xFF) as u8;
+            // SAFETY: As above.
+            unsafe { crate::cap::ioport::out8(slot, port, value) }?;
+            Ok(0)
+        }
+
+        Method::NotificationBind => {
+            // SAFETY: The target holds a Notification and this must
+            // hold a TCB: distinct types, distinct slots.
+            let tcb_slot = unsafe { resolve_aux(&space, args.arg0, CapType::Tcb) }?;
+            // SAFETY: Both slots live and of the required types.
+            // `bind_notification` takes the TCB first and refuses a
+            // Notification that is already bound, or a thread that
+            // already has one (ADR 038).
+            unsafe { crate::cap::ipc::bind_notification(tcb_slot, slot) }?;
+            Ok(0)
+        }
+
+        Method::TcbSuspend => {
+            // SAFETY: `resolve_typed` established a live TCB.
+            let thread = unsafe { tcb::from_slot(slot) }?;
+            // **Infallible**, and that is the point of calling it
+            // here rather than making the caller check first.
+            // ADR 026 refuses to *revoke* a running thread, so
+            // killing a component is suspend-then-revoke — and the
+            // suspend half must not be the thing that fails, or the
+            // sequence would have no guaranteed first step.
+            //
+            // SAFETY: `thread` is that live TCB, and suspending the
+            // current thread is handled inside (it switches away).
+            unsafe {
+                crate::sched::suspend(thread);
+            }
+            Ok(0)
+        }
+
+        Method::CNodeRevoke | Method::CNodeDelete => {
+            // RDI the CNode, RDX the index within it.
+            //
+            // The target is the CNode rather than the capability,
+            // which is `Mint`'s arrangement and has `Mint`'s reason:
+            // the authority to destroy belongs where the authority
+            // to hand out belongs. A component given a capability
+            // but not its CNode can use it and cannot revoke it —
+            // which is exactly what lets the root task kill a driver
+            // that cannot kill itself.
+            let index = usize::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+
+            // SAFETY: Resolution established a live CNode with this
+            // radix.
+            let cnode = unsafe { crate::cap::cnode::CNode::new(slot.object().0, slot.as_radix()) };
+            if index >= cnode.len() {
+                return Err(CapError::CPtrOutOfRange);
+            }
+            // SAFETY: Index checked immediately above.
+            let target = unsafe { cnode.slot(index) };
+
+            // SAFETY: The slot is inside a live CNode; both calls
+            // report an empty slot as `EmptySlot` rather than
+            // touching it.
+            unsafe {
+                match method {
+                    Method::CNodeRevoke => {
+                        let report = crate::cap::cnode::revoke(target)?;
+                        // How many capabilities died. The caller is
+                        // entitled to the figure: `driver-dies`
+                        // asserts it is non-zero, which is the
+                        // difference between "revoke ran" and
+                        // "revoke did something".
+                        Ok(report.deleted as u64)
+                    }
+                    _ => {
+                        crate::cap::cnode::delete(target)?;
+                        Ok(0)
+                    }
+                }
+            }
+        }
+
         Method::Echo => unreachable!("Echo is handled before resolution"),
     }
 }
@@ -1266,10 +1565,23 @@ fn decode_retype_target(bits: u64) -> Result<CapType, CapError> {
         // chance.
         CapType::IrqHandler => Err(CapError::InvalidArgument),
 
-        // The one capability naming no object at all. There is
-        // exactly one, created at boot; `object_layout` would refuse
-        // it anyway, and saying so here makes the reason visible.
-        CapType::IrqControl => Err(CapError::InvalidArgument),
+        // The capabilities naming no object at all. There is exactly
+        // one of each, created at boot; `object_layout` would refuse
+        // them anyway, and saying so here makes the reason visible.
+        CapType::IrqControl | CapType::IoPortControl => Err(CapError::InvalidArgument),
+
+        // An IOPort comes from `IOPortControl.Issue` and nowhere
+        // else (ADR 045), for the reason the IRQHandler arm gives.
+        //
+        // The refusal is **not** redundant with `object_layout`,
+        // which would happily make one: an IoPort has a size, so
+        // retype can produce the 32 bytes. What it cannot produce is
+        // the *range*, and an IoPort with `first == last == 0` would
+        // be a capability for port 0 that the overlap table has
+        // never heard of — authority created without passing the
+        // one-owner check. Written here because this is where a
+        // caller could ask for it.
+        CapType::IoPort => Err(CapError::InvalidArgument),
     }
 }
 
@@ -1302,6 +1614,34 @@ pub fn entry_address() -> u64 {
 // RIP-relative addressing for both statics, so no general register is
 // spent before they have been saved. See ADR 030 on why this is not
 // `swapgs`.
+//
+// # SAVED_USER_RSP is a handoff, not storage
+//
+// The static is written at step 1 and read at step 2, and **those two
+// instructions are the whole of its lifetime**. In between, IF is
+// clear and nothing else can run.
+//
+// The return path must not touch it, and for a reason that took a
+// #PF in ring 3 to find. A syscall that blocks -- `Send` waiting for
+// a receiver (ADR 033), `Recv` waiting for a sender -- returns from
+// `syscall_dispatch` on the far side of a context switch, after
+// other threads have entered the kernel and overwritten the static
+// with their own stack pointers. The thread would then `sysret` onto
+// a stack belonging to whichever thread made a syscall most
+// recently.
+//
+// This was latent from M9 until M13. Every program that blocked
+// before now was hand-assembled and spun immediately afterwards, so
+// a wrong RSP was never dereferenced; the root task is the first
+// *compiled* component to block in `Send` and come back to code with
+// locals. It read `[rsp+0x90]` at 0x501018, one page past where its
+// own stack ends, because RSP was the serial driver's.
+//
+// The frame already carries the right value: step 2 pushed it, and
+// the frame lives on this thread's kernel stack, which the scheduler
+// saves and restores along with everything else. So the exit path
+// reads `user_rsp` out of the frame, and the static is never read
+// after the window that created it.
 core::arch::global_asm!(
     ".section .text",
     ".code64",
@@ -1387,10 +1727,19 @@ core::arch::global_asm!(
     "    pop rbx",
     "    jne 3f",
     // 8a. Canonical: the fast path.
+    //
+    //     RSP points at the frame's `user_rsp` slot -- the fifteen
+    //     pops above consumed everything below it -- so the user's
+    //     stack pointer is simply `[rsp]`.
+    //
+    //     **Not `[rip + SAVED_USER_RSP]`.** That static holds
+    //     whatever thread entered the kernel most recently, which is
+    //     this one only if nothing blocked. See the note above the
+    //     stub.
     "    push rcx",
     "    call syscall_count_sysret",
     "    pop rcx",
-    "    mov rsp, [rip + SAVED_USER_RSP]",
+    "    mov rsp, [rsp]",
     "    sysretq",
     // 8b. Not canonical: build an iretq frame instead.
     //
@@ -1404,9 +1753,12 @@ core::arch::global_asm!(
     "    pop rcx",
     // The frame iretq expects, pushed high to low: SS, RSP, RFLAGS,
     // CS, RIP.
+    //
+    // As above, the user's RSP comes from the frame. One `push` has
+    // happened since RSP pointed at the slot, so it is at `[rsp+8]`.
     "    mov rax, {user_ss}",
     "    push rax",
-    "    push qword ptr [rip + SAVED_USER_RSP]",
+    "    push qword ptr [rsp + 8]",
     "    push r11",
     "    mov rax, {user_cs}",
     "    push rax",

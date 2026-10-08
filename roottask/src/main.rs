@@ -29,8 +29,10 @@
 //! is mapped read-execute with the code, and the linker script fails
 //! the build rather than letting it fault at run time.
 
+mod driver;
+
 use safrox_abi as abi;
-use safrox_abi::{cap_type, method, perm, BootInfo, CPtr, UntypedDesc};
+use safrox_abi::{cap_type, method, perm, scenario, BootInfo, CPtr, UntypedDesc};
 
 // ---- Entry -------------------------------------------------------------
 
@@ -269,11 +271,299 @@ fn main() -> ! {
         if accounted == info.usable_bytes { 1 } else { 0 },
     );
 
-    // --- 3. Build two components and let them talk -------------------
-    build_and_connect(info, untypeds);
+    // --- 3. What this boot is for ------------------------------------
+    //
+    // M12 had one thing to do. M13's negatives need the root task to
+    // behave differently — kill its driver, replace it, hand a
+    // component nothing and watch it try — and the root task is a
+    // separate binary with no other way to be told (ADR 044's
+    // BootInfo is the channel, and `scenario` is the field).
+    //
+    // **Zero stays M12's meaning**, so a root task that ignored the
+    // field entirely would still do what it did before.
+    match info.scenario {
+        scenario::ROOT_TEST => build_and_connect(info, untypeds),
+        _ => driver_scenarios(info, untypeds),
+    }
 
     echo(CHANNEL_DONE, 0);
     spin();
+}
+
+/// The M13 scenarios, all four of which start the same way.
+///
+/// Sharing the setup is not tidiness: it means `driver-dies` and
+/// `driver-restart` exercise **the same build path** the positive
+/// scenario does. A negative that built its driver differently would
+/// be testing a different driver.
+fn driver_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
+    let Some(budget) = largest_untyped(info, untypeds) else {
+        echo(
+            CHANNEL | STEP_CHILD_RETYPE,
+            abi::ERROR_FLAG | abi::error::NOT_ENOUGH_MEMORY,
+        );
+        return;
+    };
+
+    let untyped = slot(budget);
+    let own_cnode = slot(info.root_cnode_slot);
+    let mut next = info.free_slot_first;
+
+    // The hostile scenario builds no driver at all, which is the
+    // point of it: the component it starts holds nothing, and what
+    // it proves is that holding nothing means reaching nothing.
+    if info.scenario == scenario::DRIVER_HOSTILE {
+        let hostile = driver::Component::allocate(&mut next, 1);
+        let mut worst = driver::retype_component(untyped, own_cnode, &hostile, 1);
+
+        // **A truncated program is not a program.** See
+        // `Code::emit`: the overflow used to be silent, and what it
+        // produced was a component that ran off the end of its code
+        // into zeroed memory and faulted somewhere unrelated.
+        let program = driver::hostile_program();
+        if program.overflowed() {
+            echo(
+                CHANNEL | STEP_CHILD_SETUP,
+                abi::ERROR_FLAG | abi::error::INVALID_ARGUMENT,
+            );
+            return;
+        }
+
+        worst = first_error(
+            worst,
+            driver::setup_component(info, &hostile, program.as_slice(), 1),
+        );
+        echo(CHANNEL | STEP_CHILD_SETUP, worst);
+        if worst == 0 {
+            echo(
+                CHANNEL | STEP_CHILD_RESUME,
+                invoke(slot(hostile.tcb).0, method::RESUME, 0, 0, 0, 0),
+            );
+        }
+        return;
+    }
+
+    // --- The driver, and a client for it -----------------------------
+    //
+    // **The Endpoint is created here, once**, outside any driver.
+    // It is the name the service is known by: the client is minted
+    // a capability to it, and in `driver-restart` a second driver
+    // receives on the same object — which is what lets the client
+    // go on sending without being told anything changed. A driver
+    // that owned its own Endpoint would make that impossible (see
+    // `DriverCaps`).
+    let endpoint = take(&mut next);
+
+    let pages = driver::driver_code_pages();
+    let drv = driver::Component::allocate(&mut next, pages);
+    let client = driver::Component::allocate(&mut next, 1);
+    let caps = driver::DriverCaps::allocate(&mut next, endpoint);
+
+    let mut worst = retype(untyped, cap_type::ENDPOINT, 0, 1, own_cnode, endpoint);
+    worst = first_error(
+        worst,
+        driver::retype_component(untyped, own_cnode, &drv, pages),
+    );
+    worst = first_error(
+        worst,
+        driver::retype_component(untyped, own_cnode, &client, 1),
+    );
+    echo(CHANNEL | STEP_CHILD_RETYPE, worst);
+    if worst != 0 {
+        return;
+    }
+
+    worst = driver::issue_hardware(info, untyped, &caps);
+    if worst != 0 {
+        return;
+    }
+
+    // **A second Issue for the same range must fail** (ADR 045), and
+    // a second Get for the same line (ADR 041). Checked here rather
+    // than from a hostile component because this component *does*
+    // hold the authority — so a refusal cannot be mistaken for "it
+    // had no capability", which is what the hostile scenario shows
+    // separately. Two different claims need two different tests.
+    let second = invoke(
+        slot(info.ioport_control_slot).0,
+        method::IOPORT_ISSUE,
+        0x3F8 | (0x3FF << 16),
+        untyped.0,
+        own_cnode.0,
+        next as u64,
+    );
+    echo(CHANNEL | driver::STEP_SECOND_ISSUE, second);
+
+    let second_irq = invoke(
+        slot(info.irq_control_slot).0,
+        method::IRQ_CONTROL_GET,
+        4,
+        untyped.0,
+        own_cnode.0,
+        next as u64,
+    );
+    echo(CHANNEL | driver::STEP_SECOND_IRQ, second_irq);
+
+    worst = first_error(
+        worst,
+        driver::setup_component(info, &drv, driver::driver_image(), pages),
+    );
+    worst = first_error(worst, driver::wire_driver(info, &drv, &caps));
+
+    // As above: refuse a client whose program did not fit rather
+    // than loading a prefix of it.
+    let program = driver::client_program();
+    if program.overflowed() {
+        echo(
+            CHANNEL | STEP_CHILD_SETUP,
+            abi::ERROR_FLAG | abi::error::INVALID_ARGUMENT,
+        );
+        return;
+    }
+
+    worst = first_error(
+        worst,
+        driver::setup_component(info, &client, program.as_slice(), 1),
+    );
+    worst = first_error(worst, driver::wire_client(info, &client, caps.endpoint));
+    echo(CHANNEL | STEP_CHILD_SETUP, worst);
+    if worst != 0 {
+        return;
+    }
+
+    // **The driver first.** A client whose `Send` arrives before the
+    // driver is receiving simply blocks (ADR 033), so either order
+    // terminates — but this one makes the common case the fast one.
+    let r = invoke(slot(drv.tcb).0, method::RESUME, 0, 0, 0, 0);
+    echo(CHANNEL | driver::STEP_DRIVER_RESUME, r);
+
+    if info.scenario == scenario::DRIVER_TEST {
+        let r = invoke(slot(client.tcb).0, method::RESUME, 0, 0, 0, 0);
+        echo(CHANNEL | driver::STEP_CLIENT_RESUME, r);
+        return;
+    }
+
+    // --- driver-dies, and driver-restart -----------------------------
+    //
+    // **Wait for the driver to be serving before killing it.**
+    //
+    // `Resume` makes a thread runnable; it does not run it. Killing
+    // a driver that has never executed an instruction proves
+    // nothing about what happens when a *running* driver dies, and
+    // the kernel's check says exactly that.
+    //
+    // Two versions of this were wrong before this one. The first
+    // killed the driver immediately. The second yielded 64 times by
+    // calling `Echo`, on the theory that entering the kernel lets
+    // the scheduler switch — it does, and the scheduler kept
+    // choosing this thread, because 64 syscalls take microseconds
+    // and a timer tick does not. The log read "released after 0
+    // access(es)".
+    //
+    // Counting syscalls is counting time with extra steps: both
+    // guess at how long something takes instead of waiting for it
+    // to happen (ADR 023, K8).
+    //
+    // `Send` is a rendezvous (ADR 033) and the driver receives only
+    // from inside its serve loop. So this returns exactly when the
+    // driver is serving, and blocks otherwise.
+    let ping = driver::ping_driver(caps.endpoint);
+    echo(CHANNEL | driver::STEP_PING, ping);
+    if abi::is_error(ping) {
+        return;
+    }
+
+    // Kill it. Two steps, because ADR 026 refuses to revoke a TCB
+    // the scheduler is holding — and that refusal is right: tearing
+    // down a thread whose registers the CPU is using is not
+    // something to make convenient.
+    invoke(slot(drv.tcb).0, method::TCB_SUSPEND, 0, 0, 0, 0);
+
+    // Revoke its capabilities. The IOPort is the one that matters:
+    // `release_range` hands the port window back to the table, which
+    // is what makes a replacement possible at all. Without it the
+    // second driver's `Issue` would be refused as an overlap, and
+    // "crash-only" would have a counterexample in its own milestone.
+    let mut died = 0u64;
+    for cap in [caps.ioport, caps.irq, caps.notification, drv.tcb] {
+        let r = invoke(own_cnode.0, method::CNODE_DELETE, cap as u64, 0, 0, 0);
+        if !abi::is_error(r) {
+            died += 1;
+        }
+    }
+    echo(CHANNEL | driver::STEP_REVOKED, died);
+
+    if info.scenario == scenario::DRIVER_DIES {
+        // The client runs *after* the driver is gone. Its first
+        // `Send` must come back as an error rather than hanging —
+        // the Endpoint still exists but nobody will ever receive on
+        // it, and ADR 039 is what turns that into a clean failure.
+        let r = invoke(slot(client.tcb).0, method::RESUME, 0, 0, 0, 0);
+        echo(CHANNEL | driver::STEP_CLIENT_RESUME, r);
+        return;
+    }
+
+    // --- driver-restart ----------------------------------------------
+    //
+    // **Crash-only recovery, and the first time this system has
+    // shown it.** A second driver, from the same image, given freshly
+    // derived capabilities for the same hardware. Nothing was
+    // repaired: the first driver's objects are gone and these are
+    // new ones.
+    // The same Endpoint. **That is the whole claim**: the client
+    // holds a capability naming this object, the object belongs to
+    // the root task, and it did not die with the driver that was
+    // receiving on it.
+    let drv2 = driver::Component::allocate(&mut next, pages);
+    let caps2 = driver::DriverCaps::allocate(&mut next, endpoint);
+
+    let mut worst = driver::retype_component(untyped, own_cnode, &drv2, pages);
+    worst = first_error(worst, driver::issue_hardware(info, untyped, &caps2));
+    worst = first_error(
+        worst,
+        driver::setup_component(info, &drv2, driver::driver_image(), pages),
+    );
+    worst = first_error(worst, driver::wire_driver(info, &drv2, &caps2));
+    echo(CHANNEL | driver::STEP_RESTARTED, worst);
+    if worst != 0 {
+        return;
+    }
+
+    let r = invoke(slot(drv2.tcb).0, method::RESUME, 0, 0, 0, 0);
+    echo(CHANNEL | driver::STEP_DRIVER_RESUME, r);
+
+    // The client was minted an Endpoint capability that the *first*
+    // driver received on. The Endpoint object outlived the driver —
+    // it is the root task's — so the replacement receives on the
+    // same one and the client never learns anything happened.
+    let r = invoke(slot(client.tcb).0, method::RESUME, 0, 0, 0, 0);
+    echo(CHANNEL | driver::STEP_CLIENT_RESUME, r);
+}
+
+// There is deliberately no `wait_for_driver` helper here.
+//
+// One existed, and what it did was yield 64 times and hope. The
+// replacement is [`driver::ping_driver`]: a message the driver
+// answers from inside its serve loop, which is the event rather
+// than a proxy for it. The note there has the full story, because
+// the mistake is easy to make again and does not look like a
+// mistake while you are making it.
+
+/// The largest non-device Untyped, by index into the leaf CNode.
+///
+/// Biggest rather than first, because boot carves memory into
+/// aligned power-of-two blocks and the sizes vary by orders of
+/// magnitude — the first may be a few KiB.
+fn largest_untyped(info: &BootInfo, untypeds: &[UntypedDesc]) -> Option<u32> {
+    let mut best = None;
+    let mut bits = 0u8;
+    for (index, desc) in untypeds.iter().enumerate() {
+        if desc.is_device == 0 && desc.size_bits > bits {
+            bits = desc.size_bits;
+            best = Some(info.untyped_first_slot + index as u32);
+        }
+    }
+    best
 }
 
 /// A child's slots inside the root task's own leaf CNode.
@@ -754,17 +1044,53 @@ fn slot(index: u32) -> CPtr {
 /// loader to load it with — the root task *is* the loader, and what
 /// it loads has to come from somewhere. Short enough to read, which
 /// is the only thing that makes it tolerable.
+///
+/// # Why 1024 and not 256
+///
+/// M12's children were two invocations each — about 100 bytes — and
+/// 256 was generous. M13's client sends six messages, which is 372
+/// bytes of `mov`-and-`syscall`, and it silently did not fit.
+///
+/// The symptom is worth recording because it was nothing like the
+/// cause: the client wrote four of its five bytes to the serial
+/// port and then took a #PF at `rip=0x400102` reading address zero.
+/// Execution had run off the end of the truncated program into the
+/// zeroed remainder of the page, where `00 00` decodes as
+/// `add [rax], al` and RAX happened to be zero.
+///
+/// So the buffer grew, and more importantly [`Code::emit`] stopped
+/// being quiet about overflowing — see the note there.
+const CODE_CAPACITY: usize = 1024;
+
 struct Code {
-    bytes: [u8; 256],
+    bytes: [u8; CODE_CAPACITY],
     len: usize,
+    /// Set if any `emit` did not fit.
+    ///
+    /// **The field that turns a truncated program into a visible
+    /// failure.** Without it the buffer's size is a silent
+    /// correctness condition, and the next person to add an
+    /// invocation gets a page fault in a different component with
+    /// no connection to what they changed.
+    overflowed: bool,
 }
 
 impl Code {
     const fn new() -> Code {
         Code {
-            bytes: [0; 256],
+            bytes: [0; CODE_CAPACITY],
             len: 0,
+            overflowed: false,
         }
+    }
+
+    /// Whether the program was truncated.
+    ///
+    /// Checked by the caller before the image is loaded, because a
+    /// truncated program is not a program — it is a prefix that
+    /// falls off the end into whatever the page holds.
+    fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// `mov r64, imm64` for one of the six registers an invocation
@@ -783,12 +1109,26 @@ impl Code {
     }
 
     fn emit(&mut self, bytes: &[u8]) -> &mut Code {
-        // No panic: the root task's panic handler cannot print, so a
-        // truncated program is reported through the channel instead
-        // and the test sees a child that never spoke. Saturating
-        // rather than wrapping, so an overflow cannot corrupt the
-        // earlier instructions.
+        // Saturating rather than wrapping, so an overflow cannot
+        // corrupt the instructions already written — and **flagged**,
+        // which the first version was not.
+        //
+        // That omission cost a debugging session. The old comment
+        // claimed a truncated program would be "reported through the
+        // channel", and it would not: the child runs off the end of
+        // its code into the zeroed rest of the page, where `00 00`
+        // is `add [rax], al` and the fault that follows has no
+        // visible relationship to the buffer being too small.
+        //
+        // A silent truncation is the worst of the three options
+        // here. Panicking is no good — this component's panic
+        // handler cannot print — but recording the fact costs one
+        // bool and lets the caller refuse to load a program that is
+        // not all there.
         let end = (self.len + bytes.len()).min(self.bytes.len());
+        if end - self.len < bytes.len() {
+            self.overflowed = true;
+        }
         let take = end - self.len;
         self.bytes[self.len..end].copy_from_slice(&bytes[..take]);
         self.len = end;

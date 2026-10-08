@@ -62,6 +62,15 @@ pub const ROOT_SLOT_OBJECTS: usize = 1;
 /// interrupt line unclaimable until reboot.
 pub const IRQ_CONTROL_SLOT: usize = 254;
 
+/// Slot in the object CNode holding the one IOPortControl capability
+/// (M13, ADR 045).
+///
+/// Beside [`IRQ_CONTROL_SLOT`] and for the same reasons: there is
+/// exactly one, nothing can retype a second, and losing it would make
+/// every I/O port unreachable until reboot. The build-time assertion
+/// at the end of this file keeps the three fixed slots distinct.
+pub const IOPORT_CONTROL_SLOT: usize = 253;
+
 /// Largest root Untyped we will create: 2^22 = 4 MiB.
 ///
 /// A region bigger than this is split into several. Two reasons to cap
@@ -466,6 +475,41 @@ pub unsafe fn init_from_regions(regions: &[MemoryRegion]) {
         super::irq::MAX_IRQ
     );
 
+    // --- IOPortControl (M13, ADR 045) ------------------------------------
+    //
+    // The second capability naming no object, and the argument is
+    // IRQControl's unchanged: what it conveys is the authority to hand
+    // out I/O port ranges, and a port is not memory. x86's ports live
+    // in their own 16-bit space that no page table describes, so
+    // ADR 017's device Untyped — which works by mapping a Frame —
+    // cannot express them at all.
+    //
+    // One, seeded, non-retypeable. A component that could make a
+    // second could issue itself any range it liked, which is the
+    // whole authority this capability exists to withhold.
+    //
+    // SAFETY: The object CNode was created and zeroed above, and
+    // IOPORT_CONTROL_SLOT is within it (checked at build time below).
+    unsafe {
+        let objects = CNode::new(object_base, OBJECT_RADIX);
+        let slot = objects.slot(IOPORT_CONTROL_SLOT);
+        cnode::seed_root(
+            slot,
+            ObjectRef::NULL,
+            CapType::IoPortControl,
+            Rights::ALL,
+            0,
+            false,
+        )
+        .expect("the freshly zeroed IOPortControl slot was not empty");
+    }
+    println!(
+        "[cap] IOPortControl seeded in object slot {}; up to {} port \
+         range(s) can be issued from it (ADR 045)",
+        IOPORT_CONTROL_SLOT,
+        super::ioport::MAX_RANGES
+    );
+
     // SAFETY: Single-threaded boot path; nothing else reads these yet.
     unsafe {
         let cspace = &raw mut INIT_CSPACE;
@@ -746,11 +790,26 @@ const _: () = {
         "a reserved root slot index is outside the root CNode"
     );
     assert!(
-        BOOT_TCB_SLOT < (1 << OBJECT_RADIX) && IRQ_CONTROL_SLOT < (1 << OBJECT_RADIX),
+        BOOT_TCB_SLOT < (1 << OBJECT_RADIX)
+            && IRQ_CONTROL_SLOT < (1 << OBJECT_RADIX)
+            && IOPORT_CONTROL_SLOT < (1 << OBJECT_RADIX),
         "a reserved object slot index is outside the object CNode"
     );
+    // Pairwise, all three. Written out rather than left to a glance:
+    // each of these capabilities is unique and unrecoverable, so two
+    // sharing a slot would mean `seed_root` refusing the second with
+    // `SlotNotEmpty` at boot — a panic before any output, which is
+    // the worst moment to discover a one-character mistake.
     assert!(
         BOOT_TCB_SLOT != IRQ_CONTROL_SLOT,
         "the boot TCB and IRQControl have been given the same slot"
+    );
+    assert!(
+        BOOT_TCB_SLOT != IOPORT_CONTROL_SLOT,
+        "the boot TCB and IOPortControl have been given the same slot"
+    );
+    assert!(
+        IRQ_CONTROL_SLOT != IOPORT_CONTROL_SLOT,
+        "IRQControl and IOPortControl have been given the same slot"
     );
 };

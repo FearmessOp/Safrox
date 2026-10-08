@@ -16,9 +16,9 @@
 
 use super::cnode::{self, CNode, Slot};
 use super::{
-    CapError, CapType, ObjectRef, Rights, FRAME_SIZE, IRQ_HANDLER_SIZE, MAX_DERIVATION_DEPTH,
-    NOTIFICATION_SIZE, PAGE_TABLE_SIZE, RETYPE_MAX_COUNT, SLOT_SIZE, TCB_SIZE, UNTYPED_MAX_BITS,
-    UNTYPED_MIN_BITS,
+    CapError, CapType, ObjectRef, Rights, FRAME_SIZE, IOPORT_SIZE, IRQ_HANDLER_SIZE,
+    MAX_DERIVATION_DEPTH, NOTIFICATION_SIZE, PAGE_TABLE_SIZE, RETYPE_MAX_COUNT, SLOT_SIZE,
+    TCB_SIZE, UNTYPED_MAX_BITS, UNTYPED_MIN_BITS,
 };
 use crate::memory::PhysAddr;
 
@@ -151,6 +151,7 @@ fn object_layout(cap_type: CapType, size_bits: u8) -> Result<(u64, u64), CapErro
         CapType::Frame => FRAME_SIZE as u64,
         CapType::PageTable => PAGE_TABLE_SIZE as u64,
         CapType::IrqHandler => IRQ_HANDLER_SIZE as u64,
+        CapType::IoPort => IOPORT_SIZE as u64,
 
         CapType::CNode => {
             // A CNode is 2^radix slots. The radix arrives as size_bits.
@@ -166,13 +167,16 @@ fn object_layout(cap_type: CapType, size_bits: u8) -> Result<(u64, u64), CapErro
             1u64 << size_bits
         }
 
-        // Neither of these names memory, and they do not name it for
-        // different reasons: `Null` is the absence of a capability,
-        // and `IrqControl` is authority over interrupt lines, which
-        // are a property of the machine rather than of RAM (ADR 041).
-        // There is exactly one IRQControl, created at boot; no amount
-        // of Untyped produces a second.
-        CapType::Null | CapType::IrqControl => return Err(CapError::InvalidArgument),
+        // None of these names memory, and they fail to for different
+        // reasons: `Null` is the absence of a capability, while
+        // `IrqControl` and `IoPortControl` are authority over
+        // interrupt lines and port ranges — properties of the machine
+        // rather than of RAM (ADR 041, ADR 045). There is exactly one
+        // of each, created at boot; no amount of Untyped produces a
+        // second.
+        CapType::Null | CapType::IrqControl | CapType::IoPortControl => {
+            return Err(CapError::InvalidArgument)
+        }
     };
 
     // ADR 017's alignment rule: the next power of two at or above the
@@ -253,6 +257,7 @@ pub unsafe fn retype(
             | CapType::Frame
             | CapType::PageTable
             | CapType::IrqHandler
+            | CapType::IoPort
     );
     if fixed && size_bits != 0 {
         return Err(CapError::InvalidArgument);

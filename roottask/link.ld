@@ -102,10 +102,20 @@ ASSERT(SIZEOF(.got) <= 64,
 
 /* And the whole image has to fit the frames the kernel maps.
  *
- * Two pages, which was one in the first draft -- the image came out
- * at 7432 bytes and scripts/build-roottask.sh said so. Two is the
- * honest number rather than a round one: the kernel maps exactly
- * this many and the assert here and the check there agree.
+ * One page in the first draft; two when the image came out at 7432
+ * bytes and scripts/build-roottask.sh said so; **four from M13**,
+ * when the root task began embedding the serial driver's flat image
+ * in its own .rodata.
+ *
+ * That embedding is not incidental. The kernel has no ELF loader and
+ * must not grow one -- loading is a component's job (ADR 043) -- so
+ * the component that loads the driver is the one that carries it.
+ * The root task's own code barely changed; its payload did.
+ *
+ * Every figure here was measured rather than chosen, and each time
+ * the check fired before anything subtle happened: the two-page
+ * build failed at the link naming this limit, rather than producing
+ * a program with its tail silently missing.
  */
-ASSERT(__image_end - 0x400000 <= 2 * 4096,
-       "the root task's image exceeds the two pages the kernel maps for it")
+ASSERT(__image_end - 0x400000 <= 4 * 4096,
+       "the root task's image exceeds the four pages the kernel maps for it")

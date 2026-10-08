@@ -3117,6 +3117,221 @@ EXPECTATIONS = {
             re.compile(r"carried on", re.M),
         ],
     ),
+    # ---- M13: the first user-space driver --------------------------
+    #
+    # All four exit 33, including the three negatives, and that is
+    # the milestone's shape. A driver that dies is not a kernel
+    # fault -- it is precisely the case the architecture exists to
+    # survive. Compare `rootdies` above, which panics: when the
+    # *root* task dies nothing can name any resource ever again.
+    "drivertest": Expectation(
+        name="the serial driver is a user component",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # Criterion 1. The driver reached ring 3 and configured
+            # the UART through a capability.
+            re.compile(
+                r"^\[driver\] the serial driver is running at CPL 3",
+                re.M,
+            ),
+            # Criterion 5, and the **specific** error. A driver with
+            # no IOPort at all would also be refused; what this
+            # asserts is that a live capability's range is what
+            # bound it.
+            re.compile(
+                r"^\[driver\] the driver holds a live IOPort with full "
+                r"rights and was refused 0x70 with PortNotInRange",
+                re.M,
+            ),
+            # Criterion 2. A digit, and `\d+` would not do: the
+            # client sends five bytes and a run that moved zero
+            # would otherwise read as a pass.
+            #
+            # **Not anchored with `^`**, and the reason is the
+            # milestone showing through. The driver's bytes and the
+            # kernel's reports go to the same UART with no
+            # coordination between them — the driver writes through
+            # `IOPort.Out8` and the kernel through its emergency
+            # console — so the client's output lands mid-line and
+            # the report that follows it does not start one:
+            #
+            #     [M13][driver] a third component sent 5 bytes...
+            #
+            # Anchoring here would have been a test of whether two
+            # independent writers happened to interleave tidily,
+            # which is not a property of this system and would make
+            # the scenario fail for a reason unconnected to its
+            # claim.
+            re.compile(
+                r"\[driver\] a third component sent [1-9]\d* bytes "
+                r"through the driver's Endpoint and they reached COM1",
+                re.M,
+            ),
+            # **The bytes themselves, in QEMU's serial output.**
+            #
+            # The one line that cannot be produced by the kernel's
+            # own printing: it is what the driver put on the wire,
+            # byte by byte, out of a client's requests. Everything
+            # else in this list is the kernel reporting; this is the
+            # device.
+            re.compile(r"\[M13\]", re.M),
+            # Criterion 3.
+            re.compile(
+                r"^\[driver\] IRQ 4 is owned by a user component",
+                re.M,
+            ),
+            # Criterion 4, and the figure must be zero rather than
+            # `\d+`.
+            re.compile(
+                r"^\[driver\] kernel still drives 0 peripheral devices",
+                re.M,
+            ),
+            # The four remaining touchers, each named. A list that
+            # said only "0 devices" would be a claim with nothing
+            # behind it.
+            re.compile(r"^\[driver\] kernel hardware: LAPIC", re.M),
+            re.compile(r"^\[driver\] kernel hardware: I/O APIC", re.M),
+            re.compile(r"^\[driver\] kernel hardware: 8259 PIC", re.M),
+            re.compile(r"^\[driver\] kernel hardware: isa-debug-exit", re.M),
+            re.compile(
+                r"^\[driver\] kernel hardware: COM1 -- emergency console",
+                re.M,
+            ),
+            # And the counter that makes criterion 4 falsifiable:
+            # some configuration writes at boot, **zero** since.
+            re.compile(
+                r"^\[driver\] the kernel made [1-9]\d* configuration "
+                r"write\(s\) to COM1 at boot and 0 since the driver took "
+                r"over",
+                re.M,
+            ),
+            re.compile(r"^\[driver\] all driver tests passed", re.M),
+            re.compile(r"^\[boot\] M13 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
+    "driverdies": Expectation(
+        name="the serial driver dies and the system does not",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # It was genuinely running first. Without this the rest
+            # would be consistent with a driver that never started,
+            # which is a much weaker claim.
+            re.compile(
+                r"^\[driver\] the driver is running; the root task will "
+                r"now revoke it",
+                re.M,
+            ),
+            # The kernel noticed on its own: `release_line` and
+            # `release_range` run from `delete`'s path.
+            re.compile(
+                r"^\[irq\] handler at .* deleted; IRQ 4 masked and "
+                r"released",
+                re.M,
+            ),
+            re.compile(
+                r"^\[ioport\] capability at .* deleted; ports "
+                r"0x03f8..=0x03ff released",
+                re.M,
+            ),
+            re.compile(
+                r"^\[driver\] the driver is gone: IRQ 4 is ownerless and "
+                r"masked",
+                re.M,
+            ),
+            # And the system is up, which is the whole claim.
+            re.compile(
+                r"^\[driver\] the serial driver died and the system did not",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M13 driver-dies checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
+    "driverrestart": Expectation(
+        name="a dead driver is replaced",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # The first one died: without this the scenario would
+            # pass on a run where nothing was ever killed.
+            re.compile(
+                r"^\[ioport\] capability at .* deleted; ports "
+                r"0x03f8..=0x03ff released",
+                re.M,
+            ),
+            # **Not anchored**, for the reason `drivertest` gives
+            # above: the replacement's client sends `[M13]` through
+            # `IOPort.Out8` and the kernel reports through its
+            # emergency console, and the two share a wire with no
+            # coordination. The line lands as
+            #
+            #     [M13][driver] a replacement driver claimed...
+            #
+            # This was anchored at first, and failed on a run where
+            # everything it describes had happened. Worth saying
+            # plainly: the reasoning was already written out for
+            # `drivertest` and the expectation here was still typed
+            # with a `^`, because the two were written at different
+            # times and an anchor is what a line expectation looks
+            # like.
+            re.compile(
+                r"\[driver\] a replacement driver claimed IRQ 4 and "
+                r"ports 0x03f8..=0x03ff and is serving the same client",
+                re.M,
+            ),
+            # **The client's bytes, served by the second driver.**
+            #
+            # Without this the scenario would pass on a replacement
+            # that claimed the hardware and served nobody -- which
+            # is the difference between a driver and a component
+            # holding capabilities.
+            re.compile(r"\[M13\]", re.M),
+            re.compile(r"^\[driver\] crash-only recovery", re.M),
+            re.compile(r"^\[boot\] M13 driver-restart checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
+    "driverhostile": Expectation(
+        name="a component with no authority cannot reach the hardware",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # All three attempts, each named. One line saying
+            # "refused" would not distinguish three refusals from
+            # one attempt that never happened twice.
+            re.compile(
+                r"^\[driver\] refused: write to COM1's data register -> "
+                r"error \d+",
+                re.M,
+            ),
+            re.compile(
+                r"^\[driver\] refused: claim IRQ 4 -> error \d+", re.M
+            ),
+            re.compile(
+                r"^\[driver\] refused: issue itself the COM1 port range "
+                r"-> error \d+",
+                re.M,
+            ),
+            re.compile(
+                r"^\[driver\] every attempt was refused, and refused for "
+                r"the right reason",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M13 driver-hostile checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
 }
 
 

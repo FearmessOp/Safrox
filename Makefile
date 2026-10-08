@@ -888,3 +888,114 @@ test: run-roottest run-rootnountyped run-rootdies
 # from its own absence (ADR 023, K5) -- and would make `make fmt`, the
 # cheapest check in the tree, build the root task first.
 clippy: $(ROOTTASK_BIN)
+
+
+
+# ---- M13: the first user-space driver ---------------------------------
+#
+# Appended, as every milestone's block is (ADR 023, K7).
+#
+# The build gains a second user component. The dependency chain is
+# now three deep and the order is forced rather than chosen:
+#
+#     serial-driver.bin  ->  roottask.bin  ->  kernel.elf
+#
+# The root task embeds the driver's flat image with `include_bytes!`,
+# because the kernel has no ELF loader and must not grow one --
+# loading is a component's job (ADR 043). So the component that
+# loads the driver is the one that carries it, and its image has to
+# exist before the root task compiles.
+#
+# `ROOT_CODE_PAGES` went from 2 to 4 for that payload. The figure
+# appears in kernel/src/roottask.rs, roottask/link.ld and
+# scripts/build-roottask.sh, and all three had to change together --
+# the two-page build failed at the link naming the limit, which is
+# the guard working rather than an inconvenience.
+
+DRIVER_BIN := $(BUILD_DIR)/serial-driver.bin
+
+# Listed rather than globbed, for the reason ROOTTASK_SRCS is: a glob
+# silently picks up editor backups and silently misses a file added
+# in a subdirectory.
+DRIVER_SRCS := driver/src/main.rs driver/link.ld driver/Cargo.toml \
+               abi/src/lib.rs
+
+$(DRIVER_BIN): $(DRIVER_SRCS)
+	@echo "  CARGO   serial-driver"
+	@bash scripts/build-driver.sh
+
+driver: $(DRIVER_BIN)
+
+# **The root task depends on the driver's image**, because it embeds
+# it. A stale file here is a root task that loads the wrong program,
+# and the failure would appear as a component behaving like an
+# earlier version of itself.
+#
+# Appended as a second rule for the same target rather than edited
+# into the original, which is both K7 and necessary: `$(ROOTTASK_BIN)`
+# is declared some 70 lines above and make expands a prerequisite
+# list when it *parses* the rule. Written there, `$(DRIVER_BIN)`
+# would have been empty -- the silent failure M12 documented and
+# M12's own follow-up fix hit a second time.
+$(ROOTTASK_BIN): $(DRIVER_BIN)
+
+# And clippy, for the reason the M12 follow-up established: clippy
+# compiles kernel/src/main.rs, which reaches the root task image,
+# which reaches this one. `make distclean && make test` is what finds
+# a missing edge here (ADR 023, K9).
+clippy: $(DRIVER_BIN)
+
+ISO_DRIVERTEST := $(BUILD_DIR)/safrox-drivertest.iso
+ISO_DRIVERDIES := $(BUILD_DIR)/safrox-driverdies.iso
+ISO_DRIVERRESTART := $(BUILD_DIR)/safrox-driverrestart.iso
+ISO_DRIVERHOSTILE := $(BUILD_DIR)/safrox-driverhostile.iso
+
+ALL_ISOS += $(ISO_DRIVERTEST) $(ISO_DRIVERDIES) $(ISO_DRIVERRESTART) \
+            $(ISO_DRIVERHOSTILE)
+
+.PHONY: driver run-drivertest run-driverdies run-driverrestart
+.PHONY: run-driverhostile
+
+# Entry indices into boot/limine.conf.in, which had 58 entries before
+# M13 appended four.
+$(ISO_DRIVERTEST): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,59)
+
+$(ISO_DRIVERDIES): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,60)
+
+$(ISO_DRIVERRESTART): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,61)
+
+$(ISO_DRIVERHOSTILE): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,62)
+
+# **All four exit 33**, including the three negatives, and that is
+# the milestone's shape rather than an oversight.
+#
+# A driver that dies is not a kernel fault — it is the case the
+# architecture exists to survive, so a kernel that panicked would be
+# failing the test rather than passing it. Same for a component
+# refused the hardware: a refusal is a caller-visible outcome, and a
+# kernel that stopped would be one any component could halt by
+# asking for something it may not have.
+#
+# Contrast `root-dies`, which exits 35: when the *root* task dies
+# every capability in the system becomes unnameable, and "carry on"
+# would mean "carry on doing nothing" (ADR 044). The difference
+# between the two is the whole content of "a driver is just a
+# component".
+
+run-drivertest: $(ISO_DRIVERTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DRIVERTEST) --expect drivertest -- $(QEMU_FLAGS)
+
+run-driverdies: $(ISO_DRIVERDIES)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DRIVERDIES) --expect driverdies -- $(QEMU_FLAGS)
+
+run-driverrestart: $(ISO_DRIVERRESTART)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DRIVERRESTART) --expect driverrestart -- $(QEMU_FLAGS)
+
+run-driverhostile: $(ISO_DRIVERHOSTILE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DRIVERHOSTILE) --expect driverhostile -- $(QEMU_FLAGS)
+
+test: run-drivertest run-driverdies run-driverrestart run-driverhostile

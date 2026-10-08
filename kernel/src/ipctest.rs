@@ -4605,16 +4605,40 @@ pub fn run_cap_cost() -> ! {
         zero, one, four, COST_SAMPLES
     );
 
-    // Carrying a capability must cost something: it is a CPtr
-    // resolution and three checks. Equal figures would mean the
-    // measurement is reporting something other than the transfer.
+    // **Carrying capabilities must cost something**, and the
+    // comparison that says so is 0 against 4.
+    //
+    // Not 0 against 1, which is what this was and which failed
+    // inside `make test` at 1806/1806 after passing three times
+    // standalone at 1218/2016, 1218/1890, 1344/1806. The one-cap
+    // figure was normal; the *zero*-cap batch came out 50% slow.
+    //
+    // Each of the three figures is the minimum of 32 samples, but
+    // the three batches run at different moments, and under TCG the
+    // drift between moments is larger than one CPtr resolution.
+    // Taking a minimum removes outliers *within* a batch and can do
+    // nothing about a batch that was uniformly slow.
+    //
+    // The note thirty lines below already says the first figure
+    // "moves between runs" and must not be compared against
+    // anything -- that was M9c's conclusion after this same flake,
+    // and it was applied to the assertion it was written beside
+    // while this one, four lines above it, kept comparing the two
+    // least stable numbers in the scenario.
+    //
+    // 0 against 4 is the same claim with four times the signal: if
+    // four CPtr resolutions and twelve checks cost nothing
+    // measurable, the measurement is not measuring the transfer.
     assert!(
-        one > zero,
-        "carrying one capability ({} cycles) did not cost more than \
-         carrying none ({}). The transfer is a CPtr resolution plus \
-         three checks; equal figures mean this is not measuring it",
-        one,
-        zero
+        four > zero,
+        "carrying four capabilities ({} cycles) did not cost more than \
+         carrying none ({}). Each transfer is a CPtr resolution plus \
+         three checks, so four of them should be visible above the \
+         noise; equal figures mean this is not measuring the transfer \
+         at all. (One cap: {}.)",
+        four,
+        zero,
+        one
     );
     assert!(
         four > one,

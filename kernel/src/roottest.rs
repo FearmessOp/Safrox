@@ -391,20 +391,57 @@ pub fn run() -> ! {
     // sender used, and the sender did not choose it -- the root task
     // attached it when it minted the copy (ADR 037). A message that
     // arrived from anywhere else would carry something different.
+    //
+    // **The low 32 bits**, since ADR 047: `Recv` returns
+    // `badge | (label << 32)`, because a driver needs to know both
+    // who is asking and what they want, and has one register to
+    // learn it from.
+    //
+    // M12's receiver reports the whole value and this check read it
+    // whole, so widening the return broke a scenario that had
+    // nothing to do with M13. The fix is here rather than in the
+    // child: extracting a field is the reader's job, and the child
+    // is two invocations of hand-written assembly whose purpose is
+    // to report what it was given.
+    //
+    // The upper half is M12's own label, `PING & 0xFFFF_FFFF`
+    // (`0x1ABC_DEF0`), which is worth asserting too -- it is the
+    // one thing in this scenario that travelled with the message
+    // rather than with the capability.
     const SENDER_BADGE: u64 = 0x5EED;
+    const SENDER_LABEL: u64 = 0x1ABC_DEF0;
+
+    let badge = received & 0xFFFF_FFFF;
+    let label = received >> 32;
+
     assert_eq!(
-        received, SENDER_BADGE,
+        badge, SENDER_BADGE,
         "the receiving child woke with badge {:#x} rather than {:#x}. A \
          message arrived, but not through the capability the root task \
          minted -- so 'the two are connected' is not what was shown.",
-        received, SENDER_BADGE
+        badge, SENDER_BADGE
+    );
+
+    // **And the label, which the sender *did* choose.**
+    //
+    // The pair is the point. The badge came from the capability and
+    // the label came from the message, so this one assertion
+    // distinguishes the two halves of ADR 047's split: what a
+    // client cannot forge from what it is free to say.
+    assert_eq!(
+        label, SENDER_LABEL,
+        "the receiving child woke with label {:#x} rather than {:#x}. \
+         The badge was right, so the message came through the right \
+         capability -- but the one field the sender chooses did not \
+         survive the trip.",
+        label, SENDER_LABEL
     );
 
     println!(
         "[roottest] two components built by a ring 3 program exchanged a \
          message; the receiver woke with badge {:#x}, which its sender \
-         could not have chosen",
-        received
+         could not have chosen, and label {:#x}, which it did",
+        badge, label
     );
 
     // ---- 4. The kernel stopped ----------------------------------------
@@ -721,4 +758,30 @@ pub fn starve() {
 /// Whether the root task should be starved.
 pub fn starving() -> bool {
     STARVE.load(Ordering::Acquire)
+}
+
+/// Which scenario the root task should run (M13).
+///
+/// Written into `BootInfo.scenario` by [`crate::roottask`], for the
+/// reason [`STARVE`] exists: the root task is a separate binary and
+/// BootInfo is the only channel to it (ADR 044). Zero is M12's
+/// behaviour, so a root task that ignored the field would do what it
+/// has always done.
+///
+/// The same argument as the flag above applies to the *shape* of
+/// this: one root task image that branches, rather than four built
+/// separately. Four images would mean four things to keep in step
+/// and three of them exercised by one scenario each; one image means
+/// every scenario runs through the same setup code, so a negative
+/// cannot pass because it built its driver differently.
+static SCENARIO: AtomicU64 = AtomicU64::new(abi::scenario::ROOT_TEST as u64);
+
+/// Ask for a particular scenario. Called from `kmain`.
+pub fn select_scenario(which: u32) {
+    SCENARIO.store(which as u64, Ordering::Release);
+}
+
+/// What to put in `BootInfo.scenario`.
+pub fn scenario() -> u32 {
+    SCENARIO.load(Ordering::Acquire) as u32
 }
