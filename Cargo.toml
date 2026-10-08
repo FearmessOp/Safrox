@@ -3,7 +3,7 @@
 cargo-features = ["trim-paths"]
 
 [package]
-name = "pythos"
+name = "safrox"
 version = "0.1.0"
 edition = "2021"
 description = "A capability-based microkernel for x86-64"
@@ -11,7 +11,7 @@ license = "BSD-2-Clause"
 publish = false
 
 [[bin]]
-name = "pythos"
+name = "safrox"
 path = "kernel/src/main.rs"
 test = false
 bench = false
@@ -35,7 +35,7 @@ limine = "0.6"
 # The kernel/user ABI: BootInfo, method numbers, error codes. One
 # definition read by two crates, because a struct written twice is two
 # structs that happen to agree today (ADR 044).
-pythos-abi = { path = "abi" }
+safrox-abi = { path = "abi" }
 
 # Typed bit flags. Used for page-table entry flags and CPU feature bits,
 # where the alternative is hand-rolled constants and bitwise operations

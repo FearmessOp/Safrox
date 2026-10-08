@@ -1,38 +1,38 @@
-# PythOS boot configuration template (Limine v9, `limine` protocol).
+# Safrox boot configuration template (Limine v9, `limine` protocol).
 #
 # The build generates one concrete limine.conf per ISO by substituting
 # @DEFAULT_ENTRY@ with the index of the entry that should boot:
 #
-#   1 -> normal boot        build/pythos.iso            exit 33
-#   2 -> panic test         build/pythos-panic.iso      exit 35
-#   3 -> breakpoint (#BP)   build/pythos-int3.iso       exit 33 (handler returns)
-#   4 -> page fault (#PF)   build/pythos-pf.iso         exit 35
-#   5 -> double fault (#DF) build/pythos-df.iso         exit 35 (handled on IST1)
-#   6 -> frame allocator    build/pythos-memtest.iso    exit 33
-#   7 -> double free        build/pythos-doublefree.iso exit 35
-#   8 -> virtual memory     build/pythos-vmtest.iso     exit 33
-#   9 -> stale TLB          build/pythos-staletlb.iso   exit 33 (advisory)
-#  10 -> guard page         build/pythos-guardpage.iso  exit 35
-#  11 -> NX enforcement     build/pythos-nx.iso         exit 35
-#  12 -> stack overflow     build/pythos-stackovf.iso   exit 35
-#  13 -> kernel heap        build/pythos-heaptest.iso   exit 33
-#  14 -> heap exhaustion    build/pythos-heapoom.iso    exit 35
-#  15 -> heap guard page    build/pythos-heapguard.iso  exit 35
+#   1 -> normal boot        build/safrox.iso            exit 33
+#   2 -> panic test         build/safrox-panic.iso      exit 35
+#   3 -> breakpoint (#BP)   build/safrox-int3.iso       exit 33 (handler returns)
+#   4 -> page fault (#PF)   build/safrox-pf.iso         exit 35
+#   5 -> double fault (#DF) build/safrox-df.iso         exit 35 (handled on IST1)
+#   6 -> frame allocator    build/safrox-memtest.iso    exit 33
+#   7 -> double free        build/safrox-doublefree.iso exit 35
+#   8 -> virtual memory     build/safrox-vmtest.iso     exit 33
+#   9 -> stale TLB          build/safrox-staletlb.iso   exit 33 (advisory)
+#  10 -> guard page         build/safrox-guardpage.iso  exit 35
+#  11 -> NX enforcement     build/safrox-nx.iso         exit 35
+#  12 -> stack overflow     build/safrox-stackovf.iso   exit 35
+#  13 -> kernel heap        build/safrox-heaptest.iso   exit 33
+#  14 -> heap exhaustion    build/safrox-heapoom.iso    exit 35
+#  15 -> heap guard page    build/safrox-heapguard.iso  exit 35
 #  16..19 -> M5 capability scenarios
 #  20..23 -> M6 thread scenarios
-#  24 -> address spaces     build/pythos-vspacetest.iso exit 33
-#  25 -> kernel-half map    build/pythos-vskernel.iso   exit 33 (refused, not fatal)
-#  26 -> isolation          build/pythos-vsisolation.iso exit 35
-#  27 -> revoked vspace     build/pythos-vsstale.iso    exit 35
-#  28 -> ring 3             build/pythos-usertest.iso   exit 33
-#  29 -> privileged insn    build/pythos-userpriv.iso   exit 35
-#  30 -> kernel read        build/pythos-userkread.iso  exit 35
-#  31 -> SMEP               build/pythos-usersmep.iso   exit 35
-#  32 -> SMAP               build/pythos-usersmap.iso   exit 35
-#  33 -> forged capability  build/pythos-userforge.iso  exit 33 (refused, not fatal)
-#  34 -> IPC rendezvous     build/pythos-ipctest.iso    exit 33
-#  35 -> cancellation cost  build/pythos-ipccancel.iso  exit 33 (measurement)
-#  36 -> revoked endpoint   build/pythos-ipcrevoked.iso exit 33 (woken, not fatal)
+#  24 -> address spaces     build/safrox-vspacetest.iso exit 33
+#  25 -> kernel-half map    build/safrox-vskernel.iso   exit 33 (refused, not fatal)
+#  26 -> isolation          build/safrox-vsisolation.iso exit 35
+#  27 -> revoked vspace     build/safrox-vsstale.iso    exit 35
+#  28 -> ring 3             build/safrox-usertest.iso   exit 33
+#  29 -> privileged insn    build/safrox-userpriv.iso   exit 35
+#  30 -> kernel read        build/safrox-userkread.iso  exit 35
+#  31 -> SMEP               build/safrox-usersmep.iso   exit 35
+#  32 -> SMAP               build/safrox-usersmap.iso   exit 35
+#  33 -> forged capability  build/safrox-userforge.iso  exit 33 (refused, not fatal)
+#  34 -> IPC rendezvous     build/safrox-ipctest.iso    exit 33
+#  35 -> cancellation cost  build/safrox-ipccancel.iso  exit 33 (measurement)
+#  36 -> revoked endpoint   build/safrox-ipcrevoked.iso exit 33 (woken, not fatal)
 #
 # Every ISO embeds the exact same kernel.elf. The fault paths are therefore
 # exercised on the shipping binary rather than on a special build, which is
@@ -45,73 +45,73 @@ timeout: 0
 default_entry: @DEFAULT_ENTRY@
 verbose: no
 
-/PythOS (normal boot)
+/Safrox (normal boot)
     comment: Prints boot info, then exits QEMU with host status 33.
     protocol: limine
     path: boot():/boot/kernel.elf
 
-/PythOS (panic test)
+/Safrox (panic test)
     comment: Same kernel; cmdline triggers a deliberate panic (host status 35).
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: panic-test
 
-/PythOS (breakpoint exception)
+/Safrox (breakpoint exception)
     comment: int3 -> #BP. A trap, so the handler returns and we exit 33.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: fault-int3
 
-/PythOS (page fault)
+/Safrox (page fault)
     comment: Write to an unmapped canonical address -> #PF, CR2 reported, exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: fault-pf
 
-/PythOS (double fault)
+/Safrox (double fault)
     comment: Corrupt RSP then fault -> #DF handled on IST1, exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: fault-df
 
-/PythOS (frame allocator tests)
+/Safrox (frame allocator tests)
     comment: Bulk alloc/free, leak check and exhaustion/recovery. Exit 33.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: mem-test
 
-/PythOS (double free)
+/Safrox (double free)
     comment: Free the same frame twice; the allocator must panic. Exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: mem-double-free
 
-/PythOS (virtual memory tests)
+/Safrox (virtual memory tests)
     comment: map/unmap/translate, error cases, reclaim survived. Exit 33.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vm-test
 
-/PythOS (stale TLB check)
+/Safrox (stale TLB check)
     comment: Unmap without invalidating. Advisory -- QEMU's TLB is not real
     comment: hardware, so a missing fault is reported, not failed. Exit 33.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vm-stale-tlb
 
-/PythOS (guard page)
+/Safrox (guard page)
     comment: Write below the IST stack; the guard page must fault. Exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vm-guard-page
 
-/PythOS (NX enforcement)
+/Safrox (NX enforcement)
     comment: Jump to a data page in PMAP; NX must fault. Exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vm-nx
 
-/PythOS (main stack overflow)
+/Safrox (main stack overflow)
     comment: Recurse off the bottom of the kernel's own stack. Unlike the
     comment: guard page test, which writes at the guard directly, this
     comment: arrives the way a real overflow would -- and escalates to #DF,
@@ -121,14 +121,14 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: vm-stack-overflow
 
-/PythOS (kernel heap tests)
+/Safrox (kernel heap tests)
     comment: Box/Vec/BTreeMap/String, 10000 sized allocations with canaries,
     comment: growth, and a return to the baseline byte count. Exit 33.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: heap-test
 
-/PythOS (heap exhaustion)
+/Safrox (heap exhaustion)
     comment: Allocate 1 MiB at a time and leak it until the heap hits its
     comment: limit or physical memory runs out. Either way: a panic naming
     comment: the size and alignment, never a silent null. Exit 35.
@@ -136,14 +136,14 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: heap-oom
 
-/PythOS (heap guard page)
+/Safrox (heap guard page)
     comment: Write to the unmapped page above the heap's maximum extent.
     comment: #PF with CR2 in the guard. Exit 35.
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: heap-guard
 
-/PythOS (capability system tests)
+/Safrox (capability system tests)
     comment: Object sizes against ADR 017's ceilings, the rights lattice
     comment: exhaustively, retype and its atomicity, copy and the refusal
     comment: to widen rights, every CPtr failure mode, the CPtr invariant
@@ -153,7 +153,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: cap-test
 
-/PythOS (revoke cost measurement)
+/Safrox (revoke cost measurement)
     comment: Build the widest, deepest derivation tree the init CSpace can
     comment: hold and time a revoke over it. Not pass/fail: ADR 019 put the
     comment: worst case at ~56 ms and never checked it, so this reports a
@@ -162,7 +162,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: cap-revoke-depth
 
-/PythOS (allocation from an interrupt)
+/Safrox (allocation from an interrupt)
     comment: Allocate a frame from interrupt context. ADR 022 made "handlers
     comment: do not allocate" an enforced rule rather than a lock that would
     comment: protect nothing on one CPU; this is the tripwire firing. M6
@@ -171,7 +171,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: cap-interrupt-alloc
 
-/PythOS (allocation after retirement)
+/Safrox (allocation after retirement)
     comment: Call the frame allocator after boot retired it. From the end of
     comment: boot memory comes only from retyping an Untyped, so a direct
     comment: allocation is a path that was meant to be capability-mediated
@@ -180,7 +180,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: cap-retired-allocator
 
-/PythOS (thread and scheduler tests)
+/Safrox (thread and scheduler tests)
     comment: Two kernel threads on their own stacks hand off 100 times;
     comment: the LAPIC timer fires and preempts a thread that never
     comment: yields; suspend, resume and ReadRegisters work; and the
@@ -190,7 +190,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: thread-test
 
-/PythOS (thread stack overflow)
+/Safrox (thread stack overflow)
     comment: A thread recurses off the bottom of its own stack -- one
     comment: retyped from an Untyped and mapped for its TCB, not the
     comment: main stack M3 tested. The report names the thread. Exit 35.
@@ -198,7 +198,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: thread-stack-overflow
 
-/PythOS (allocation inside a real interrupt)
+/Safrox (allocation inside a real interrupt)
     comment: M5 tested ADR 022's tripwire by driving the depth counter
     comment: by hand, because there were no interrupts. This calls
     comment: allocate() from inside the timer handler the LAPIC
@@ -207,7 +207,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: thread-interrupt-alloc
 
-/PythOS (operate on a running thread)
+/Safrox (operate on a running thread)
     comment: ADR 026: a thread the scheduler is holding cannot have its
     comment: TCB rewritten -- ThreadBusy, not undefined behaviour. Then
     comment: Suspend, and the same call succeeds: the refusal is a
@@ -216,7 +216,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: thread-kill-running
 
-/PythOS (address space tests)
+/Safrox (address space tests)
     comment: A user VSpace built entirely out of capabilities: a root
     comment: PageTable, three intermediate tables the caller supplies,
     comment: and a Frame. Then the check that cannot be faked -- two
@@ -229,7 +229,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: vspace-test
 
-/PythOS (mapping into the kernel half)
+/Safrox (mapping into the kernel half)
     comment: Four attempts to map a Frame at a kernel address through a
     comment: user VSpace. Every one must be refused with NotUserAddress:
     comment: the kernel's top-level entries are shared by every address
@@ -240,7 +240,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: vspace-kernel-half
 
-/PythOS (address space isolation)
+/Safrox (address space isolation)
     comment: Isolation from the failing side. An address is mapped in
     comment: one VSpace and not the other; a thread in the second one
     comment: reads it and must take a #PF with CR2 at that address.
@@ -251,7 +251,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: vspace-isolation
 
-/PythOS (revoked address space)
+/Safrox (revoked address space)
     comment: ADR 028's two cases. Revoking the VSpace in CR3 right now is
     comment: refused -- the CPU would walk page tables handed back to
     comment: their Untyped. Revoking an idle one succeeds, and the thread
@@ -262,7 +262,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: vspace-stale-cr3
 
-/PythOS (ring 3 tests)
+/Safrox (ring 3 tests)
     comment: A thread running at CPL 3, in its own address space, with
     comment: code in a page that is executable and not writable. It reads
     comment: CS and reports the privilege level through the one syscall;
@@ -275,7 +275,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-test
 
-/PythOS (privileged instruction from ring 3)
+/Safrox (privileged instruction from ring 3)
     comment: User code executes cli, then hlt, rdmsr and lgdt. Each is
     comment: privileged, so the first one must raise #GP -- and cli is
     comment: first deliberately, because it is the one that looks
@@ -284,7 +284,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-privileged
 
-/PythOS (user reads the kernel half)
+/Safrox (user reads the kernel half)
     comment: Ring 3 reads an address in the kernel heap. #PF with the
     comment: USER bit set in the error code -- that bit is what tells a
     comment: user overreach from a kernel pointer bug, and the two mean
@@ -293,7 +293,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-kernel-read
 
-/PythOS (SMEP)
+/Safrox (SMEP)
     comment: The kernel jumps into a user code page -- the *same* page
     comment: ring 3 has just executed successfully, so the fault cannot
     comment: be explained by a mapping difference. #PF with the
@@ -304,7 +304,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-smep
 
-/PythOS (SMAP)
+/Safrox (SMAP)
     comment: The kernel reads a user page twice: once holding a
     comment: UserAccess guard, which must succeed, and once without,
     comment: which must fault. Both halves in one scenario, because
@@ -314,7 +314,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-smap
 
-/PythOS (forged capability pointers)
+/Safrox (forged capability pointers)
     comment: The first genuinely hostile input this kernel has taken.
     comment: Ring 3 invokes with reserved bits set, an out-of-range
     comment: index, a stale generation, an empty slot, a real object of
@@ -326,7 +326,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: user-cap-forge
 
-/PythOS (IPC rendezvous)
+/Safrox (IPC rendezvous)
     comment: M9a. Two threads meet on an endpoint, in both orders: a
     comment: sender that arrives first blocks until somebody receives,
     comment: and a receiver that arrives first blocks until somebody
@@ -341,7 +341,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-test
 
-/PythOS (cancellation cost)
+/Safrox (cancellation cost)
     comment: M9a's real result. Removing one waiter from a queue of 50
     comment: and then from a queue of 500, timed both times. One figure
     comment: would say nothing; two figures ten times apart, agreeing,
@@ -356,7 +356,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-cancel-cost
 
-/PythOS (revoked endpoint)
+/Safrox (revoked endpoint)
     comment: Three threads wait on an endpoint; its capability is
     comment: deleted. All three must wake with EndpointDead, and the
     comment: kernel must still be running -- so this exits 33, not 35.
@@ -373,7 +373,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-endpoint-revoked
 
-/PythOS (call and reply)
+/Safrox (call and reply)
     comment: M9b. Four scenarios: a Call/Reply round trip, ReplyRecv
     comment: doing two operations in one kernel entry, two badged
     comment: clients the server tells apart, and the reply-stealing
@@ -389,7 +389,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-call-test
 
-/PythOS (server dies owing a reply)
+/Safrox (server dies owing a reply)
     comment: A server is revoked while holding a caller. The client
     comment: must wake with ReplyTargetGone rather than waiting for
     comment: an answer that can never come.
@@ -404,7 +404,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-server-dies
 
-/PythOS (stale reply target)
+/Safrox (stale reply target)
     comment: The caller's TCB is revoked and a new TCB is retyped into
     comment: the same memory -- which ADR 020's watermark reset makes
     comment: likely rather than contrived. The server's Reply must be
@@ -419,7 +419,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-stale-reply
 
-/PythOS (self-call deadlock)
+/Safrox (self-call deadlock)
     comment: A thread Calls its own endpoint with nobody receiving. It
     comment: blocks forever, and that is deliberately not prevented: a
     comment: check for "am I the receiver" would catch this and miss
@@ -433,7 +433,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-self-call
 
-/PythOS (IPC cost)
+/Safrox (IPC cost)
     comment: ADR 040 refused a fastpath and promised to measure the
     comment: slow one instead. Three figures: a bare Send+Recv
     comment: rendezvous, a Call+Reply round, and a server loop built
@@ -449,7 +449,7 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: ipc-cost
-/+PythOS (M9c: capability transfer)
+/+Safrox (M9c: capability transfer)
     comment: ADR 035's authority half. Four capabilities at most, into
     comment: slots the RECEIVER opened -- a sender cannot name a
     comment: destination in another CSpace, so there is nothing for it
@@ -460,7 +460,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-captransfer
 
-/+PythOS (M9c: hostile capability transfers)
+/+Safrox (M9c: hostile capability transfers)
     comment: Malformed transfers: reserved CPtr bits, a leaf index past
     comment: its CNode, a root index past the root, and a well-formed
     comment: capability without GRANT. Each is dropped silently (ADR
@@ -473,7 +473,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-captransferhostile
 
-/+PythOS (M9c: revoked notification)
+/+Safrox (M9c: revoked notification)
     comment: A thread blocked in Wait when the Notification's
     comment: capability is deleted. It wakes with EndpointDead rather
     comment: than waiting forever -- ADR 039's reasoning, which is not
@@ -485,7 +485,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: ipc-notification-revoked
 
-/+PythOS (M9c: capability transfer cost)
+/+Safrox (M9c: capability transfer cost)
     comment: What a capability costs on the IPC path: Send+Recv with 0,
     comment: 1 and 4 of them. ADR 035 chose four on the grounds that
     comment: each is bounded work -- a CPtr resolution, a rights check,
@@ -498,7 +498,7 @@ verbose: no
     cmdline: ipc-captransfercost
 
 
-/+PythOS (M10: interrupt handling)
+/+Safrox (M10: interrupt handling)
     comment: A hardware interrupt reaching a thread outside the kernel,
     comment: which is the whole of M10. A line is claimed from IRQControl
     comment: and masked; a second claim on it gives IrqAlreadyOwned, which
@@ -516,7 +516,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: irq-test
 
-/+PythOS (M10: claiming a line without IRQControl)
+/+Safrox (M10: claiming a line without IRQControl)
     comment: An Endpoint capability in place of IRQControl. Refused with
     comment: WrongType, the line stays unowned and the destination slot
     comment: stays empty -- a refused Get leaves no trace, which is
@@ -530,7 +530,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: irq-no-cap
 
-/+PythOS (M10: the handler's destination is revoked)
+/+Safrox (M10: the handler's destination is revoked)
     comment: The race ADR 042 names. A handler is bound and its line
     comment: opened; the Notification *capability* is then deleted while
     comment: the object itself stays alive behind another capability --
@@ -546,7 +546,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: irq-revoked
 
-/+PythOS (M10: allocation inside a device interrupt)
+/+Safrox (M10: allocation inside a device interrupt)
     comment: ADR 022's tripwire has been live since M6, but only the
     comment: timer has ever reached it -- and a timer interrupt is the
     comment: kernel's own. This is the first time it fires on a path a
@@ -559,7 +559,7 @@ verbose: no
     cmdline: irq-alloc
 
 
-/+PythOS (M10: a ring 3 thread waits for an interrupt)
+/+Safrox (M10: a ring 3 thread waits for an interrupt)
     comment: M10's purpose, stated as a test. A thread at CPL 3, in its
     comment: own address space, invokes Wait on a Notification it was
     comment: given -- the first blocking syscall this kernel has -- and
@@ -578,7 +578,7 @@ verbose: no
 
 
 
-/+PythOS (M11: a component manages its own address space)
+/+Safrox (M11: a component manages its own address space)
     comment: M7 built an address space out of capabilities from inside
     comment: the kernel; M8 put code in ring 3. This is both at once: a
     comment: component at CPL 3 retypes a Frame and three page tables
@@ -601,7 +601,7 @@ verbose: no
     cmdline: vspace-user-test
 
 
-/+PythOS (M11: a component maps into the kernel half)
+/+Safrox (M11: a component maps into the kernel half)
     comment: Four kernel addresses -- PMAP, the heap, the stacks and the
     comment: image -- each refused with NotUserAddress. The component
     comment: holds the Frame and its own VSpace, so the refusal is the
@@ -616,7 +616,7 @@ verbose: no
     cmdline: vspace-user-kernel-half
 
 
-/+PythOS (M11: a component reaches for another's address space)
+/+Safrox (M11: a component reaches for another's address space)
     comment: The capability-level proof of isolation, and the scenario
     comment: the whole per-thread CSpace change exists to make possible.
     comment: B is handed the exact CPtr that names A's VSpace in A's
@@ -634,7 +634,7 @@ verbose: no
     cmdline: vspace-user-foreign
 
 
-/+PythOS (M11: a component exhausts its own budget)
+/+Safrox (M11: a component exhausts its own budget)
     comment: ADR 022 has claimed since M5 that the kernel allocates
     comment: nothing for itself and every object comes out of somebody's
     comment: Untyped. True, but only ever exercised from inside the
@@ -651,7 +651,7 @@ verbose: no
     cmdline: vspace-user-exhaust
 
 
-/+PythOS (M11: a component writes to its own read-only page)
+/+Safrox (M11: a component writes to its own read-only page)
     comment: The component maps a Frame ReadOnly, reads it successfully,
     comment: then writes -- and takes a #PF. Exit 35.
     comment: Its own scenario rather than part of vspace-user-test,
@@ -670,7 +670,7 @@ verbose: no
 
 
 
-/+PythOS (M12: the root task)
+/+Safrox (M12: the root task)
     comment: The first user component, and the milestone. The kernel
     comment: creates exactly one thread -- at CPL 3, with every root
     comment: Untyped and the IRQControl in its CSpace -- and then seals
@@ -698,7 +698,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: root-test
 
-/+PythOS (M12: the root task is given no memory)
+/+Safrox (M12: the root task is given no memory)
     comment: The handover loop runs with its bound set to zero, so the
     comment: root task starts holding no Untyped at all. The same loop,
     comment: bounded differently -- not a second code path, because a
@@ -712,7 +712,7 @@ verbose: no
     path: boot():/boot/kernel.elf
     cmdline: root-no-untyped
 
-/+PythOS (M12: the root task dies)
+/+Safrox (M12: the root task dies)
     comment: Its TCB is deleted while it runs, after it has reported
     comment: its BootInfo -- waited for, rather than timed, so the
     comment: scenario does not depend on how fast the machine is.

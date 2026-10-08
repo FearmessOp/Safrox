@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! PythOS — M1: CPU structures.
+//! Safrox — M1: CPU structures.
 //!
 //! Established by M0:
 //!   1. Limine boots us into 64-bit long mode in the higher half.
@@ -86,10 +86,10 @@ use limine::request::{
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 /// Name reported on the serial console.
-const KERNEL_NAME: &str = "PythOS";
+const KERNEL_NAME: &str = "Safrox";
 
 /// Version reported on the serial console. Kept in step with Cargo.toml.
-const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M8");
+const KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-M12");
 
 /// Lowest address of the higher half under the -2 GiB kernel code model.
 ///

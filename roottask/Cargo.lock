@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "pythos-abi"
-version = "0.1.0"
-
-[[package]]
 name = "roottask"
 version = "0.1.0"
 dependencies = [
- "pythos-abi",
+ "safrox-abi",
 ]
+
+[[package]]
+name = "safrox-abi"
+version = "0.1.0"

@@ -191,7 +191,7 @@ ikisini birden basıyor.
 
 **Bu bir istisnadır ve modelin saflığını bozar.** Yazmaktan kaçınmıyorum:
 
-> PythOS'ta kernel'in, hiçbir bileşenin hesabına yazılmayan sabit bir
+> Safrox'ta kernel'in, hiçbir bileşenin hesabına yazılmayan sabit bir
 > bellek rezervi vardır. Bu, "kernel kendi adına allocate etmez"
 > kuralının istisnasıdır.
 

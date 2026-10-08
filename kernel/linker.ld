@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * PythOS kernel link script — x86_64, Limine boot protocol (base revision 3).
+ * Safrox kernel link script — x86_64, Limine boot protocol (base revision 3).
  *
  * The kernel is a higher-half ELF executable loaded at -2 GiB, matching
  * `-C code-model=kernel`. The Limine request markers must stay in their own

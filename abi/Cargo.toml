@@ -10,15 +10,15 @@
 # twice is two structs that happen to agree today.
 
 [package]
-name = "pythos-abi"
+name = "safrox-abi"
 version = "0.1.0"
 edition = "2021"
-description = "The PythOS kernel/user ABI"
+description = "The Safrox kernel/user ABI"
 license = "BSD-2-Clause"
 publish = false
 
 [lib]
-name = "pythos_abi"
+name = "safrox_abi"
 path = "src/lib.rs"
 test = false
 bench = false

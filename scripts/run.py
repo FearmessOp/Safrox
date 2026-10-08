@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
-"""Boot a PythOS ISO under QEMU and validate the acceptance criteria.
+"""Boot a Safrox ISO under QEMU and validate the acceptance criteria.
 
 Why a runner instead of plain `qemu ... && echo ok`?
 
@@ -66,7 +66,7 @@ def describe_status(status: int) -> str:
 # `-no-reboot` is supposed to turn into a clean exit instead. Every scenario
 # is checked for this, because "it eventually printed the right thing, after
 # rebooting" is not passing.
-BANNER = re.compile(r"^PythOS \S+", re.M)
+BANNER = re.compile(r"^Safrox \S+", re.M)
 
 
 @dataclass
@@ -83,7 +83,7 @@ class Expectation:
 # identifies itself, Limine identifies itself, and the kernel reports where
 # it was loaded.
 COMMON_BOOT_LINES = [
-    re.compile(r"^PythOS \S+", re.M),  # name/version
+    re.compile(r"^Safrox \S+", re.M),  # name/version
     re.compile(r"^\[boot\] bootloader: \S+ \S+", re.M),  # from Limine
     re.compile(r"^\[boot\] higher-half base: 0xffffffff[0-9a-f]+", re.M),
 ]

@@ -26,12 +26,12 @@ makefile = open("Makefile", encoding="utf-8").read()
 
 # 1. The ISO variables, beside the M9b ones.
 makefile = makefile.replace(
-    "ISO_IPCCOST := $(BUILD_DIR)/pythos-ipccost.iso\n",
-    "ISO_IPCCOST := $(BUILD_DIR)/pythos-ipccost.iso\n"
-    "ISO_IPCCAP := $(BUILD_DIR)/pythos-ipccap.iso\n"
-    "ISO_IPCCAPHOSTILE := $(BUILD_DIR)/pythos-ipccaphostile.iso\n"
-    "ISO_IPCNTFNREV := $(BUILD_DIR)/pythos-ipcntfnrev.iso\n"
-    "ISO_IPCCAPCOST := $(BUILD_DIR)/pythos-ipccapcost.iso\n",
+    "ISO_IPCCOST := $(BUILD_DIR)/safrox-ipccost.iso\n",
+    "ISO_IPCCOST := $(BUILD_DIR)/safrox-ipccost.iso\n"
+    "ISO_IPCCAP := $(BUILD_DIR)/safrox-ipccap.iso\n"
+    "ISO_IPCCAPHOSTILE := $(BUILD_DIR)/safrox-ipccaphostile.iso\n"
+    "ISO_IPCNTFNREV := $(BUILD_DIR)/safrox-ipcntfnrev.iso\n"
+    "ISO_IPCCAPCOST := $(BUILD_DIR)/safrox-ipccapcost.iso\n",
     1,
 )
 
@@ -112,7 +112,7 @@ if grep -q 'ipc-cap-test' boot/limine.conf.in; then
 else
     cat >> boot/limine.conf.in <<'EOF'
 
-/+PythOS (M9c: capability transfer)
+/+Safrox (M9c: capability transfer)
     comment: ADR 035's authority half. Four capabilities at most, into
     comment: slots the RECEIVER opened -- a sender cannot name a
     comment: destination in another CSpace, so there is nothing for it
@@ -123,7 +123,7 @@ else
     path: boot():/boot/kernel.elf
     cmdline: ipc-cap-test
 
-/+PythOS (M9c: hostile capability transfers)
+/+Safrox (M9c: hostile capability transfers)
     comment: Malformed transfers: reserved CPtr bits, a leaf index past
     comment: its CNode, a root index past the root, and a well-formed
     comment: capability without GRANT. Each is dropped silently (ADR
@@ -136,7 +136,7 @@ else
     path: boot():/boot/kernel.elf
     cmdline: ipc-cap-hostile
 
-/+PythOS (M9c: revoked notification)
+/+Safrox (M9c: revoked notification)
     comment: A thread blocked in Wait when the Notification's
     comment: capability is deleted. It wakes with EndpointDead rather
     comment: than waiting forever -- ADR 039's reasoning, which is not
@@ -148,7 +148,7 @@ else
     path: boot():/boot/kernel.elf
     cmdline: ipc-notification-revoked
 
-/+PythOS (M9c: capability transfer cost)
+/+Safrox (M9c: capability transfer cost)
     comment: What a capability costs on the IPC path: Send+Recv with 0,
     comment: 1 and 4 of them. ADR 035 chose four on the grounds that
     comment: each is bounded work -- a CPtr resolution, a rights check,

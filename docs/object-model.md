@@ -1,4 +1,4 @@
-# PythOS nesne modeli
+# Safrox nesne modeli
 
 Status: fixed at M5 (architect pass). Bu belgedeki **nesne kümesi, CPtr
 formatı ve hak bitleri kalıcıdır**; M13'e kadar değişmeyecek. Gerekçeler

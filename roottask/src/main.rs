@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-//! PythOS root task — the first user component (ADR 044).
+//! Safrox root task — the first user component (ADR 044).
 //!
 //! **This is the milestone.** Until M11 every component was built by
 //! kernel code: `build_component` computed the CPtrs, wrote the
@@ -29,8 +29,8 @@
 //! is mapped read-execute with the code, and the linker script fails
 //! the build rather than letting it fault at run time.
 
-use pythos_abi as abi;
-use pythos_abi::{cap_type, method, perm, BootInfo, CPtr, UntypedDesc};
+use safrox_abi as abi;
+use safrox_abi::{cap_type, method, perm, BootInfo, CPtr, UntypedDesc};
 
 // ---- Entry -------------------------------------------------------------
 

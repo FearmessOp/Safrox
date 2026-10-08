@@ -25,8 +25,8 @@ sırasında `@DEFAULT_ENTRY@` yerine `1` veya `2` konarak iki ayrı config
 
 | ISO | `default_entry` | Girdi | Beklenen çıkış |
 |---|---|---|---|
-| `build/pythos.iso` | 1 | normal boot | 33 |
-| `build/pythos-panic.iso` | 2 | `cmdline: panic-test` | 35 |
+| `build/safrox.iso` | 1 | normal boot | 33 |
+| `build/safrox-panic.iso` | 2 | `cmdline: panic-test` | 35 |
 
 Kernel, Limine'den aldığı command line'da `panic-test` token'ını arar ve
 bulursa kasıtlı olarak panic eder. Bu kontrol normal binary'nin içindedir;

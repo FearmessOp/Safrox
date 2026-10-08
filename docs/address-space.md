@@ -1,4 +1,4 @@
-# PythOS adres uzayı haritası
+# Safrox adres uzayı haritası
 
 Status: fixed at M3 (architect pass). Bu haritadaki **user/kernel sınırı ve
 kernel aralıklarının başlangıç adresleri kalıcıdır**; M8'de user space

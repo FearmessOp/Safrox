@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# PythOS — M0 build system.
+# Safrox — M0 build system.
 #
 #   make            Build the kernel and both ISO images.
 #   make run        Boot the normal ISO; expects QEMU host status 33.
@@ -25,64 +25,64 @@ CARGO_FLAGS := --profile $(PROFILE)
 # ---- Layout ------------------------------------------------------------
 
 TARGET      := x86_64-unknown-none
-CARGO_OUT   := target/$(TARGET)/$(PROFILE)/pythos
+CARGO_OUT   := target/$(TARGET)/$(PROFILE)/safrox
 
 BUILD_DIR   := build
 ISO_ROOT    := $(BUILD_DIR)/iso_root
 KERNEL      := $(BUILD_DIR)/kernel.elf
-ISO         := $(BUILD_DIR)/pythos.iso
-ISO_PANIC   := $(BUILD_DIR)/pythos-panic.iso
+ISO         := $(BUILD_DIR)/safrox.iso
+ISO_PANIC   := $(BUILD_DIR)/safrox-panic.iso
 # M1 fault-injection images. Same kernel.elf, different Limine default_entry.
-ISO_INT3    := $(BUILD_DIR)/pythos-int3.iso
-ISO_PF      := $(BUILD_DIR)/pythos-pf.iso
-ISO_DF      := $(BUILD_DIR)/pythos-df.iso
+ISO_INT3    := $(BUILD_DIR)/safrox-int3.iso
+ISO_PF      := $(BUILD_DIR)/safrox-pf.iso
+ISO_DF      := $(BUILD_DIR)/safrox-df.iso
 # M2 frame allocator images.
-ISO_MEMTEST := $(BUILD_DIR)/pythos-memtest.iso
-ISO_DFREE   := $(BUILD_DIR)/pythos-doublefree.iso
+ISO_MEMTEST := $(BUILD_DIR)/safrox-memtest.iso
+ISO_DFREE   := $(BUILD_DIR)/safrox-doublefree.iso
 # M3 virtual memory images.
-ISO_VMTEST   := $(BUILD_DIR)/pythos-vmtest.iso
-ISO_STALETLB := $(BUILD_DIR)/pythos-staletlb.iso
-ISO_GUARD    := $(BUILD_DIR)/pythos-guardpage.iso
-ISO_NX       := $(BUILD_DIR)/pythos-nx.iso
-ISO_STACKOVF := $(BUILD_DIR)/pythos-stackovf.iso
+ISO_VMTEST   := $(BUILD_DIR)/safrox-vmtest.iso
+ISO_STALETLB := $(BUILD_DIR)/safrox-staletlb.iso
+ISO_GUARD    := $(BUILD_DIR)/safrox-guardpage.iso
+ISO_NX       := $(BUILD_DIR)/safrox-nx.iso
+ISO_STACKOVF := $(BUILD_DIR)/safrox-stackovf.iso
 # M4 kernel heap images.
-ISO_HEAPTEST  := $(BUILD_DIR)/pythos-heaptest.iso
-ISO_HEAPOOM   := $(BUILD_DIR)/pythos-heapoom.iso
-ISO_HEAPGUARD := $(BUILD_DIR)/pythos-heapguard.iso
-ISO_CAPTEST := $(BUILD_DIR)/pythos-captest.iso
-ISO_CAPREVOKE := $(BUILD_DIR)/pythos-caprevoke.iso
-ISO_CAPINTALLOC := $(BUILD_DIR)/pythos-capintalloc.iso
-ISO_CAPRETIRED := $(BUILD_DIR)/pythos-capretired.iso
-ISO_THREADTEST := $(BUILD_DIR)/pythos-threadtest.iso
-ISO_THREADOVF := $(BUILD_DIR)/pythos-threadovf.iso
-ISO_THREADINTALLOC := $(BUILD_DIR)/pythos-threadintalloc.iso
-ISO_THREADKILL := $(BUILD_DIR)/pythos-threadkill.iso
+ISO_HEAPTEST  := $(BUILD_DIR)/safrox-heaptest.iso
+ISO_HEAPOOM   := $(BUILD_DIR)/safrox-heapoom.iso
+ISO_HEAPGUARD := $(BUILD_DIR)/safrox-heapguard.iso
+ISO_CAPTEST := $(BUILD_DIR)/safrox-captest.iso
+ISO_CAPREVOKE := $(BUILD_DIR)/safrox-caprevoke.iso
+ISO_CAPINTALLOC := $(BUILD_DIR)/safrox-capintalloc.iso
+ISO_CAPRETIRED := $(BUILD_DIR)/safrox-capretired.iso
+ISO_THREADTEST := $(BUILD_DIR)/safrox-threadtest.iso
+ISO_THREADOVF := $(BUILD_DIR)/safrox-threadovf.iso
+ISO_THREADINTALLOC := $(BUILD_DIR)/safrox-threadintalloc.iso
+ISO_THREADKILL := $(BUILD_DIR)/safrox-threadkill.iso
 # M7 address space images.
-ISO_VSPACETEST := $(BUILD_DIR)/pythos-vspacetest.iso
-ISO_VSKERNEL := $(BUILD_DIR)/pythos-vskernel.iso
-ISO_VSISOLATION := $(BUILD_DIR)/pythos-vsisolation.iso
-ISO_VSSTALE := $(BUILD_DIR)/pythos-vsstale.iso
+ISO_VSPACETEST := $(BUILD_DIR)/safrox-vspacetest.iso
+ISO_VSKERNEL := $(BUILD_DIR)/safrox-vskernel.iso
+ISO_VSISOLATION := $(BUILD_DIR)/safrox-vsisolation.iso
+ISO_VSSTALE := $(BUILD_DIR)/safrox-vsstale.iso
 # M8 ring 3 images.
-ISO_USERTEST := $(BUILD_DIR)/pythos-usertest.iso
-ISO_USERPRIV := $(BUILD_DIR)/pythos-userpriv.iso
-ISO_USERKREAD := $(BUILD_DIR)/pythos-userkread.iso
-ISO_USERSMEP := $(BUILD_DIR)/pythos-usersmep.iso
-ISO_USERSMAP := $(BUILD_DIR)/pythos-usersmap.iso
-ISO_USERFORGE := $(BUILD_DIR)/pythos-userforge.iso
+ISO_USERTEST := $(BUILD_DIR)/safrox-usertest.iso
+ISO_USERPRIV := $(BUILD_DIR)/safrox-userpriv.iso
+ISO_USERKREAD := $(BUILD_DIR)/safrox-userkread.iso
+ISO_USERSMEP := $(BUILD_DIR)/safrox-usersmep.iso
+ISO_USERSMAP := $(BUILD_DIR)/safrox-usersmap.iso
+ISO_USERFORGE := $(BUILD_DIR)/safrox-userforge.iso
 # M9a IPC images.
-ISO_IPCTEST := $(BUILD_DIR)/pythos-ipctest.iso
-ISO_IPCCANCEL := $(BUILD_DIR)/pythos-ipccancel.iso
-ISO_IPCREVOKED := $(BUILD_DIR)/pythos-ipcrevoked.iso
+ISO_IPCTEST := $(BUILD_DIR)/safrox-ipctest.iso
+ISO_IPCCANCEL := $(BUILD_DIR)/safrox-ipccancel.iso
+ISO_IPCREVOKED := $(BUILD_DIR)/safrox-ipcrevoked.iso
 # M9b call/reply images.
-ISO_IPCCALL := $(BUILD_DIR)/pythos-ipccall.iso
-ISO_IPCDEAD := $(BUILD_DIR)/pythos-ipcdead.iso
-ISO_IPCSTALE := $(BUILD_DIR)/pythos-ipcstale.iso
-ISO_IPCSELF := $(BUILD_DIR)/pythos-ipcself.iso
-ISO_IPCCOST := $(BUILD_DIR)/pythos-ipccost.iso
-ISO_IPCCAP := $(BUILD_DIR)/pythos-ipccap.iso
-ISO_IPCCAPHOSTILE := $(BUILD_DIR)/pythos-ipccaphostile.iso
-ISO_IPCNTFNREV := $(BUILD_DIR)/pythos-ipcntfnrev.iso
-ISO_IPCCAPCOST := $(BUILD_DIR)/pythos-ipccapcost.iso
+ISO_IPCCALL := $(BUILD_DIR)/safrox-ipccall.iso
+ISO_IPCDEAD := $(BUILD_DIR)/safrox-ipcdead.iso
+ISO_IPCSTALE := $(BUILD_DIR)/safrox-ipcstale.iso
+ISO_IPCSELF := $(BUILD_DIR)/safrox-ipcself.iso
+ISO_IPCCOST := $(BUILD_DIR)/safrox-ipccost.iso
+ISO_IPCCAP := $(BUILD_DIR)/safrox-ipccap.iso
+ISO_IPCCAPHOSTILE := $(BUILD_DIR)/safrox-ipccaphostile.iso
+ISO_IPCNTFNREV := $(BUILD_DIR)/safrox-ipcntfnrev.iso
+ISO_IPCCAPCOST := $(BUILD_DIR)/safrox-ipccapcost.iso
 
 ALL_ISOS    := $(ISO) $(ISO_PANIC) $(ISO_INT3) $(ISO_PF) $(ISO_DF) \
                $(ISO_MEMTEST) $(ISO_DFREE) \
@@ -629,10 +629,10 @@ run-ipccapcost: $(ISO_IPCCAPCOST)
 # milestone can add itself without touching a line another milestone
 # depends on.
 
-ISO_IRQTEST := $(BUILD_DIR)/pythos-irqtest.iso
-ISO_IRQNOCAP := $(BUILD_DIR)/pythos-irqnocap.iso
-ISO_IRQREVOKED := $(BUILD_DIR)/pythos-irqrevoked.iso
-ISO_IRQALLOC := $(BUILD_DIR)/pythos-irqalloc.iso
+ISO_IRQTEST := $(BUILD_DIR)/safrox-irqtest.iso
+ISO_IRQNOCAP := $(BUILD_DIR)/safrox-irqnocap.iso
+ISO_IRQREVOKED := $(BUILD_DIR)/safrox-irqrevoked.iso
+ISO_IRQALLOC := $(BUILD_DIR)/safrox-irqalloc.iso
 
 ALL_ISOS += $(ISO_IRQTEST) $(ISO_IRQNOCAP) $(ISO_IRQREVOKED) $(ISO_IRQALLOC)
 
@@ -688,7 +688,7 @@ test: run-irqtest run-irqnocap run-irqrevoked run-irqalloc
 # exist before it could be written at all. Keeping the two additions
 # apart leaves that order visible.
 
-ISO_IRQUSER := $(BUILD_DIR)/pythos-irquser.iso
+ISO_IRQUSER := $(BUILD_DIR)/safrox-irquser.iso
 
 ALL_ISOS += $(ISO_IRQUSER)
 
@@ -713,11 +713,11 @@ test: run-irquser
 #
 # Entry numbers continue from M10's 50.
 
-ISO_VSUSERTEST    := $(BUILD_DIR)/pythos-vsusertest.iso
-ISO_VSUSERKERNEL  := $(BUILD_DIR)/pythos-vsuserkernel.iso
-ISO_VSUSERFOREIGN := $(BUILD_DIR)/pythos-vsuserforeign.iso
-ISO_VSUSEREXHAUST := $(BUILD_DIR)/pythos-vsuserexhaust.iso
-ISO_VSUSERRO      := $(BUILD_DIR)/pythos-vsuserro.iso
+ISO_VSUSERTEST    := $(BUILD_DIR)/safrox-vsusertest.iso
+ISO_VSUSERKERNEL  := $(BUILD_DIR)/safrox-vsuserkernel.iso
+ISO_VSUSERFOREIGN := $(BUILD_DIR)/safrox-vsuserforeign.iso
+ISO_VSUSEREXHAUST := $(BUILD_DIR)/safrox-vsuserexhaust.iso
+ISO_VSUSERRO      := $(BUILD_DIR)/safrox-vsuserro.iso
 
 ALL_ISOS += $(ISO_VSUSERTEST) $(ISO_VSUSERKERNEL) $(ISO_VSUSERFOREIGN) \
             $(ISO_VSUSEREXHAUST) $(ISO_VSUSERRO)
@@ -819,9 +819,9 @@ $(KERNEL): $(ROOTTASK_BIN)
 # The scenarios. root-test exits 33; root-dies exits 35, because a
 # dead root task is a panic (ADR 044) — after it, no capability names
 # any resource, so "carry on" would mean "carry on doing nothing".
-ISO_ROOTTEST     := $(BUILD_DIR)/pythos-roottest.iso
-ISO_ROOTNOUNTYPED := $(BUILD_DIR)/pythos-rootnountyped.iso
-ISO_ROOTDIES     := $(BUILD_DIR)/pythos-rootdies.iso
+ISO_ROOTTEST     := $(BUILD_DIR)/safrox-roottest.iso
+ISO_ROOTNOUNTYPED := $(BUILD_DIR)/safrox-rootnountyped.iso
+ISO_ROOTDIES     := $(BUILD_DIR)/safrox-rootdies.iso
 
 ALL_ISOS += $(ISO_ROOTTEST) $(ISO_ROOTNOUNTYPED) $(ISO_ROOTDIES)
 

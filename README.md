@@ -1,4 +1,4 @@
-# PythOS
+# Safrox
 
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).

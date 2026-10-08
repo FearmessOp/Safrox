@@ -96,7 +96,7 @@ ring 3'e giriş yolunun tek bir şekli olmasını sağlıyor.
 ```rust
 #[repr(C)]
 struct BootInfo {
-    magic: u64,            // 0x50797468_42495631 "PythBIV1"
+    magic: u64,            // 0x53616672_42495631 "SafrBIV1"
     version: u32,
     header_size: u32,      // bu yapının boyutu
     untyped_count: u32,

@@ -42,8 +42,8 @@ pub const ROOT_STACK_TOP: u64 = ROOT_STACK_ADDRESS + 4096 - 16;
 /// back its own words as though they were the kernel's.
 pub const BOOTINFO_ADDRESS: u64 = 0x0060_0000;
 
-/// `"PythBIV1"`, big-endian so it reads as text in a hex dump.
-pub const BOOTINFO_MAGIC: u64 = 0x5079_7468_4249_5631;
+/// `"SafrBIV1"`, big-endian so it reads as text in a hex dump.
+pub const BOOTINFO_MAGIC: u64 = 0x5361_6672_4249_5631;
 
 /// The version this header describes.
 pub const BOOTINFO_VERSION: u32 = 1;

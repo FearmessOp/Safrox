@@ -184,7 +184,7 @@ gerektiriyor. ISO'lar hibrit (BIOS + UEFI), yani `dd` ile USB'ye
 yazılabiliyor:
 
 ```sh
-sudo dd if=build/pythos-vmtest.iso of=/dev/sdX bs=4M status=progress
+sudo dd if=build/safrox-vmtest.iso of=/dev/sdX bs=4M status=progress
 ```
 
 Seri çıktı için ya gerçek bir COM portu ya bir USB-seri adaptör gerekiyor;
