@@ -353,11 +353,92 @@ pub fn run() -> ! {
     check_delivery();
     check_mask_until_ack();
     measure_wake_latency();
+    check_hardware_mask();
 
     irq::report();
     println!("[irq] all interrupt tests passed");
 
     crate::qemu::exit(crate::qemu::EXIT_SUCCESS)
+}
+
+/// 6. The hardware mask agrees with the software flag (M12).
+///
+/// **Added by M12, and it does not change what the scenario above
+/// asserts** — ADR 042's contract is the same contract, kept by the
+/// same software flag, and `check_mask_until_ack` is untouched.
+///
+/// # What this can and cannot show
+///
+/// It cannot show that the hardware mask *stops an interrupt*,
+/// because this scenario raises its interrupts with a self-IPI
+/// (M10's deliberate choice: with a real device, "no second
+/// interrupt" and "nothing was sent" are indistinguishable, which is
+/// ADR 023's K8). A self-IPI goes LAPIC-to-CPU and never passes
+/// through the I/O APIC, so no redirection-table mask could stop it.
+///
+/// Claiming the hardware mask made the scenario pass would therefore
+/// be unfalsifiable — it would pass identically with the chip
+/// unplugged.
+///
+/// What *is* falsifiable: the register holds what the kernel wrote.
+/// `ioapic::verify` reads every redirection entry back off the chip
+/// and compares it against the software flag. A mask that never
+/// reached the hardware reads back unmasked and this fails.
+fn check_hardware_mask() {
+    if !crate::ioapic::present() {
+        // No chip on this machine. Reported rather than skipped
+        // silently: a check that quietly does nothing is
+        // indistinguishable from one that passed.
+        println!(
+            "[irq] no I/O APIC on this machine; the software flag is \
+             carrying ADR 042's contract alone, which is what it has \
+             always done"
+        );
+        return;
+    }
+
+    // Interrupts off: `verify` reads the select/data register pair,
+    // which `set_masked` also writes.
+    let _guard = crate::sched::InterruptGuard::new();
+
+    // SAFETY: Interrupts are disabled by the guard above.
+    let disagreements = unsafe { crate::ioapic::verify() };
+
+    assert_eq!(
+        disagreements, 0,
+        "{} interrupt line(s) are masked in software but not in \
+         hardware, or the reverse. The two are written together by \
+         `cap::irq::set_masked`, so a disagreement means a write did \
+         not reach the chip -- which would leave a real device free to \
+         keep asserting a line the kernel believes is shut.",
+        disagreements
+    );
+
+    // And the writes actually happened. Without this the check above
+    // would pass on a kernel where `set_masked` did nothing at all:
+    // the software flag and an all-masked chip would agree for every
+    // line that was never unmasked.
+    let writes = crate::ioapic::mask_writes();
+    assert!(
+        writes > 0,
+        "the I/O APIC is present and every line agrees with the \
+         software flag, but no mask write was ever performed. The \
+         agreement is a coincidence: the chip came up all-masked and \
+         nothing has touched it since."
+    );
+
+    println!(
+        "[irq] i/o apic: {} redirection entries, {} mask writes, all \
+         lines agree with the software flag when read back off the chip",
+        crate::ioapic::redirection_count(),
+        writes
+    );
+    println!(
+        "[irq] the hardware mask is wired and verified, but it is NOT \
+         what makes this scenario pass: a self-IPI goes LAPIC-to-CPU \
+         and never reaches the I/O APIC. The software flag keeps \
+         ADR 042's contract, exactly as it did in M10"
+    );
 }
 
 /// 1. A line is claimed once, and only once (ADR 041).

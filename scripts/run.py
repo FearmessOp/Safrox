@@ -3002,6 +3002,121 @@ EXPECTATIONS = {
             re.compile(r"\(supervisor write", re.M),
         ],
     ),
+    # ---- M12: the root task --------------------------------------------
+    "roottest": Expectation(
+        name="the root task, and the kernel that stops",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            *THREAD_INIT_LINES,
+            *VSPACE_INIT_LINES,
+            # The kernel handed everything over and then sealed. The
+            # operation count is in the line, so a seal that closed
+            # before the handover would read differently.
+            re.compile(
+                r"^\[root\] sealed after \d+ privileged operations", re.M
+            ),
+            # Criterion 1: it read what the kernel wrote.
+            re.compile(
+                r"^\[roottest\] the root task read its BootInfo at "
+                r"0x[0-9a-f]{16}: magic ok, version \d+, \d+ untypeds",
+                re.M,
+            ),
+            # Criterion 3. **All four terms**, and the regex demands
+            # the "three mechanisms" sentence: the figures come from
+            # the capabilities, from call counting and from the
+            # bitmap, which is what lets them disagree. A single
+            # derived number could not.
+            re.compile(
+                r"^\[roottest\] accounting: \d+ MiB in untypeds \+ \d+ "
+                r"MiB kept by the kernel \+ \d+ KiB unreachable = \d+ "
+                r"MiB usable",
+                re.M,
+            ),
+            # Criterion 2, the milestone. The badge is in the line
+            # because the badge is the claim -- the sender did not
+            # choose it.
+            re.compile(
+                r"^\[roottest\] two components built by a ring 3 program "
+                r"exchanged a message; the receiver woke with badge "
+                r"0x5eed",
+                re.M,
+            ),
+            # Criterion 4.
+            re.compile(
+                r"^\[roottest\] the kernel performed \d+ privileged "
+                r"operations during boot and none since the seal",
+                re.M,
+            ),
+            re.compile(r"^\[roottest\] all root task tests passed", re.M),
+            re.compile(r"^\[boot\] M12 checks passed", re.M),
+        ],
+        forbidden=[
+            # The root task's panic handler cannot print, so its only
+            # trace is the kernel reporting that the channel fired.
+            re.compile(r"the root task's panic handler ran", re.M),
+            re.compile(r"never finished", re.M),
+            # A sum that balances only because the remainder absorbed
+            # the difference.
+            re.compile(r"do not balance", re.M),
+        ],
+    ),
+    "rootnountyped": Expectation(
+        name="the root task is given no memory",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            re.compile(
+                r"^\[root\] root-no-untyped: handing over 0 of \d+ "
+                r"untypeds",
+                re.M,
+            ),
+            # **Error 11 exactly**, not `\d+`. The first version of
+            # this pattern accepted any digits and the kernel
+            # printed "reported error 0" -- a bare ERROR_FLAG, which
+            # says only that something went wrong. A root task that
+            # set the flag for any reason would have matched.
+            re.compile(
+                r"^\[roottest\] the root task found no usable Untyped, "
+                r"reported error 11, and stopped; the kernel is still "
+                r"running and did nothing on its behalf",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            # Zero is not an error code.
+            re.compile(r"reported error 0,", re.M),
+            # The kernel stepping in would mean it had not really
+            # handed the memory over.
+            re.compile(
+                r"the kernel performed privileged operations while its "
+                r"component starved",
+                re.M,
+            ),
+        ],
+    ),
+    "rootdies": Expectation(
+        name="the root task dies",
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            # It was genuinely running first. Without this the panic
+            # would be consistent with a root task that never started.
+            re.compile(
+                r"^\[roottest\] the root task is running \(it read its "
+                r"BootInfo\); revoking its TCB now",
+                re.M,
+            ),
+            re.compile(r"^\*\*\* KERNEL PANIC \*\*\*", re.M),
+        ],
+        forbidden=[
+            re.compile(r"M12 checks passed", re.M),
+            # The failure this rules out: the kernel carrying on with
+            # nothing able to name any resource.
+            re.compile(r"carried on", re.M),
+        ],
+    ),
 }
 
 

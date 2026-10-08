@@ -20,4 +20,9 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "limine",
+ "pythos-abi",
 ]
+
+[[package]]
+name = "pythos-abi"
+version = "0.1.0"

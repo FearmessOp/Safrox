@@ -172,12 +172,60 @@ static OWNERS: [AtomicU64; MAX_IRQ] = [const { AtomicU64::new(0) }; MAX_IRQ];
 /// a line is masked and unmasked on every single interrupt, and its
 /// owner changes once.
 ///
-/// A software flag today, and ADR 042 says so plainly rather than
-/// implying otherwise: M12 moves it to a real IOAPIC redirection-table
-/// mask. What the flag already provides is the *contract* — no second
-/// delivery before `Ack` — and that contract is what scenario 4 tests,
-/// so the test does not change when the mechanism does.
+/// # The flag and the hardware (M10's debt, paid in M12)
+///
+/// M10 said this was a software flag and that M12 would move it to a
+/// real I/O APIC redirection-table mask. It has, and the honest
+/// account of what changed is narrower than "the mask is now real".
+///
+/// **The flag stays, and it is still what enforces the contract.**
+/// [`handle_interrupt`] reads it with one atomic load, on the
+/// interrupt path, where a device-register read through the
+/// select/data window would be two uncached accesses that cannot be
+/// made atomic against a concurrent write. ADR 042's contract — no
+/// second delivery before `Ack` — is the flag's.
+///
+/// What the hardware adds is stopping the line *at the source*, so
+/// a masked line costs no dispatch and no EOI. That matters for a
+/// real device and is invisible to `irq-test`, which raises its
+/// interrupts with a self-IPI: those go LAPIC-to-CPU and never pass
+/// through the I/O APIC at all.
+///
+/// So the two are kept in step and [`crate::ioapic::verify`] checks
+/// that they are, because "the register holds what we wrote" is a
+/// falsifiable claim where "the interrupt did not arrive" would not
+/// have been — it was never going to.
 static MASKED: [AtomicU8; MAX_IRQ] = [const { AtomicU8::new(1) }; MAX_IRQ];
+
+/// Set both the flag and the hardware, in that order.
+///
+/// **The flag first when masking**, the hardware first when
+/// unmasking, and the asymmetry is deliberate: whichever is set
+/// first, the window between them must fail *closed*. Masking means
+/// the flag shuts the door before the hardware does; unmasking means
+/// the hardware opens before the flag does. An interrupt arriving in
+/// either window is dropped by the flag, which is the safe answer.
+///
+/// # Safety
+///
+/// Interrupts must be disabled: `ioapic::set_masked` is a
+/// read-modify-write of a device register.
+unsafe fn set_masked(irq: usize, masked: bool) {
+    debug_assert!(irq < MAX_IRQ);
+    if masked {
+        MASKED[irq].store(1, Ordering::Release);
+        // SAFETY: Caller's guarantee that interrupts are disabled.
+        unsafe {
+            crate::ioapic::set_masked(irq as u8, true);
+        }
+    } else {
+        // SAFETY: As above.
+        unsafe {
+            crate::ioapic::set_masked(irq as u8, false);
+        }
+        MASKED[irq].store(0, Ordering::Release);
+    }
+}
 
 /// Interrupts delivered to a Notification.
 static DELIVERED: AtomicU64 = AtomicU64::new(0);
@@ -366,7 +414,10 @@ pub unsafe fn irq_control_get(
     // has nowhere to receive an interrupt, so delivering one would
     // produce a refusal by construction. `Ack` is what opens the
     // line, and a driver calls it when it is ready to be interrupted.
-    MASKED[irq as usize].store(1, Ordering::Release);
+    // SAFETY: An InterruptGuard is held for the whole function.
+    unsafe {
+        set_masked(irq as usize, true);
+    }
     OWNERS[irq as usize].store(slot.object().0 .0, Ordering::Release);
 
     Ok(())
@@ -441,7 +492,10 @@ pub unsafe fn ack(slot: &Slot) -> Result<(), CapError> {
     let irq = handler.irq as usize;
     debug_assert!(irq < MAX_IRQ, "an IrqHandler holds an out-of-range line");
 
-    MASKED[irq].store(0, Ordering::Release);
+    // SAFETY: An InterruptGuard is held for the whole function.
+    unsafe {
+        set_masked(irq, false);
+    }
     ACKS.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
@@ -473,7 +527,10 @@ pub unsafe fn release_line(slot: &Slot) -> bool {
     // the line first makes that window empty rather than merely
     // short. The orphan counter still exists because the interrupt
     // may already have been raised before this line ran.
-    MASKED[irq].store(1, Ordering::Release);
+    // SAFETY: The caller guarantees interrupts are disabled.
+    unsafe {
+        set_masked(irq, true);
+    }
     OWNERS[irq].store(0, Ordering::Release);
 
     handler.bound = 0;
@@ -516,7 +573,11 @@ pub unsafe fn handle_interrupt(irq: u8) -> bool {
         // (ADR 030: the kernel does not stop because of something
         // outside it), and not a silent open line (a storm).
         ORPHANED.fetch_add(1, Ordering::AcqRel);
-        MASKED[index].store(1, Ordering::Release);
+        // SAFETY: This runs in the interrupt handler, so interrupts
+        // are disabled.
+        unsafe {
+            set_masked(index, true);
+        }
         return false;
     }
 
@@ -546,7 +607,16 @@ pub unsafe fn handle_interrupt(irq: u8) -> bool {
     //    the driver had started on the first -- and because a signal
     //    is a mask rather than a count (ADR 038), the driver would
     //    have no way to tell one interrupt from two.
-    MASKED[index].store(1, Ordering::Release);
+    //
+    //    The hardware mask goes with it. On the interrupt path that
+    //    is two uncached device accesses, which is real cost -- but
+    //    it is the cost of a line that is genuinely shut rather than
+    //    one whose interrupts the kernel keeps taking and dropping.
+    //
+    // SAFETY: Interrupts are disabled in an interrupt handler.
+    unsafe {
+        set_masked(index, true);
+    }
 
     if handler.bound == 0 {
         // Owned, but the driver never said where to deliver. The line

@@ -667,3 +667,68 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: vspace-user-ro
+
+
+
+/+PythOS (M12: the root task)
+    comment: The first user component, and the milestone. The kernel
+    comment: creates exactly one thread -- at CPL 3, with every root
+    comment: Untyped and the IRQControl in its CSpace -- and then seals
+    comment: itself. Everything else in the system is built from
+    comment: roottask/src/main.rs, a separate crate that links against
+    comment: core and the ABI and nothing else, so "the kernel contains
+    comment: no component-building code" is enforced by the linker
+    comment: rather than asserted in a comment.
+    comment: Four criteria. It reads its BootInfo and reports it; it
+    comment: builds two components from its own Untypeds and connects
+    comment: them with an Endpoint, and they exchange a message; the
+    comment: accounting adds up; and the kernel's privileged-operation
+    comment: counter does not move after the seal.
+    comment: The accounting is the one that could most easily prove
+    comment: nothing. usable = untyped + kernel + lost, and the three
+    comment: figures come from three different mechanisms -- the
+    comment: capabilities, call counting, and the bitmap -- so they can
+    comment: disagree. The fourth term is real: boot builds Untypeds of
+    comment: 2^k bytes at 2^k boundaries, and the frames that fit no
+    comment: such block are unreachable once the allocator retires.
+    comment: Reporting it separately is the difference between a sum
+    comment: that balances and one that balances for the right reason.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: root-test
+
+/+PythOS (M12: the root task is given no memory)
+    comment: The handover loop runs with its bound set to zero, so the
+    comment: root task starts holding no Untyped at all. The same loop,
+    comment: bounded differently -- not a second code path, because a
+    comment: second path would test itself rather than the kernel.
+    comment: It must notice, report, and stop; and the kernel must stay
+    comment: up and do nothing on its behalf. A kernel that stepped in
+    comment: when its component ran out would not have handed the
+    comment: memory over in the first place.
+    comment: Exit 33: a starved component is a component's problem.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: root-no-untyped
+
+/+PythOS (M12: the root task dies)
+    comment: Its TCB is deleted while it runs, after it has reported
+    comment: its BootInfo -- waited for, rather than timed, so the
+    comment: scenario does not depend on how fast the machine is.
+    comment: The kernel must panic. ADR 044 decided this and the
+    comment: reasoning is worth repeating, because "carry on" sounds
+    comment: like the robust answer: every capability in the system
+    comment: descends from one the root task held, so afterwards
+    comment: nothing can name an Untyped, an interrupt line or a frame
+    comment: -- not because the kernel refuses but because a CPtr is
+    comment: meaningful only relative to a root, and the only root that
+    comment: reached anything is gone. "Continues" would mean
+    comment: "continues doing nothing, forever, with no way to be told".
+    comment: Rebooting was considered and rejected: it is the same
+    comment: decision wearing a recovery story, and it hides the
+    comment: failure from the person who needs to see it.
+    comment: Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: root-dies

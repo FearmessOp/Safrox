@@ -61,12 +61,15 @@ mod heaptest;
 mod idt;
 mod interrupts;
 mod io;
+mod ioapic;
 mod ipctest;
 mod irqtest;
 mod memory;
 mod memtest;
 mod panic;
 mod qemu;
+mod roottask;
+mod roottest;
 mod sched;
 mod serial;
 mod syscall;
@@ -629,6 +632,23 @@ extern "C" fn kmain() -> ! {
     let lapic_hz = unsafe { apic::init() };
     let _ = lapic_hz;
 
+    // ---- The I/O APIC (M10's debt, paid in M12) ------------------------
+    //
+    // After `apic::init`, because it maps the page next to the
+    // LAPIC's and reuses the same KMMIO region. Still with
+    // interrupts disabled, which is what `set_masked` requires.
+    //
+    // Every line comes up masked. If there is no chip, this says so
+    // and the software flag carries the contract alone — a kernel
+    // that refused to boot without an I/O APIC would be refusing
+    // over a capability it does not yet need.
+    //
+    // SAFETY: First and only call, after the LAPIC is mapped, with
+    // interrupts disabled.
+    unsafe {
+        ioapic::init();
+    }
+
     // ---- Address spaces (M7) -------------------------------------------
     //
     // Snapshot which top-level entries the kernel occupies, so every
@@ -968,6 +988,80 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("irq-test") {
         println!("[boot] cmdline requested the interrupt tests");
         irqtest::run();
+    }
+
+    // ---- The root task (M12) -------------------------------------------
+    //
+    // **Last**, and after every scenario above, because this is the
+    // point of no return: `roottask::start` closes the seal, and
+    // from then on the kernel may not create an object, map a page
+    // or start a thread on its own initiative (ADR 044). Every
+    // scenario above does at least one of those in its fixture.
+    //
+    // The scenarios are therefore not "tests that run before the
+    // root task" by accident of ordering — they are tests of a
+    // kernel that still has powers the sealed one does not, and
+    // each of them exits QEMU before reaching this line. They
+    // exercise paths that exist only during boot.
+    //
+    // Negative (a) is arranged *before* the start, because what it
+    // changes is what the handover loop finds — not a different
+    // path through it.
+    if cmdline.contains("root-no-untyped") {
+        roottest::starve();
+    }
+
+    // **Only on a boot that asked for it**, and the first version of
+    // this started the root task unconditionally — which was wrong
+    // in a way worth recording.
+    //
+    // Most scenarios above exit QEMU and never return. `cap-test`
+    // and a few others *do* return, which was harmless while nothing
+    // followed them. It stopped being harmless here: `captest` calls
+    // `clear_objects()`, which empties the object CNode — including
+    // the IRQControl capability boot seeded at slot 254 — and the
+    // root task then started on a machine whose capability state a
+    // test had already dismantled. The failure was
+    // `object slot 254 does not hold the IRQControl capability`,
+    // reported against `cap-test`, which had itself passed.
+    //
+    // The general shape: a scenario that returns leaves the system
+    // in whatever state it finished in, and that is fine precisely
+    // *because* nothing runs afterwards. Adding an unconditional
+    // step at the end of `kmain` broke an invariant nobody had
+    // written down, because until now there was nothing to break.
+    //
+    // So the root task runs when a root scenario asked for it, and
+    // the "no scenario" boot — `make run` — gets it too, because
+    // that one is the real system rather than a test of it.
+    let wants_root_task = cmdline.contains("root-test")
+        || cmdline.contains("root-no-untyped")
+        || cmdline.contains("root-dies")
+        || cmdline.is_empty();
+
+    if wants_root_task {
+        // SAFETY: After `cap::boot::init_from_regions`, `sched::init`,
+        // `apic::init` and `record_kernel_entries`, with the
+        // scheduler running and interrupts enabled.
+        unsafe { roottask::start() };
+    }
+
+    // `root-no-untyped` is checked before `root-test` so the longer
+    // token wins; `contains` does not care about word boundaries
+    // (the lesson M9c paid for).
+    if cmdline.contains("root-no-untyped") {
+        println!("[boot] cmdline requested the starved-root-task test");
+        roottest::run_no_untyped();
+    }
+
+    if cmdline.contains("root-dies") {
+        println!("[boot] cmdline requested the dead-root-task test");
+        roottest::run_root_dies();
+    }
+
+    if cmdline.contains("root-test") {
+        println!("[boot] cmdline requested the root task tests");
+        roottest::run();
     }
 
     println!("[boot] M9a checks passed");

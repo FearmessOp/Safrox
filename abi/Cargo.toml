@@ -1,0 +1,36 @@
+# The kernel/user ABI.
+#
+# A crate rather than a shared module, because the kernel and the
+# root task are separate builds with different linker scripts and
+# different `build-std` settings. A `#[path]` include would work and
+# would hide that these are two compilations of one source; a
+# dependency says it.
+#
+# Depended on by both sides, which is the point: a struct written
+# twice is two structs that happen to agree today.
+
+[package]
+name = "pythos-abi"
+version = "0.1.0"
+edition = "2021"
+description = "The PythOS kernel/user ABI"
+license = "BSD-2-Clause"
+publish = false
+
+[lib]
+name = "pythos_abi"
+path = "src/lib.rs"
+test = false
+bench = false
+
+# No dependencies, and that is a constraint rather than a
+# coincidence. Anything this crate depended on would end up inside
+# the kernel's trusted base *and* inside every component.
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

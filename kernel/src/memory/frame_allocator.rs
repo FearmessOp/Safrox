@@ -11,7 +11,7 @@
 //! free list, and where the bitmap itself lives.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use limine::memmap;
 
@@ -220,6 +220,38 @@ static INITIALISED: AtomicBool = AtomicBool::new(false);
 /// path that was supposed to go through a capability and does not -- so
 /// it panics rather than quietly working.
 static RETIRED: AtomicBool = AtomicBool::new(false);
+
+/// Frames handed out through the public entry points.
+///
+/// **Counted at the call, not derived from the bitmap**, and that is
+/// the whole point. `free_count` already tells us how many frames are
+/// free; a second figure derived from it would agree with it by
+/// construction and could not disagree even if a frame had been lost.
+///
+/// These two are produced by different mechanisms — one by setting
+/// bits, one by counting calls — so M12's accounting can hold them up
+/// against each other. A frame whose bit was set without going through
+/// `allocate` or `allocate_specific`, or a path that took memory twice
+/// and counted once, makes them diverge.
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Frames returned through [`free`].
+///
+/// [`release`] is deliberately *not* counted here: it donates memory
+/// the allocator never owned, and it raises `initial_free_count` to
+/// match. Counting it as a return would make the balance below come
+/// out right for the wrong reason.
+static FREES: AtomicU64 = AtomicU64::new(0);
+
+/// How many frames have been handed out, counted at the call sites.
+pub fn allocation_count() -> u64 {
+    ALLOCATIONS.load(Ordering::Acquire)
+}
+
+/// How many frames have been given back, counted at the call sites.
+pub fn free_count_calls() -> u64 {
+    FREES.load(Ordering::Acquire)
+}
 
 /// Nesting depth of interrupt handlers, for the allocation tripwire.
 ///
@@ -581,6 +613,7 @@ pub fn allocate() -> Option<PhysFrame> {
             debug_assert!(changed, "allocator picked a frame that was already used");
 
             allocator.next_hint = found + 1;
+            ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
             Some(PhysFrame(found))
         })
     }
@@ -653,6 +686,7 @@ pub fn allocate_specific(frame: PhysFrame) -> bool {
             }
             let changed = allocator.mark_used(frame.0);
             debug_assert!(changed, "mark_used disagreed with is_used");
+            ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
             true
         })
     }
@@ -686,6 +720,7 @@ pub fn free(frame: PhysFrame) {
 
             let changed = allocator.mark_free(frame.0);
             debug_assert!(changed, "mark_free disagreed with is_used");
+            FREES.fetch_add(1, Ordering::AcqRel);
 
             // Reuse freed memory first: it is more likely to be in cache,
             // and it keeps the bitmap's low end dense.

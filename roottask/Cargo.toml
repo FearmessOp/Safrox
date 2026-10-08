@@ -1,0 +1,55 @@
+# The root task: the first user component, and after M12 the only one
+# the kernel creates.
+#
+# A separate crate rather than a module of the kernel, and that is the
+# milestone rather than a packaging choice -- it cannot call a kernel
+# function, cannot see a kernel type, and reaches the kernel only
+# through `syscall`. The compiler enforces what the design claims.
+#
+# Deliberately NOT a workspace member of the kernel. A workspace
+# shares one target directory and one set of profiles, and this binary
+# needs its own linker script and its own build-std settings. See
+# roottask/.cargo/config.toml.
+cargo-features = ["trim-paths"]
+
+[package]
+name = "roottask"
+version = "0.1.0"
+edition = "2021"
+description = "PythOS root task: the first user component"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "roottask"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The kernel/user ABI. One definition, two readers -- a struct written
+# twice is two structs that happen to agree today.
+pythos-abi = { path = "../abi" }
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = true
+codegen-units = 1
+opt-level = 2
+lto = false
+trim-paths = "all"
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+trim-paths = "all"

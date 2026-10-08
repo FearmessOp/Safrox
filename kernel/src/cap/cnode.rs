@@ -364,6 +364,17 @@ impl CNode {
         }
     }
 
+    /// Physical address of slot zero.
+    ///
+    /// Added in M12 for `CNode.Mint`, which has to decide whether
+    /// two capabilities name the *same* CNode. Comparing the
+    /// capabilities would not answer that — two slots can hold two
+    /// capabilities for one object — and the object's address is
+    /// what identity means here.
+    pub fn base(&self) -> PhysAddr {
+        self.base
+    }
+
     pub fn len(&self) -> usize {
         self.slots
     }
@@ -505,6 +516,33 @@ pub unsafe fn copy(src: &mut Slot, dest: &mut Slot, rights: Rights) -> Result<()
 /// without trusting them -- so it counts as producing authority and needs
 /// `GRANT` (ADR 021).
 ///
+/// # Only Endpoint and Notification may be minted
+///
+/// **This restriction was missing until M12, and its absence was a
+/// capability-integrity bug rather than a gap in validation.**
+///
+/// `extra` is one field with three meanings (ADR 037): a badge for
+/// Endpoint and Notification, a `radix` for CNode, a `size_bits` for
+/// Untyped. The last line of this function overwrites `extra` with
+/// the badge. Minting a CNode therefore *overwrote its radix* — a
+/// 64-slot CNode minted with badge 0 would become a capability
+/// claiming one slot, and every index into it would be refused as out
+/// of range. Minting an Untyped would rewrite the bound that `retype`
+/// checks allocations against.
+///
+/// The old guard — `extra() != 0 && badge != extra()` — appeared to
+/// prevent this and did so only by coincidence: a CNode's radix and an
+/// Untyped's `size_bits` are *usually* non-zero. A CNode of radix 0 or
+/// an Untyped of `size_bits` 0 passed it, and so did any mint whose
+/// badge happened to equal the radix. A check that holds for the
+/// common values and fails for the rest is indistinguishable from a
+/// correct one until the day it matters (ADR 023, K5).
+///
+/// So the question is answered by type, which is what it was always
+/// about: a badge belongs to the two object types that carry one. A
+/// component wanting to place a CNode in another CSpace wants
+/// [`copy`], which leaves `extra` alone.
+///
 /// # Safety
 ///
 /// As [`copy`].
@@ -517,6 +555,14 @@ pub unsafe fn mint(
     if src.is_empty() {
         return Err(CapError::EmptySlot);
     }
+
+    // The type gate, before anything else: on a non-badgeable
+    // capability the comparison below would be reading a radix.
+    let found = src.cap_type();
+    if !matches!(found, CapType::Endpoint | CapType::Notification) {
+        return Err(CapError::WrongType { found });
+    }
+
     if !src.rights().contains(Rights::GRANT) {
         return Err(CapError::InsufficientRights {
             needed: Rights::GRANT,
@@ -526,12 +572,9 @@ pub unsafe fn mint(
     // A badge is written once. Re-badging would let a holder forge a
     // different client's identity.
     //
-    // `extra()` rather than `as_badge()`: this check runs before the
-    // type is known to be an Endpoint, and on a CNode the field holds a
-    // radix. The comparison is still the right one -- a non-zero field
-    // of any meaning must not be overwritten -- but it is reading the
-    // storage, not a badge, so the typed accessor would be a lie.
-    if src.extra() != 0 && badge != src.extra() {
+    // `as_badge()` is sound here because the type gate above has
+    // established that `extra` is a badge.
+    if src.as_badge() != 0 && badge != src.as_badge() {
         return Err(CapError::InvalidArgument);
     }
 

@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: BSD-2-Clause
+#![no_std]
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//! The kernel/user ABI.
+//!
+//! **One definition, two readers.** Everything here is seen by both
+//! the kernel and every user component, and the only way to keep
+//! them in step is to have a single copy — a struct written twice is
+//! two structs that happen to agree today.
+//!
+//! This crate has no dependencies, no allocation and no `unsafe`
+//! outside the accessors at the bottom. It is a description of a
+//! wire format, not a library.
+//!
+//! # What is frozen here
+//!
+//! The method numbers, the error codes and [`BootInfo`]'s layout are
+//! an **ABI**: a component compiled against one kernel must keep
+//! working against the next. The rule that follows is simple and
+//! absolute — **numbers are appended, never inserted or reused**. A
+//! renumbering is indistinguishable, from a compiled component's
+//! point of view, from the kernel lying about what happened.
+
+// ---- BootInfo (ADR 044) ------------------------------------------------
+
+/// Where the kernel maps the root task's code.
+pub const ROOT_CODE_ADDRESS: u64 = 0x0040_0000;
+
+/// Where the kernel maps the root task's stack (one page).
+pub const ROOT_STACK_ADDRESS: u64 = 0x0050_0000;
+
+/// The root task's initial RSP: top of the stack page, 16-byte
+/// aligned as the SysV ABI requires at a function entry.
+pub const ROOT_STACK_TOP: u64 = ROOT_STACK_ADDRESS + 4096 - 16;
+
+/// Where the kernel maps [`BootInfo`]. **Read-only** (ADR 044).
+///
+/// Read-only is not caution. BootInfo is what the kernel says about
+/// the root task; if the root task could write it, it could read
+/// back its own words as though they were the kernel's.
+pub const BOOTINFO_ADDRESS: u64 = 0x0060_0000;
+
+/// `"PythBIV1"`, big-endian so it reads as text in a hex dump.
+pub const BOOTINFO_MAGIC: u64 = 0x5079_7468_4249_5631;
+
+/// The version this header describes.
+pub const BOOTINFO_VERSION: u32 = 1;
+
+/// How many Untyped descriptors fit in the BootInfo page.
+///
+/// One page holds the header plus this many 16-byte descriptors.
+/// Boot creates about 90 on a 256 MiB machine, so 128 is headroom
+/// rather than a limit being approached — and the kernel asserts it
+/// rather than truncating, because a silently short list would make
+/// the accounting in scenario 3 wrong in a way that looks right.
+pub const BOOTINFO_MAX_UNTYPED: usize = 128;
+
+/// What the root task is told at startup (ADR 044).
+///
+/// `magic` and `version` are first **and that order is part of the
+/// ABI**: they are the only two fields a root task of the wrong
+/// version may rely on. Everything after them means whatever the
+/// version says it means.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BootInfo {
+    /// [`BOOTINFO_MAGIC`].
+    pub magic: u64,
+    /// [`BOOTINFO_VERSION`].
+    pub version: u32,
+    /// Size of this header, descriptors excluded.
+    ///
+    /// For forward compatibility: a later kernel may add fields, and
+    /// an older root task skips to the descriptors using this rather
+    /// than `size_of::<BootInfo>()`, which would be its own idea of
+    /// the size.
+    pub header_size: u32,
+
+    /// How many Untyped capabilities the root task holds.
+    pub untyped_count: u32,
+    /// Leaf-CNode index of the first of them. They are consecutive.
+    pub untyped_first_slot: u32,
+
+    /// Where the one IRQControl capability is (ADR 041).
+    pub irq_control_slot: u32,
+    /// The root task's own CNode, named within its own CSpace.
+    ///
+    /// Needed because almost every invocation that creates something
+    /// has to say where to put it, and "my own CNode" is the usual
+    /// answer.
+    pub root_cnode_slot: u32,
+    /// Its own TCB.
+    pub tcb_slot: u32,
+    /// Its own VSpace root.
+    pub vspace_slot: u32,
+
+    /// First free leaf slot, and one past the last.
+    ///
+    /// The root task allocates from this range. The kernel does not
+    /// track what it does with them — that is the point of handing
+    /// the range over rather than a slot at a time.
+    pub free_slot_first: u32,
+    /// One past the last free slot.
+    pub free_slot_end: u32,
+
+    /// Usable bytes the kernel counted at boot, before anything was
+    /// spent.
+    ///
+    /// **Scenario 3's anchor.** With it the root task can do the
+    /// accounting itself — sum the Untypeds, add what the kernel
+    /// kept, compare — rather than being told a figure and believing
+    /// it.
+    pub usable_bytes: u64,
+
+    /// Bytes the kernel kept for itself: the heap's reserve, its own
+    /// page tables, the image, the stacks.
+    ///
+    /// Stated separately so the sum is checkable. A single
+    /// "available to you" number would be unfalsifiable.
+    pub kernel_bytes: u64,
+
+    /// Bytes that are in **no** Untyped and were not kept by the
+    /// kernel either — memory nothing can ever reach again.
+    ///
+    /// **This field exists because the honest answer is not always
+    /// zero**, and discovering that is what M12's accounting is for.
+    ///
+    /// `cap::boot` turns free memory into Untypeds of `2^k` bytes at
+    /// `2^k` boundaries (ADR 020). A free frame that cannot be fitted
+    /// into such a block — or that arrives after the Untyped CNode is
+    /// full — is in no Untyped at all, and `retire()` then removes
+    /// the only other way to reach it. It is not leaked in the
+    /// ordinary sense; it is *unnameable*, which is worse, because no
+    /// amount of revoking brings it back.
+    ///
+    /// Reporting it separately is the difference between a sum that
+    /// balances and a sum that balances **for the right reason**.
+    /// Folding it into [`kernel_bytes`](Self::kernel_bytes) would make
+    /// the root task's check pass while the memory was still gone,
+    /// which is precisely the unfalsifiable arithmetic ADR 044
+    /// refused.
+    pub lost_bytes: u64,
+}
+
+/// One Untyped the root task holds. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UntypedDesc {
+    /// Physical base address.
+    ///
+    /// The root task cannot dereference this — it holds no mapping
+    /// for it and physical addresses are not virtual ones. It is
+    /// here so that a memory *manager* can reason about adjacency
+    /// and about which Untyped covers a device's MMIO range.
+    pub base: u64,
+    /// Size as a power of two: the region is `1 << size_bits` bytes.
+    pub size_bits: u8,
+    /// Non-zero if this is device memory, which may only become a
+    /// Frame (ADR 020).
+    pub is_device: u8,
+    /// Zero.
+    pub reserved: [u8; 6],
+}
+
+impl UntypedDesc {
+    /// Size in bytes.
+    pub const fn size(&self) -> u64 {
+        1u64 << self.size_bits
+    }
+}
+
+/// Offset of the descriptor array within the BootInfo page.
+///
+/// A constant rather than `size_of::<BootInfo>()`, because the ABI
+/// fixes it: a later kernel growing the header must not move the
+/// descriptors for an older reader. `header_size` reports the real
+/// header size; this is where the array begins.
+pub const BOOTINFO_UNTYPED_OFFSET: usize = 128;
+
+// The header must fit in front of the descriptors, and the whole
+// thing in one page. Checked here rather than in the kernel so that
+// a component depending on this crate gets the same guarantee.
+const _: () = assert!(core::mem::size_of::<BootInfo>() <= BOOTINFO_UNTYPED_OFFSET);
+const _: () = assert!(core::mem::size_of::<UntypedDesc>() == 16);
+const _: () = assert!(BOOTINFO_UNTYPED_OFFSET + BOOTINFO_MAX_UNTYPED * 16 <= 4096);
+
+// ---- The syscall ABI (ADR 030, ADR 043) --------------------------------
+
+/// What a component may ask of a capability.
+///
+/// One syscall, and the method is an argument (ADR 017). These
+/// numbers are frozen: **append only**.
+pub mod method {
+    /// Report what a thread is doing. Takes a TCB.
+    pub const READ_REGISTERS: u64 = 1;
+    /// Store a priority. Takes a TCB.
+    pub const SET_PRIORITY: u64 = 2;
+    /// Say hello. Names no capability.
+    pub const ECHO: u64 = 3;
+    /// Block until a Notification is signalled.
+    pub const WAIT: u64 = 4;
+    /// Map a Frame into an address space.
+    pub const FRAME_MAP: u64 = 5;
+    /// Remove a mapping. Targets the **VSpace**, not the Frame.
+    pub const FRAME_UNMAP: u64 = 6;
+    /// Supply an intermediate page table.
+    pub const PAGE_TABLE_MAP: u64 = 7;
+    /// Take one back out. Targets the VSpace.
+    pub const PAGE_TABLE_UNMAP: u64 = 8;
+    /// Turn memory into objects.
+    pub const RETYPE: u64 = 9;
+    /// Give a thread an address space and a CSpace.
+    pub const SET_SPACE: u64 = 10;
+    /// Make a configured thread runnable.
+    pub const RESUME: u64 = 11;
+    /// Turn a fresh page table into an address space.
+    pub const CREATE_VSPACE: u64 = 12;
+    /// Entry point and stack for a ring-3 thread.
+    pub const SET_USER_REGISTERS: u64 = 13;
+    /// Send a message. **Blocks** until a receiver takes it.
+    pub const SEND: u64 = 14;
+    /// Wait for a message. **Blocks.** Returns the sender's badge.
+    pub const RECV: u64 = 15;
+    /// Copy an **Endpoint or Notification** into another CNode, with
+    /// a badge attached.
+    ///
+    /// **The invocation that connects two components.** Without it
+    /// a component can create capabilities and never give one away,
+    /// which is isolation without composition.
+    ///
+    /// Only the two badgeable types: a badge lives in a field that
+    /// means `radix` on a CNode and `size_bits` on an Untyped, so
+    /// minting either would overwrite the number that bounds it. Use
+    /// [`COPY`] for everything else.
+    pub const MINT: u64 = 16;
+    /// Copy **any** capability into another CNode, unbadged.
+    ///
+    /// The more basic of the two hand-over operations, and the one
+    /// that was missing: M12 added `Mint` as "the way to give a
+    /// capability away" and then found that giving away a *CNode* —
+    /// which is how a child gets a CSpace — needs no badge and must
+    /// not have one.
+    ///
+    /// Rights may be narrowed but never widened (ADR 021).
+    pub const COPY: u64 = 17;
+}
+
+/// Object types, as `Retype` names them.
+///
+/// Deliberately **not** the kernel's `CapType` discriminants: these
+/// are a user-visible ABI and inheriting them from an internal enum
+/// would mean an internal renumbering silently changed what a
+/// component asks for.
+pub mod cap_type {
+    /// Memory that has not been given a type yet.
+    pub const UNTYPED: u64 = 1;
+    /// An array of capability slots.
+    pub const CNODE: u64 = 2;
+    /// A thread.
+    pub const TCB: u64 = 3;
+    /// A synchronous rendezvous point.
+    pub const ENDPOINT: u64 = 4;
+    /// An asynchronous signal.
+    pub const NOTIFICATION: u64 = 5;
+    /// A page of memory.
+    pub const FRAME: u64 = 6;
+    /// A page table, at any level.
+    pub const PAGE_TABLE: u64 = 7;
+}
+
+/// Mapping permissions (ADR 032).
+///
+/// Three values, and there is **no fourth**: writable-and-executable
+/// has no encoding, so W^X is unrepresentable rather than merely
+/// forbidden.
+pub mod perm {
+    /// Readable. Not writable, not executable.
+    pub const READ_ONLY: u64 = 0;
+    /// Readable and writable. Not executable.
+    pub const READ_WRITE: u64 = 1;
+    /// Readable and executable. **Not writable.**
+    pub const READ_EXECUTE: u64 = 2;
+}
+
+/// Bit 63 of a syscall's return value: this is an error.
+///
+/// One register, two outcomes, 63 bits left for a result.
+pub const ERROR_FLAG: u64 = 1 << 63;
+
+/// Error codes, as the kernel encodes them. **Append only.**
+pub mod error {
+    /// The reserved bits of a CPtr were not zero.
+    pub const INVALID_CPTR: u64 = 1;
+    /// An index was past the end of a CNode.
+    pub const CPTR_OUT_OF_RANGE: u64 = 2;
+    /// The slot holds nothing.
+    pub const EMPTY_SLOT: u64 = 3;
+    /// The slot has been reused since the pointer was issued.
+    pub const STALE_CPTR: u64 = 4;
+    /// A root CSpace slot held something other than a CNode.
+    pub const ROOT_SLOT_MUST_BE_CNODE: u64 = 5;
+    /// The capability is not of the type the method needs.
+    pub const WRONG_TYPE: u64 = 6;
+    /// The capability does not carry the rights needed.
+    pub const INSUFFICIENT_RIGHTS: u64 = 7;
+    /// A copy asked for rights the source does not hold.
+    pub const RIGHTS_ESCALATION: u64 = 8;
+    /// The destination slot is occupied.
+    pub const SLOT_NOT_EMPTY: u64 = 9;
+    /// The derivation chain is at its depth limit.
+    pub const DERIVATION_TOO_DEEP: u64 = 10;
+    /// **The caller's own Untyped is spent.**
+    ///
+    /// Distinct from [`NO_KERNEL_STACK`], which means a kernel-wide
+    /// pool ran out. A component can exhaust the first and only the
+    /// first (ADR 022).
+    pub const NOT_ENOUGH_MEMORY: u64 = 11;
+    /// A retype asked for more objects than the limit allows.
+    pub const TOO_MANY_OBJECTS: u64 = 12;
+    /// Device memory may only become a Frame.
+    pub const DEVICE_UNTYPED_FRAME_ONLY: u64 = 13;
+    /// The thread is running or ready; suspend it first.
+    pub const THREAD_BUSY: u64 = 14;
+    /// The address is not in the user half.
+    pub const NOT_USER_ADDRESS: u64 = 15;
+    /// The page flags disagree with the half the address is in.
+    pub const FLAGS_WRONG_HALF: u64 = 16;
+    /// An intermediate page table is missing. Supply one.
+    pub const MISSING_PAGE_TABLE: u64 = 17;
+    /// Something is already mapped there.
+    pub const ALREADY_MAPPED: u64 = 18;
+    /// Nothing is mapped there.
+    pub const NOT_MAPPED: u64 = 19;
+    /// The VSpace is the one currently in CR3.
+    pub const VSPACE_IN_USE: u64 = 20;
+    /// A malformed argument.
+    pub const INVALID_ARGUMENT: u64 = 21;
+    /// A message claimed more than 128 words.
+    pub const MESSAGE_TOO_LONG: u64 = 22;
+    /// A message claimed more than four capabilities.
+    pub const TOO_MANY_CAPS: u64 = 23;
+    /// The endpoint was revoked while this thread waited on it.
+    pub const ENDPOINT_DEAD: u64 = 24;
+    /// `Reply` found nobody waiting.
+    pub const NO_REPLY_TARGET: u64 = 25;
+    /// The caller is gone, or no longer waiting.
+    pub const REPLY_TARGET_GONE: u64 = 26;
+    /// A Notification already has a waiter, or is already bound.
+    pub const NOTIFICATION_BUSY: u64 = 27;
+    /// Already bound.
+    pub const ALREADY_BOUND: u64 = 28;
+    /// Somebody else owns that interrupt line.
+    pub const IRQ_ALREADY_OWNED: u64 = 29;
+    /// **A kernel-wide pool ran out**, not the caller's budget.
+    pub const NO_KERNEL_STACK: u64 = 30;
+}
+
+/// Whether a returned value encodes an error.
+pub const fn is_error(value: u64) -> bool {
+    value & ERROR_FLAG != 0
+}
+
+/// The error code out of a returned value.
+pub const fn error_code(value: u64) -> u64 {
+    value & !ERROR_FLAG
+}
+
+// ---- Capability pointers (ADR 018) -------------------------------------
+
+/// A capability pointer: two indices and two generations.
+///
+/// ```text
+///  63      56 55      48 47            32 31            16 15          0
+/// +----------+----------+----------------+---------------+-------------+
+/// | L1 gen   | L0 gen   | reserved, zero |   L1 index    |  L0 index   |
+/// +----------+----------+----------------+---------------+-------------+
+/// ```
+///
+/// **A CPtr is meaningful only relative to a root.** The same bits
+/// name different objects in different CSpaces — which is what makes
+/// a capability outside a component's CSpace unnameable rather than
+/// forbidden, and is also a trap for anyone who assumes a foreign
+/// pointer means nothing. It means whatever is at those indices
+/// there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CPtr(pub u64);
+
+impl CPtr {
+    /// Build a pointer from its parts.
+    pub const fn new(l1_index: u16, l1_generation: u8, l0_index: u16, l0_generation: u8) -> CPtr {
+        CPtr(
+            ((l1_generation as u64) << 56)
+                | ((l0_generation as u64) << 48)
+                | ((l1_index as u64) << 16)
+                | (l0_index as u64),
+        )
+    }
+
+    /// The leaf index.
+    pub const fn l0_index(self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
+}
+
+/// Pack `Retype`'s type and size into one argument word.
+///
+/// Two fields in one register because they are one answer: "what
+/// object". Unlike packing a value into an address's spare bits
+/// (which ADR 043 rejected), neither of these is an address and
+/// neither is meaningful alone.
+pub const fn retype_arg(cap_type: u64, size_bits: u64) -> u64 {
+    cap_type | (size_bits << 8)
+}

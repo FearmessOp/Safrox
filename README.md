@@ -3,15 +3,50 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
-**Current milestone: M11 — user-space address space management.** A
-component at CPL 3 now manages its own memory, and — the result the
-milestone turns on — **builds a second component**:
+**Current milestone: M12 — the root task, and the kernel that
+stops.** The kernel now creates exactly one thread and then **seals
+itself**. Everything else in the system is built from
+[`roottask/src/main.rs`](roottask/src/main.rs), at CPL 3:
 
 ```
-[vsuser] a ring 3 component built a second component -- its own
-CSpace, VSpace and TCB, all from its own Untyped -- and started it;
-the child reported 0xc1d0000033334444 from cpl 3
+[roottest] two components built by a ring 3 program exchanged a
+message; the receiver woke with badge 0x5eed, which its sender could
+not have chosen
+[roottest] the kernel performed 103 privileged operations during boot
+and none since the seal; it has served 61 syscalls
 ```
+
+The root task is a **separate crate** that links against `core` and
+the ABI definitions and nothing else. "The kernel contains no
+component-building code" is therefore enforced by the linker rather
+than asserted in a comment — a line in that file that needed a
+kernel type would not compile.
+
+After the seal, `note_privileged_op` *panics*. Criterion 4 is not a
+counter somebody reads; it is a kernel that stops if it ever creates
+an object, maps a page or starts a thread of its own accord
+([ADR 044](docs/adr/044-root-task-ve-bootstrap-protokolu.md)).
+
+**The accounting was the part that could most easily have proved
+nothing.** The obvious form — report `kernel = usable - untyped` and
+check `untyped + kernel == usable` — is true by construction and so
+tests nothing. Here the three figures come from three *different*
+mechanisms (the capabilities, call counting at the allocator's entry
+points, and the bitmap), so they can disagree. And there is a fourth
+term, because the honest answer is not always zero: `cap::boot`
+builds Untypeds of `2^k` bytes at `2^k` boundaries, and a free frame
+that fits no such block is in no Untyped at all — unreachable once
+the allocator retires. `lost_bytes` reports it rather than absorbing
+it, because a sum that balances by swallowing its own remainder
+proves nothing.
+
+**M10's debt is paid.** Line masking has moved from a software flag
+to the I/O APIC's redirection table — and the README says what that
+did *not* buy: `irq-test` raises its interrupts with a self-IPI,
+which goes LAPIC-to-CPU and never passes through the chip. The
+hardware mask is not what makes that scenario pass, and claiming
+otherwise would be unfalsifiable. What is checked is that the
+register holds what was written, read back off the chip.
 
 Everything the parent did, it did with capabilities it holds: it
 retyped the objects out of its own 256 KiB budget, asked the kernel
@@ -282,6 +317,79 @@ cloned into `third_party/` automatically.
 | `make clean` | Remove `target/` and `build/` |
 | `make distclean` | Also remove the vendored Limine checkout |
 
+## M12 acceptance criteria
+
+Three scenarios. Two exit 33; `root-dies` exits 35, because a dead
+root task is a panic rather than an idle loop.
+
+### 1. `make run-roottest` — the root task, and the four criteria
+
+```
+[root] sealed after 103 privileged operations; the kernel now answers
+syscalls and delivers interrupts and does nothing else (ADR 044)
+[roottest] the root task read its BootInfo at 0x0000000000600000:
+magic ok, version 1, 97 untypeds
+[roottest] accounting: 190 MiB in untypeds + 64 MiB kept by the
+kernel + 0 KiB unreachable = 254 MiB usable. The three figures come
+from the capabilities, from call counting, and from the bitmap --
+three mechanisms, so they can disagree.
+[roottest] two components built by a ring 3 program exchanged a
+message; the receiver woke with badge 0x5eed
+[roottest] the kernel performed 103 privileged operations during boot
+and none since the seal
+```
+
+**The badge is the claim** in criterion 2. It identifies the
+capability the sender used, and the sender did not choose it — the
+root task attached it when it minted the copy
+([ADR 037](docs/adr/037-badge-ve-rozetli-yetkiler.md)). A message
+that arrived from anywhere else would carry something different.
+
+### 2. `make run-rootnountyped` — a component with no memory
+
+The handover loop runs with its bound set to zero: the *same* loop,
+not a second code path, because a second path would test itself
+rather than the kernel. The root task must notice, report
+`NotEnoughMemory`, and stop; the kernel must stay up and do nothing
+on its behalf.
+
+Error **11** by name, not "an error". The first version of this
+reported a bare `ERROR_FLAG` — error code *zero* — and the test,
+which only asked whether the flag was set, passed. A root task that
+set the flag for any reason at all would have satisfied it
+identically.
+
+### 3. `make run-rootdies` — the root task dies
+
+Its TCB is deleted while it runs, after it has reported its BootInfo
+(waited for, not timed). **The kernel must panic**, and the first
+version of this scenario is the finding worth keeping: it deleted
+the TCB, waited, and then declared failure with its own
+`unreachable!` — which is precisely what happened. The scheduler
+stopped scheduling the thread and carried on, content.
+
+A negative scenario that detects the fault itself proves the
+scenario works, not the kernel. `roottask::check_alive` now runs on
+the timer tick, using the same address-and-generation idiom as IRQ
+destinations ([ADR 042](docs/adr/042-kesme-teslim-yolu.md)) and
+stale replies ([ADR 036](docs/adr/036-call-reply-ve-reply-nesnesi.md)).
+
+### K5 in M12: the mutation died twice
+
+The mandatory mutation — report one fewer Untyped in BootInfo — is
+caught by the count check (`BootInfo says 96, the kernel created
+97`). Disabling that check and running again, **the accounting
+catches it alone**, short by exactly 4096 bytes:
+
+```
+199811072 + 67473408 + 0 != 267288576
+```
+
+The second run is the point. One kill would not have said whether
+criterion 3 was load-bearing or decorative.
+
+All 59 scenarios: `make test`.
+
 ## M11 acceptance criteria
 
 Five scenarios. Four exit 33, including two of the three negatives:
@@ -391,6 +499,105 @@ kernel half is still safe *today*, because every user mapping
 happens to carry the USER flag. It stops being safe the moment
 something maps into a user VSpace without it — and nothing would
 notice.
+
+### What M12 cost: two capability bugs and a build system that lied
+
+The capability bugs are the serious ones, and both were latent long
+before M12 went looking.
+
+**`mint()` corrupted capabilities.** The badge is written into
+`extra`, which holds a CNode's `radix` and an Untyped's `size_bits`
+([ADR 037](docs/adr/037-badge-ve-rozetli-yetkiler.md)). Minting a
+CNode therefore replaced "64 slots" with the badge, and every index
+into it would afterwards be refused as out of range.
+
+The guard that appeared to prevent this — `extra() != 0 && badge !=
+extra()` — held **only by coincidence**: a radix and a `size_bits`
+are *usually* non-zero. A CNode of radix 0, an Untyped of
+`size_bits` 0, or a badge that happened to equal the radix all went
+straight through. A check that holds for the common values and fails
+for the rest is indistinguishable from a correct one until the day
+it matters. The question was always a *type* question, and is now a
+type gate.
+
+**`Copy` did not exist**, and the reason it was thought unnecessary
+was a sentence in a doc comment: *"a badge of zero is an unbadged
+copy, so the narrower operation is reachable through the wider
+one."* Wrong twice — minting writes the badge whatever its value, so
+zero is an *erasure* rather than a no-op; and `mint` demands
+`GRANT`, which plain copying does not need. It surfaced when the
+root task tried to give a child its CSpace: a CSpace is a CNode, a
+CNode cannot carry a badge, and handing a capability over *unaltered*
+is the basic operation. Attaching an identity is the special case.
+
+**The Makefile dependency silently did nothing.** Adding
+`$(ROOTTASK_BIN)` to the kernel's prerequisites had no effect: make
+expands a prerequisite list when it *parses* the rule, and the
+variable is defined 570 lines further down. It expanded to nothing —
+no error, no warning, and `make -n` reporting no work to do even
+with the source newer than the image. The symptom was a scenario
+failing against a root task binary from two edits earlier.
+
+For a Makefile that grows by appending, the rule is: appending a
+*rule* is safe; editing an earlier rule to name a later variable is
+not. Make unions prerequisites across rules for the same target, so
+the fix is also an append.
+
+### What M12 cost: four findings about the tests
+
+**A test noticed what the kernel should have.** `root-dies` deleted
+the root task's TCB, waited, and then failed with its own
+`unreachable!` — which is exactly what happened, because the
+scheduler simply stopped scheduling the thread and carried on. The
+panic came from the test. A negative scenario that detects the fault
+itself proves the scenario works, not the kernel; on a machine
+nobody was watching, the system would have sat there forever.
+
+**A bare `ERROR_FLAG` is "error 0".** The starved root task reported
+the flag with no code, the test asked only whether the flag was set,
+and it passed — the log reading `reported error 0`. A root task that
+set the flag for any reason, or none, would have satisfied it.
+
+**An unfalsifiable corroborating check.** Criterion 4 gained
+`syscalls > ops_at_seal`, on the reasoning that an inversion would
+mean the kernel had grown back the code M12 removed. It failed at
+103 against 61 — and the kernel had grown nothing: 97 of those
+operations are one `Copy` per root Untyped, so the counter scales
+with **how much RAM the machine has**. There is no honest threshold
+to tune when the two numbers measure unrelated things, so the claim
+was removed rather than adjusted. A second, weaker check dressed as
+corroboration is worse than none: it fails for reasons unconnected
+to the claim and gets "fixed" by raising a constant.
+
+**Scenarios that return leave the system rearranged.** Starting the
+root task unconditionally at the end of `kmain` broke an invariant
+nobody had written down, because until then nothing ran after a
+scenario. `cap-test` returns, and it calls `clear_objects()`, which
+empties the object CNode — including the IRQControl capability boot
+seeded at slot 254. The root task then started on top of a
+capability system a test had dismantled, and the failure was
+reported against `cap-test`, which had itself passed.
+
+### Page table sharing is per level
+
+M11 recorded `SCRATCH_ADDRESS` — an address chosen because it
+"shares its PDPT and PD" with the mappings around it, which was true
+and irrelevant. M12 made the same mistake from the other side, in a
+loop.
+
+The root task's code is at 4 MiB, its stack at 5, its BootInfo at 6.
+The first version offered the same three table capabilities for both
+the code and BootInfo and accepted `AlreadyMapped` throughout, on
+the reasoning that redundant offers would be harmlessly refused. Two
+of the three are redundant. The third is not: a PT covers 2 MiB, so
+4..6 MiB is one table and 6..8 MiB is another, and the capability
+being offered for the second was already mapped at the first.
+
+The failure surfaced one step later, as `AlreadyMapped { address:
+6291456 }` from `map_frame` — naming the BootInfo mapping rather
+than the missing table beneath it. **Blanket-accepting an error
+turned a precise failure into a misleading one.** Each capability is
+now used exactly once and no error is tolerated.
 
 ### What M11 cost: four findings about the tests
 
@@ -2717,14 +2924,31 @@ deleting the body of `TlbFlush::flush` entirely, `invlpg` and `mfence`
 both, leaves all fifteen scenarios passing. The experiment was run. What
 `TlbFlush` buys in this environment is compile-time only.
 
-**Interrupt masking is a software flag, not an IOAPIC mask.** On real
-hardware a masked line stops the *device*; the flag here stops
-delivery, not the interrupt reaching the CPU. The contract — no second
-interrupt delivered before `Ack` — is the same either way, and
-`irq-test` scenario 4 tests the contract rather than the mechanism, so
-it does not change when **M12** moves masking into the IOAPIC's
-redirection table. Named in
-[ADR 042](docs/adr/042-kesme-yolu-ve-ack.md).
+**Interrupt masking reaches the I/O APIC (M12), but the software
+flag is still what enforces the contract.** M10 masked lines with a
+flag and promised hardware in M12. The hardware is now there —
+every redirection entry is programmed, and `ioapic::verify` reads
+each one back off the chip and compares it against the flag.
+
+The honest account is narrower than "the mask is now real". The
+flag stays, because the interrupt path reads it with one atomic
+load where a device register would be two uncached accesses that
+cannot be made atomic against a concurrent write. ADR 042's
+contract — no second delivery before `Ack` — is the flag's. What
+the hardware adds is stopping the line *at the source*, so a masked
+line costs no dispatch and no EOI.
+
+And `irq-test` cannot show that: it raises interrupts with a
+self-IPI, which goes LAPIC-to-CPU and never passes through the
+chip. That was M10's deliberate choice — with a real device, "no
+second interrupt arrived" and "the device sent nothing" are
+indistinguishable (ADR 023's K8) — and it means the hardware mask
+is **not** what makes the scenario pass. It would pass identically
+with the chip unplugged. What is falsifiable, and what is checked,
+is that the register holds what was written.
+
+Named in [ADR 042](docs/adr/042-kesme-yolu-ve-ack.md) and paid in
+[ADR 044](docs/adr/044-root-task-ve-bootstrap-protokolu.md).
 
 **Interrupt lines cannot be shared.** One owner per line, by decision
 rather than omission

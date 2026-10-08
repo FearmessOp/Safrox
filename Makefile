@@ -198,6 +198,9 @@ $(LIMINE_EXE): $(LIMINE_DIR)/limine.h
 
 # ---- Build & verify ----------------------------------------------------
 
+# M12 adds `$(ROOTTASK_BIN)` to this rule's prerequisites, in the
+# block at the bottom of the file. It cannot be added *here*: see
+# the note there for why, and for the silent failure that taught it.
 $(KERNEL): $(RUST_SRCS) kernel/linker.ld Cargo.toml .cargo/config.toml build.rs
 	@echo "  CARGO   build --profile $(PROFILE)"
 	@$(CARGO) build $(CARGO_FLAGS)
@@ -753,3 +756,96 @@ run-vsuserro: $(ISO_VSUSERRO)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_VSUSERRO) --expect vsuserro -- $(QEMU_FLAGS)
 
 test: run-vsusertest run-vsuserkernel run-vsuserforeign run-vsuserexhaust run-vsuserro
+
+
+# ---- M12: the root task ------------------------------------------------
+#
+# Appended, as every milestone's block is (ADR 023, K7). The one
+# exception is `$(KERNEL)`'s prerequisite list, which gained
+# `$(ROOTTASK_BIN)` — a dependency cannot be expressed by appending,
+# and an ordering convention would be remembered by whoever edits
+# next rather than by make.
+
+# The root task's flat image, embedded in the kernel's .rodata.
+ROOTTASK_BIN := $(BUILD_DIR)/roottask.bin
+
+# Its sources. Listed rather than globbed so that a new file is a
+# deliberate addition: a glob silently picks up editor backups and
+# silently misses a file added in a subdirectory.
+ROOTTASK_SRCS := roottask/src/main.rs roottask/link.ld roottask/Cargo.toml \
+                 abi/src/lib.rs
+
+# Built by a script rather than inline, because it needs a *replaced*
+# RUSTFLAGS and that is too subtle for a recipe line. Cargo merges
+# `rustflags` across config files instead of letting the nearer one
+# win, so a `roottask/.cargo/config.toml` produces a link line with
+# both linker scripts and the kernel's comes first — linking the root
+# task at -2 GiB, in the kernel half, where CPL 3 cannot fetch an
+# instruction. `CARGO_TARGET_*_RUSTFLAGS` does not replace either.
+# Only the blanket variable does, which is exactly the hazard
+# .cargo/config.toml warns about at length, used here as the tool.
+$(ROOTTASK_BIN): $(ROOTTASK_SRCS)
+	@echo "  CARGO   roottask"
+	@bash scripts/build-roottask.sh
+
+roottask: $(ROOTTASK_BIN)
+
+# **The kernel depends on the image**, because it embeds it with
+# `include_bytes!` (ADR 044): a stale file is a kernel built around
+# the wrong program.
+#
+# Appended as a second rule for the same target rather than edited
+# into the original prerequisite list, and that is not only K7
+# politeness — the direct edit **silently did nothing**.
+#
+# Make expands a prerequisite list when it *parses* the rule.
+# `$(KERNEL)` is declared around line 200; `ROOTTASK_BIN` is defined
+# here, some 570 lines later. At parse time the variable was empty,
+# so the list read as though nothing had been added — no error, no
+# warning, and `make -n` showing no rebuild even with the source
+# newer than the image. The symptom was a scenario failing against
+# a root task binary from two edits ago.
+#
+# A target may appear in several rules; make unions the
+# prerequisites as long as only one rule has a recipe. So this line
+# does what the edit was meant to do, and does it after the variable
+# exists.
+#
+# The general lesson for an append-structured Makefile: appending a
+# *rule* is safe, editing an earlier rule to name a later variable
+# is not.
+$(KERNEL): $(ROOTTASK_BIN)
+
+# The scenarios. root-test exits 33; root-dies exits 35, because a
+# dead root task is a panic (ADR 044) — after it, no capability names
+# any resource, so "carry on" would mean "carry on doing nothing".
+ISO_ROOTTEST     := $(BUILD_DIR)/pythos-roottest.iso
+ISO_ROOTNOUNTYPED := $(BUILD_DIR)/pythos-rootnountyped.iso
+ISO_ROOTDIES     := $(BUILD_DIR)/pythos-rootdies.iso
+
+ALL_ISOS += $(ISO_ROOTTEST) $(ISO_ROOTNOUNTYPED) $(ISO_ROOTDIES)
+
+# Entry indices into boot/limine.conf.in, which had 55 entries before
+# M12 appended three. Literal numbers because that is what
+# `default_entry` takes and what every other milestone's rules pass.
+$(ISO_ROOTTEST): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,56)
+
+$(ISO_ROOTNOUNTYPED): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,57)
+
+$(ISO_ROOTDIES): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,58)
+
+run-roottest: $(ISO_ROOTTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_ROOTTEST) --expect roottest -- $(QEMU_FLAGS)
+
+run-rootnountyped: $(ISO_ROOTNOUNTYPED)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_ROOTNOUNTYPED) --expect rootnountyped -- $(QEMU_FLAGS)
+
+run-rootdies: $(ISO_ROOTDIES)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_ROOTDIES) --expect rootdies -- $(QEMU_FLAGS)
+
+test: run-roottest run-rootnountyped run-rootdies
+
+.PHONY: roottask run-roottest run-rootnountyped run-rootdies

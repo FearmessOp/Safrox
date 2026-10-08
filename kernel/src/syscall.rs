@@ -398,6 +398,71 @@ pub enum Method {
     /// must not be able to. The kernel assigns it. See
     /// [`crate::cap::tcb::set_user_registers`] for what that costs.
     SetUserRegisters = 13,
+
+    /// `Endpoint.Send`: a one-way message.
+    ///
+    /// **M9 built this and never opened it.** Every IPC scenario
+    /// from M9a to M9c called `cap::ipc::send` from inside the
+    /// kernel, which was honest for a milestone about the mechanism
+    /// and leaves a system where no component can talk to another.
+    ///
+    /// M12 needs it: the root task's two children have to exchange a
+    /// message, and there was no way for them to. The same shape as
+    /// M11's missing `CreateVSpace` — a function that existed, took
+    /// capabilities, checked rights, and had no door.
+    ///
+    /// Three message words only, in R10, R8 and R9. The IPC buffer's
+    /// other 125 words (ADR 034) are not reachable from here, and
+    /// that is a gap rather than a decision: it needs the buffer
+    /// mapped into the component's address space, which is M13's
+    /// problem.
+    Send = 14,
+
+    /// `Endpoint.Recv`: wait for a message.
+    ///
+    /// **Blocks**, like `Wait`. Returns the badge in RAX; the
+    /// message words are not returned, for the reason `Send` gives.
+    /// A component that needs the words needs the buffer.
+    Recv = 15,
+
+    /// `CNode.Mint`: copy a capability into another CNode, badged.
+    ///
+    /// **The invocation that connects two components**, and its
+    /// absence was the third thing M12 found missing. Without it a
+    /// component can *create* capabilities — `Retype` has been open
+    /// since M11 — and can never give one away. Every component it
+    /// builds would be sealed off from every other, which is
+    /// isolation without composition, and a system of components
+    /// that cannot be connected is not a system.
+    ///
+    /// Target: the **source CNode**, because that is where the
+    /// authority to copy lives. Arguments: the source index, the
+    /// destination CNode, the destination index, and the badge.
+    ///
+    /// **Endpoint and Notification only.** A badge lives in the
+    /// field that holds a CNode's `radix` and an Untyped's
+    /// `size_bits` (ADR 037), so minting either would overwrite the
+    /// number that bounds it.
+    ///
+    /// An earlier version of this comment claimed that "a badge of
+    /// zero is an unbadged copy, so the narrower operation is
+    /// reachable through the wider one", and that reasoning is why
+    /// [`Method::Copy`] was thought unnecessary. It is wrong twice
+    /// over: minting writes the badge field whatever the badge is,
+    /// so zero is not a no-op but an *erasure*; and `mint` demands
+    /// `GRANT`, which plain copying does not need.
+    Mint = 16,
+
+    /// `CNode.Copy`: copy any capability, unbadged.
+    ///
+    /// Same five arguments as [`Method::Mint`] without the badge.
+    ///
+    /// The more basic of the two hand-over operations and the one
+    /// that was missing until M12 — found when the root task tried
+    /// to give a child its CSpace, which is a CNode and so cannot be
+    /// minted. Giving a capability away without altering it is the
+    /// common case; attaching an identity to it is the special one.
+    Copy = 17,
 }
 
 impl Method {
@@ -416,6 +481,10 @@ impl Method {
             11 => Some(Method::Resume),
             12 => Some(Method::CreateVSpace),
             13 => Some(Method::SetUserRegisters),
+            14 => Some(Method::Send),
+            15 => Some(Method::Recv),
+            16 => Some(Method::Mint),
+            17 => Some(Method::Copy),
             _ => None,
         }
     }
@@ -435,6 +504,10 @@ impl Method {
             Method::Resume => "TCB.Resume",
             Method::CreateVSpace => "PageTable.CreateVSpace",
             Method::SetUserRegisters => "TCB.SetUserRegisters",
+            Method::Send => "Endpoint.Send",
+            Method::Recv => "Endpoint.Recv",
+            Method::Mint => "CNode.Mint",
+            Method::Copy => "CNode.Copy",
         }
     }
 
@@ -464,6 +537,8 @@ impl Method {
             Method::SetSpace | Method::Resume => Some(CapType::Tcb),
             Method::CreateVSpace => Some(CapType::PageTable),
             Method::SetUserRegisters => Some(CapType::Tcb),
+            Method::Send | Method::Recv => Some(CapType::Endpoint),
+            Method::Mint | Method::Copy => Some(CapType::CNode),
             Method::Echo => None,
         }
     }
@@ -638,6 +713,7 @@ fn dispatch(
         if !crate::usertest::record_forge_result(cptr_bits, arg0)
             && !crate::irqtest::record_user_report(cptr_bits, arg0)
             && !crate::vspaceuser::record_step(cptr_bits, arg0)
+            && !crate::roottest::record_step(cptr_bits, arg0)
         {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);
         }
@@ -936,6 +1012,91 @@ fn dispatch(
             Ok(0)
         }
 
+        Method::Send => {
+            // Three words in R10, R8 and R9; the label in RDX.
+            //
+            // **M9's IPC, reachable for the first time.** Every
+            // scenario from M9a to M9c called this function from
+            // inside the kernel — honest for a milestone about the
+            // mechanism, and it left a system in which no component
+            // could speak to another. M12's root task needs its two
+            // children to exchange a message, so the door opens here.
+            let label = u32::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+            let message = crate::cap::ipc::Message::words(label, [args.arg1, args.arg2, args.arg3]);
+
+            // **This blocks** until a receiver takes the message
+            // (ADR 033). The calling thread is parked and another
+            // runs; control returns here when the rendezvous
+            // completes — or with an error if the endpoint is
+            // revoked while it waits (ADR 039).
+            //
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live Endpoint. `space` is the caller's own CSpace,
+            // which is what any capability in the message would be
+            // resolved against — and this message carries none.
+            unsafe { crate::cap::ipc::send(slot, &message, &space) }?;
+            Ok(0)
+        }
+        Method::Recv => {
+            // Also blocks. Returns the **badge** of the capability
+            // the sender used (ADR 037), which is how a server tells
+            // its clients apart without trusting them.
+            //
+            // The message words are not returned. They live in the
+            // IPC buffer, which is inside the TCB and not mapped
+            // into any component's address space — so there is
+            // nowhere for a component to read them from yet. The
+            // badge fits in a register and a component can act on
+            // it, which is enough for "the two talked"; the words
+            // need the buffer mapped, and that is M13.
+            //
+            // SAFETY: `resolve_typed` established the slot holds a
+            // live Endpoint, and nothing else borrows the current
+            // TCB on this path.
+            let delivery = unsafe { crate::cap::ipc::recv(slot) }?;
+
+            // The badge cannot collide with the error encoding: it
+            // is 32 bits (ADR 037) and ERROR_FLAG is bit 63. The
+            // same argument `Wait` makes.
+            Ok(delivery.badge as u64)
+        }
+
+        Method::Mint | Method::Copy => {
+            // RDI the source CNode, RDX the source index, R10 the
+            // destination CNode, R8 the destination index, R9 the
+            // badge (Mint only).
+            //
+            // One arm for both, because everything up to the final
+            // call is identical and two copies of this reasoning
+            // would be two chances to get the aliasing wrong.
+            let badge = u32::try_from(args.arg3).map_err(|_| CapError::InvalidArgument)?;
+            if method == Method::Copy && badge != 0 {
+                // A badge argument to `Copy` means the caller
+                // expected it to be attached. Refusing beats
+                // silently discarding it.
+                return Err(CapError::InvalidArgument);
+            }
+
+            // SAFETY: `resolve_typed` established the target is a
+            // live CNode, and `locate_pair` is given the same
+            // guarantee for the destination.
+            let (src, dest) = unsafe { locate_pair(&space, slot, cptr_bits, &args) }?;
+
+            // SAFETY: Both slots are live and distinct, which
+            // `locate_pair` established.
+            unsafe {
+                match method {
+                    // `mint` requires GRANT (ADR 021) and only
+                    // accepts badgeable types.
+                    Method::Mint => crate::cap::cnode::mint(src, dest, src.rights(), badge),
+                    // `copy` carries `extra` across untouched, which
+                    // is what a CNode's radix needs.
+                    _ => crate::cap::cnode::copy(src, dest, src.rights()),
+                }
+            }?;
+            Ok(0)
+        }
+
         // Handled above, before the capability was resolved.
         Method::Echo => unreachable!("Echo is handled before resolution"),
     }
@@ -964,6 +1125,87 @@ unsafe fn resolve_aux(
     // SAFETY: Caller's guarantee; `resolve_typed` validates every
     // field of the pointer before it reaches an object.
     unsafe { crate::cap::cptr::resolve_typed(space, CPtr(bits), required) }
+}
+/// Resolve the source and destination slots of `Copy` and `Mint`.
+///
+/// Returns two **distinct** live slots, or an error. Shared by both
+/// invocations because the hard part is identical and is entirely
+/// about aliasing rather than about what is then done with them.
+///
+/// # The three ways these can coincide
+///
+/// Each needs a different answer, and collapsing them would be wrong
+/// in a different direction every time:
+///
+/// 1. **The same CPtr names both CNodes.** Ordinary: a component
+///    rearranging its own CSpace. Resolving twice would produce two
+///    `&'static mut` to one slot, so the pointer is compared and the
+///    second resolution skipped. Not refused — refusing would make
+///    the common case impossible.
+/// 2. **Different CPtrs, same CNode object.** Also ordinary, and not
+///    detectable from the pointers: two slots can hold two
+///    capabilities for one CNode. Handled by comparing
+///    [`CNode::base`], which is object identity rather than
+///    capability identity.
+/// 3. **The same slot on both sides.** Refused. `copy` would read
+///    the source after having filled the destination — the same
+///    memory — and `link_after` would splice the derivation list
+///    into a cycle. Unlike the first two this has no legitimate
+///    reading: copying a capability onto itself is not a weaker
+///    request, it is a meaningless one.
+///
+/// # Safety
+///
+/// `src_slot` must be a live CNode capability that nothing else
+/// borrows mutably, and `src_bits` the CPtr it was resolved from.
+/// The returned slots are distinct, so holding both is sound.
+unsafe fn locate_pair(
+    space: &crate::cap::cptr::CSpace,
+    src_slot: &crate::cap::cnode::Slot,
+    src_bits: u64,
+    args: &Args,
+) -> Result<
+    (
+        &'static mut crate::cap::cnode::Slot,
+        &'static mut crate::cap::cnode::Slot,
+    ),
+    CapError,
+> {
+    let src_index = usize::try_from(args.arg0).map_err(|_| CapError::InvalidArgument)?;
+    let dest_index = usize::try_from(args.arg2).map_err(|_| CapError::InvalidArgument)?;
+
+    // SAFETY: Caller's guarantee that the slot holds a live CNode;
+    // `as_radix` asserts the type, so the length is the object's.
+    let src_cnode =
+        unsafe { crate::cap::cnode::CNode::new(src_slot.object().0, src_slot.as_radix()) };
+
+    // Case 1: the same pointer on both sides.
+    let dest_cnode = if args.arg1 == src_bits {
+        // SAFETY: As above — this reads the same capability again
+        // rather than resolving a second mutable reference to it.
+        unsafe { crate::cap::cnode::CNode::new(src_slot.object().0, src_slot.as_radix()) }
+    } else {
+        // SAFETY: A different CPtr. The borrow of the resolved slot
+        // ends with this expression: `CNode::new` copies out the
+        // address and radix and keeps no reference.
+        let dest_slot = unsafe { resolve_aux(space, args.arg1, CapType::CNode) }?;
+        // SAFETY: As above.
+        unsafe { crate::cap::cnode::CNode::new(dest_slot.object().0, dest_slot.as_radix()) }
+    };
+
+    if src_index >= src_cnode.len() || dest_index >= dest_cnode.len() {
+        return Err(CapError::CPtrOutOfRange);
+    }
+
+    // Cases 2 and 3: object identity, then slot identity.
+    if src_cnode.base() == dest_cnode.base() && src_index == dest_index {
+        return Err(CapError::InvalidArgument);
+    }
+
+    // SAFETY: Both indices are in range, and the pair is distinct —
+    // either the CNodes are different objects, or the check above
+    // established different indices within one.
+    unsafe { Ok((src_cnode.slot(src_index), dest_cnode.slot(dest_index))) }
 }
 
 /// Decode the permissions argument of `Frame.Map` (ADR 032).

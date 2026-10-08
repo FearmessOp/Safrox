@@ -22,6 +22,12 @@ __pycache__/
 
 # The question-7 probe builds its own crate.
 /scripts/m9-index-probe/target/
+# The root task is built as a separate crate (M12), so it has a
+# `target/` of its own. `/target/` above is anchored to the
+# repository root and does not reach it — the first `git add -A`
+# after M12 staged 106 build artefacts before this line existed.
+/roottask/target/
+
 
 # Cargo.lock is committed: the kernel is a binary, and a reproducible build
 # needs pinned dependency versions.

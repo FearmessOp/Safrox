@@ -922,6 +922,19 @@ pub fn yield_now() {
 pub unsafe fn tick() {
     TICK_COUNT.fetch_add(1, Ordering::AcqRel);
 
+    // Is the root task still there? (ADR 044)
+    //
+    // **Before the preempt check**, deliberately: the question is
+    // not "may we switch threads" but "is there still a system".
+    // A preempt-disabled region is exactly where a kernel would sit
+    // spinning if the root task had died, so skipping the check
+    // there would skip it when it matters most.
+    //
+    // Cheap: two loads and a comparison, against an address
+    // recorded once at boot. Before the root task starts, the
+    // recorded address is zero and this returns immediately.
+    crate::roottask::check_alive();
+
     if preemption_disabled() {
         // Deferred, not lost. ADR 025: a preempt-disabled region still
         // takes interrupts; it just does not switch threads.
