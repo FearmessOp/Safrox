@@ -3332,6 +3332,198 @@ EXPECTATIONS = {
             re.compile(r"KERNEL PANIC", re.M),
         ],
     ),
+    # ---- M14: the framebuffer, driven from a component ---------------
+    "fbtest": Expectation(
+        name="the framebuffer is driven by a user component",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # The geometry, from the kernel's copy of Limine's answer
+            # (ADR 049). Digits rather than `.*`: a run that reported
+            # a 0x0 screen would otherwise read as a pass.
+            re.compile(
+                r"^\[boot\] framebuffer: [1-9]\d*x[1-9]\d* at 0x[0-9a-f]+, "
+                r"pitch [1-9]\d* bytes, [1-9]\d* bpp",
+                re.M,
+            ),
+            # Boot turned it into device Untypeds -- the first real
+            # ones this kernel has ever had (ADR 050).
+            re.compile(
+                r"^\[cap\] framebuffer: [1-9]\d* device Untyped\(s\) from "
+                r"slot \d+",
+                re.M,
+            ),
+            # The PAT, without which the write-combining mapping
+            # below would silently be write-back (ADR 051).
+            re.compile(
+                r"^\[cpu\] PAT: entry 4 = write-combining", re.M
+            ),
+            # The component mapped it. A digit, because a component
+            # that mapped zero pages would otherwise pass.
+            re.compile(
+                r"^\[fb\] the screen component mapped [1-9]\d* page\(s\) of "
+                r"device memory into its own address space",
+                re.M,
+            ),
+            # **Criterion 2, and the line that distinguishes handing a
+            # device over from lending it.**
+            re.compile(
+                r"^\[fb\] the kernel's own address space does not map any "
+                r"of the [1-9]\d* framebuffer page\(s\)",
+                re.M,
+            ),
+            # It drew and read back. The pixel count is what makes
+            # this different from "the component said it was done".
+            re.compile(
+                r"^\[fb\] the component read back [1-9]\d* pixel\(s\) and "
+                r"every one held what it wrote",
+                re.M,
+            ),
+            # The fill was timed and the figure is not zero.
+            re.compile(
+                r"^\[fb\] full-screen fill: [1-9]\d* cycles for [1-9]\d* "
+                r"pixels",
+                re.M,
+            ),
+            # **The surviving mutation, in the log on every run.**
+            #
+            # On QEMU `pitch == width * bpp / 8`, so replacing one
+            # with the other changes nothing and criterion 5 cannot
+            # be falsified here. ADR 023 says a mutation that lives
+            # is reported rather than buried, and this is where it
+            # is reported -- asserted, so that deleting the report
+            # fails the scenario.
+            #
+            # On hardware that pads its rows the other branch prints
+            # instead, and this expectation would have to change.
+            # That is correct: the day it changes is the day the
+            # claim becomes testable.
+            re.compile(r"^\[fb\] pitch \d+ bytes", re.M),
+            re.compile(r"^\[fb\] all framebuffer tests passed", re.M),
+            re.compile(r"^\[boot\] M14 checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
+    "fbnocap": Expectation(
+        name="a component with no framebuffer capability cannot map it",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            re.compile(
+                r"^\[fb\] refused with EmptySlot: a framebuffer is memory "
+                r"at an address anybody can compute",
+                re.M,
+            ),
+            # And nothing got mapped anywhere as a result.
+            re.compile(
+                r"^\[fb\] the kernel's own address space does not map any "
+                r"of the [1-9]\d* framebuffer page\(s\)",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M14 fb-no-cap checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
+    "fboob": Expectation(
+        name="writing past the framebuffer faults",
+        # **The one M14 scenario that exits 35.**
+        #
+        # A fault, not a refusal. The component mapped the
+        # framebuffer correctly and then wrote one page past it;
+        # nothing is there, and the CPU says so. A run that exited 33
+        # would be one where the write had quietly worked, which
+        # would mean the mapping extends past the device.
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            # **The kernel's own arithmetic, printed before the
+            # fault.**
+            #
+            # This used to require the *component's* announcement of
+            # the address, and that expectation could never be met.
+            # The component echoes and then stores, with no
+            # scheduling point between: `Echo` returns straight to
+            # ring 3 (ADR 048), so the kernel thread waiting for the
+            # report is not runnable until the fault, and the fault
+            # ends the run. The line was missing because it was
+            # unreachable.
+            #
+            # The kernel now computes the address from
+            # `abi::FRAMEBUFFER_BASE` and the geometry, which is a
+            # better test besides: the expected CR2 and the actual
+            # one come from different places, so the pair below is a
+            # comparison rather than an echo.
+            re.compile(
+                r"^\[fb\] it maps \d+ page\(s\) at 0x[0-9a-f]+ and will "
+                r"write to 0x[0-9a-f]+, one page past the last mapped byte",
+                re.M,
+            ),
+            re.compile(
+                r"^\[fb\] expecting #PF with cr2=0x[0-9a-f]+\.",
+                re.M,
+            ),
+            # The fault itself, with CR2. `(user write not-present)`
+            # rather than any #PF: a fault from the kernel, or a
+            # read, or a protection violation would all be a
+            # different event wearing the same name.
+            re.compile(r"\*\*\* EXCEPTION: #PF page fault", re.M),
+            re.compile(
+                r"^\[trap\] cr2=0x[0-9a-f]+\s+\(user write not-present\)",
+                re.M,
+            ),
+            # **And it landed where the kernel said it would.**
+            #
+            # The two lines above would be satisfied by any user
+            # write fault anywhere -- a component that overran its
+            # own stack would match both, and the claim is
+            # specifically about the page after the framebuffer.
+            #
+            # The comparison is made inside the #PF handler, which
+            # is the only code that sees both numbers: the kernel
+            # predicted the address from the device Untyped's size
+            # before the component ran, and the CPU reported where
+            # the store actually went. This line is printed only
+            # when they are equal.
+            re.compile(
+                r"^\[fb\] the fault landed at 0x[0-9a-f]+, exactly where "
+                r"the mapping ends",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            # The component must not have got past the write. If this
+            # line appears, the store succeeded.
+            re.compile(r"^\[fb\] all framebuffer tests passed", re.M),
+            # The handler says this when CR2 and the prediction
+            # disagree. Forbidden as well as the positive being
+            # required, so that a future change which stops printing
+            # either line cannot pass by silence.
+            re.compile(r"^\[fb\] WRONG ADDRESS", re.M),
+        ],
+    ),
+    "fbmisuse": Expectation(
+        name="device memory cannot become a TCB",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            re.compile(
+                r"^\[fb\] refused with DeviceUntypedFrameOnly: boot's "
+                r"seeding set the device flag",
+                re.M,
+            ),
+            re.compile(
+                r"^\[boot\] M14 fb-device-untyped-misuse checks passed",
+                re.M,
+            ),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+        ],
+    ),
 }
 
 

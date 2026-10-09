@@ -62,6 +62,22 @@ bitflags! {
         const NO_CACHE = 1 << 5;
         /// Write-through rather than write-back.
         const WRITE_THROUGH = 1 << 6;
+        /// Write-combining: writes gather in a buffer and go out in
+        /// bursts (ADR 051).
+        ///
+        /// For a framebuffer, where there are millions of bytes and
+        /// no ordering requirement between them. **Not** for register
+        /// windows: the LAPIC and I/O APIC use [`NO_CACHE`], because
+        /// a write to a control register has to arrive when it was
+        /// issued and in the order it was issued.
+        ///
+        /// Needs PAT entry 4 to say WC, which `cpu::init_pat` writes
+        /// — the reset value of that entry is WB, so this flag means
+        /// nothing until the MSR is programmed (SDM Vol. 3A, Table
+        /// 12-10).
+        ///
+        /// [`NO_CACHE`]: Self::NO_CACHE
+        const WRITE_COMBINING = 1 << 7;
     }
 }
 
@@ -107,7 +123,24 @@ bitflags! {
         const DIRTY = 1 << 6;
         /// Bit 7, PS: this entry maps a large page rather than a table.
         /// Meaningful at PDPT (1 GiB) and PD (2 MiB) level.
+        ///
+        /// **In a 4 KiB PTE this same bit is PAT**, not PS. See
+        /// [`PAT_4K`](Self::PAT_4K): one bit, two meanings, chosen by
+        /// the level the entry sits at.
         const HUGE = 1 << 7;
+        /// Bit 7 again, under its other name: PAT, in a 4 KiB leaf.
+        ///
+        /// Together with PCD (bit 4) and PWT (bit 3) this selects one
+        /// of the eight PAT entries (SDM Vol. 3A, Table 12-11):
+        /// `index = PAT<<2 | PCD<<1 | PWT`. Setting it alone selects
+        /// entry 4, which `cpu::init_pat` programs as write-combining.
+        ///
+        /// **The duplicate name is the point.** Bit 7 means PS at
+        /// levels 2 and 3 and PAT at level 1, and before M14 nothing
+        /// in this kernel ever set it in a leaf, so one name was
+        /// enough. Two names make the ambiguity visible at every use
+        /// site rather than leaving it to be rediscovered.
+        const PAT_4K = 1 << 7;
         /// Bit 8, G: global; not flushed on a CR3 reload when CR4.PGE is
         /// set.
         const GLOBAL = 1 << 8;
@@ -144,8 +177,29 @@ impl Entry {
         self.0 & EntryFlags::PRESENT.bits() != 0
     }
 
-    fn is_huge(self) -> bool {
-        self.0 & EntryFlags::HUGE.bits() != 0
+    /// Does this entry map a large page?
+    ///
+    /// **Takes the level, and that is not decoration.** Bit 7 is PS
+    /// at levels 2 and 3 and PAT at level 1 (SDM Vol. 3A, Table 4-19
+    /// against 4-20), so "is this huge" is unanswerable without
+    /// knowing where the entry lives. At level 1 the answer is always
+    /// `false`: a 4 KiB entry is a leaf by construction.
+    ///
+    /// Before M14 the parameter would have been pointless, because
+    /// nothing set bit 7 in a leaf. The write-combining flag does
+    /// (ADR 051), and the old signature would then have reported
+    /// every WC mapping as a huge page.
+    ///
+    /// Auditing the four callers at the time showed all of them
+    /// already safe — three walk only intermediate levels, and
+    /// `walk_lookup` is guarded by `level == 1 ||`, whose
+    /// short-circuit happens to stop the call. **Happens to** is the
+    /// operative phrase: reordering that condition would have broken
+    /// it silently. The level parameter makes the rule part of the
+    /// signature instead of a property of an expression's evaluation
+    /// order.
+    fn is_huge(self, level: u8) -> bool {
+        level >= 2 && self.0 & EntryFlags::HUGE.bits() != 0
     }
 
     fn frame(self) -> PhysFrame {
@@ -195,6 +249,18 @@ fn leaf_entry_flags(flags: PageFlags) -> EntryFlags {
     if flags.contains(PageFlags::WRITE_THROUGH) {
         bits |= EntryFlags::WRITE_THROUGH;
     }
+    if flags.contains(PageFlags::WRITE_COMBINING) {
+        // PAT=1, PCD=0, PWT=0 -> entry 4, which cpu::init_pat sets to
+        // write-combining (ADR 051).
+        //
+        // Only correct for a 4 KiB leaf. A 2 MiB or 1 GiB page keeps
+        // PAT at bit 12 and bit 7 is PS -- setting this there would
+        // declare a huge page rather than choose a cache type. Large
+        // pages are created by `map_huge` for the HHDM alone and
+        // nothing asks for WC there, so the case is refused rather
+        // than handled: see the assertion in `map_huge`.
+        bits |= EntryFlags::PAT_4K;
+    }
 
     bits
 }
@@ -220,6 +286,12 @@ fn page_flags_from_entry(bits: EntryFlags) -> PageFlags {
     }
     if bits.contains(EntryFlags::WRITE_THROUGH) {
         flags |= PageFlags::WRITE_THROUGH;
+    }
+    if bits.contains(EntryFlags::PAT_4K) {
+        // Reached only for 4 KiB leaves; the one caller
+        // (`translate`) returns the level alongside and large pages
+        // are reported at levels 2 and 3.
+        flags |= PageFlags::WRITE_COMBINING;
     }
 
     flags
@@ -496,7 +568,7 @@ unsafe fn walk_create<'a>(
         let entry = unsafe { (*current).entries[index] };
 
         let next_frame = if entry.is_present() {
-            if entry.is_huge() {
+            if entry.is_huge(level) {
                 // A large page covers this address. Splitting it is a
                 // policy decision (which pieces keep which permissions),
                 // so refuse rather than guess.
@@ -554,7 +626,7 @@ unsafe fn walk_lookup(table: &PageTable, addr: VirtAddr) -> Option<(Entry, u8)> 
         if !entry.is_present() {
             return None;
         }
-        if level == 1 || entry.is_huge() {
+        if level == 1 || entry.is_huge(level) {
             return Some((entry, level));
         }
 
@@ -684,7 +756,7 @@ unsafe fn clear_leaf(table: &mut PageTable, page: VirtAddr) {
         // SAFETY: `current` points at a live table, and the caller
         // guarantees the entry is present and non-huge.
         let entry = unsafe { (*current).entries[index] };
-        debug_assert!(entry.is_present() && !entry.is_huge());
+        debug_assert!(entry.is_present() && !entry.is_huge(level));
         // SAFETY: As above; the entry's frame holds the next table.
         current = unsafe { table_mut(entry.frame()) };
     }
@@ -734,6 +806,23 @@ pub unsafe fn map_huge(
         _ => return Err(MapError::InvalidFlags(flags)),
     };
 
+    // **Write-combining is not representable in a large page here**
+    // (ADR 051).
+    //
+    // In a 4 KiB PTE the PAT bit is bit 7; in a PDE or PDPTE that bit
+    // is PS and PAT moves to bit 12. `leaf_entry_flags` encodes the
+    // 4 KiB layout, so letting WC through would set PS -- declaring a
+    // page size rather than choosing a cache type, in a function that
+    // then sets PS itself.
+    //
+    // Refused rather than handled. Large pages exist here for the
+    // HHDM alone, nothing asks for a write-combining HHDM, and the
+    // bit-12 encoding would be a second cache-type path with one
+    // caller and no test.
+    if flags.contains(PageFlags::WRITE_COMBINING) {
+        return Err(MapError::InvalidFlags(flags));
+    }
+
     assert!(
         virt.0.is_multiple_of(size) && phys.0.is_multiple_of(size),
         "a {} byte page needs both addresses aligned to it: {} -> {}",
@@ -752,7 +841,7 @@ pub unsafe fn map_huge(
         let entry = unsafe { (*current).entries[index] };
 
         let next = if entry.is_present() {
-            if entry.is_huge() {
+            if entry.is_huge(walk_level) {
                 return Err(MapError::BlockedByHugePage { level: walk_level });
             }
             entry.frame()
@@ -910,7 +999,7 @@ pub unsafe fn insert_table(
             // MissingPageTable.
             return Err(MapError::OutOfFrames);
         }
-        if entry.is_huge() {
+        if entry.is_huge(walk_level) {
             return Err(MapError::BlockedByHugePage { level: walk_level });
         }
 
@@ -972,7 +1061,7 @@ pub unsafe fn remove_table(
         if !entry.is_present() {
             return Err(UnmapError::NotMapped);
         }
-        if entry.is_huge() {
+        if entry.is_huge(walk_level) {
             return Err(UnmapError::BlockedByHugePage { level: walk_level });
         }
 
@@ -987,7 +1076,7 @@ pub unsafe fn remove_table(
     if !entry.is_present() {
         return Err(UnmapError::NotMapped);
     }
-    if entry.is_huge() {
+    if entry.is_huge(level + 1) {
         return Err(UnmapError::BlockedByHugePage { level: level + 1 });
     }
 

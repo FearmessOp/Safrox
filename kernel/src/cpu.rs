@@ -48,6 +48,57 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 /// Reference: Intel SDM Vol. 4, Table 2-2, MSR address 0xC000_0084.
 const IA32_FMASK: u32 = 0xC000_0084;
 
+/// Page Attribute Table (ADR 051).
+///
+/// Eight one-byte entries; a leaf page-table entry picks one with its
+/// PAT, PCD and PWT bits.
+///
+/// Reference: Intel SDM Vol. 3A, 12.12, MSR address 0x277.
+const IA32_PAT: u32 = 0x277;
+
+/// Memory types, as a PAT entry encodes them.
+///
+/// Reference: Intel SDM Vol. 3A, Table 12-10.
+mod pat_type {
+    /// Uncacheable, and not overridable by an MTRR.
+    pub const UC: u64 = 0x00;
+    /// Write-combining: writes gather and leave in bursts.
+    pub const WC: u64 = 0x01;
+    /// Write-through.
+    pub const WT: u64 = 0x04;
+    /// Uncacheable, overridable by an MTRR to WC.
+    pub const UC_MINUS: u64 = 0x07;
+    /// Write-back. The ordinary type for RAM.
+    pub const WB: u64 = 0x06;
+}
+
+/// What this kernel programs into the PAT.
+///
+/// **Entries 0..3 keep their reset values and entry 4 becomes WC.**
+///
+/// The reset table (SDM Table 12-10) is WB, WT, UC-, UC and then the
+/// same four again — so there is no write-combining entry at all
+/// until this is written, which is why ADR 051 exists.
+///
+/// Leaving 0..3 alone is the load-bearing half. Every mapping the
+/// kernel has already made, and every mapping Limine left behind,
+/// means what it means because of those four: the physical window is
+/// WB, the LAPIC and I/O APIC are PCD so UC-. Redefining one of them
+/// would change what existing page-table entries mean without
+/// touching a single entry, and the symptom would surface somewhere
+/// with no visible connection to the change.
+///
+/// Entry 4 is selected by PAT=1, PCD=0, PWT=0 — a bit no leaf in this
+/// kernel set before M14, so nothing is reinterpreted by defining it.
+const PAT_VALUE: u64 = pat_type::WB
+    | (pat_type::WT << 8)
+    | (pat_type::UC_MINUS << 16)
+    | (pat_type::UC << 24)
+    | (pat_type::WC << 32)
+    | (pat_type::WT << 40)
+    | (pat_type::UC_MINUS << 48)
+    | (pat_type::UC << 56);
+
 bitflags! {
     /// Bits of `IA32_EFER` that this kernel cares about.
     ///
@@ -635,6 +686,88 @@ pub fn fmask() -> u64 {
 ///
 /// Call once, after `gdt::init`, with interrupts disabled. `entry` must
 /// be the address of a stub that obeys ADR 030's contract: it is entered
+/// Program the PAT so that entry 4 means write-combining (ADR 051).
+///
+/// # Why this has to happen at all
+///
+/// The reset value of the PAT has **no write-combining entry**: the
+/// eight slots are WB, WT, UC-, UC and then those four again (SDM
+/// Vol. 3A, Table 12-10). A page-table entry asking for "entry 4"
+/// gets write-back, which for a framebuffer means drawing that is
+/// correct and invisible until something flushes it.
+///
+/// So M14's `PageFlags::WRITE_COMBINING` is inert until this runs.
+/// That is worth stating because the failure would be quiet: the
+/// mapping succeeds, the pixels are right, and only the timing is
+/// wrong.
+///
+/// # Why entries 0..3 are left alone
+///
+/// Everything mapped before this call — the physical window, the
+/// kernel image, the LAPIC, the I/O APIC, and whatever Limine set up
+/// — means what it means through entries 0..3. Redefining one of
+/// them would change the cache type of live mappings without
+/// touching a page-table entry, and the symptom would appear
+/// somewhere unrelated to the line that caused it.
+///
+/// # Ordering
+///
+/// Must run **before** any write-combining mapping is created, and
+/// it is called from `kmain` right after `cpu::init`. Nothing before
+/// that point asks for WC.
+///
+/// No TLB flush is needed here: no existing entry sets the PAT bit,
+/// so no cached translation changes meaning. A kernel that
+/// *redefined* an entry in use would have to flush, and would be
+/// wrong for the reason above regardless.
+///
+/// # Safety
+///
+/// Called once, at boot, at CPL 0, before any mapping asks for
+/// write-combining.
+pub unsafe fn init_pat() {
+    // CPUID leaf 1, EDX bit 16: the PAT exists.
+    //
+    // Checked rather than assumed: on a CPU without it, writing MSR
+    // 0x277 raises #GP, and a #GP during boot is a triple fault with
+    // nothing printed.
+    //
+    // Reference: Intel SDM Vol. 2A, Table 3-8, leaf 01H, EDX bit 16.
+    let (_, _, _, edx) = cpuid(1, 0);
+    assert!(
+        edx & (1 << 16) != 0,
+        "this CPU does not implement the Page Attribute Table, so a \
+         write-combining mapping cannot be expressed (ADR 051). The \
+         framebuffer would have to be uncacheable instead."
+    );
+
+    // SAFETY: The PAT exists (just checked) and `PAT_VALUE` contains
+    // only the memory-type encodings the SDM defines -- no reserved
+    // value, which is the one way a WRMSR here raises #GP. CPL 0.
+    unsafe {
+        write_msr(IA32_PAT, PAT_VALUE);
+    }
+
+    // Read it back, for the reason `enable_syscall` does: a write
+    // that did not take would surface as a framebuffer that draws
+    // slowly, which is not a symptom anybody traces back to an MSR.
+    //
+    // SAFETY: As above.
+    let now = unsafe { read_msr(IA32_PAT) };
+    assert_eq!(
+        now, PAT_VALUE,
+        "the PAT reads back as {:#018x} rather than the {:#018x} just \
+         written",
+        now, PAT_VALUE
+    );
+
+    println!(
+        "[cpu] PAT: entry 4 = write-combining; entries 0..3 left at \
+         their reset values (WB, WT, UC-, UC) so existing mappings \
+         keep their meaning (ADR 051)"
+    );
+}
+
 /// with RSP still pointing at user memory, RCX holding the return
 /// address and R11 the saved RFLAGS.
 pub unsafe fn enable_syscall(entry: u64) {

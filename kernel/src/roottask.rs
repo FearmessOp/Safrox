@@ -73,12 +73,37 @@ static ROOT_TASK_IMAGE: &[u8] = include_bytes!("../../build/roottask.bin");
 /// Two pages failed the link, which is the guard working: the
 /// message named the limit rather than producing a program with its
 /// tail missing.
-const ROOT_CODE_PAGES: usize = 4;
+const ROOT_CODE_PAGES: usize = 8;
 
 const _: () = assert!(
-    ROOT_CODE_PAGES * 4096 >= 7432,
+    ROOT_CODE_PAGES * 4096 >= 21000,
     "ROOT_CODE_PAGES is too small for the root task image"
 );
+
+/// Pages of stack the root task gets.
+///
+/// **Four from M14, and one before that** — a number that had no
+/// name until it stopped being enough.
+///
+/// The root task hand-assembles its children's programs into
+/// `Code` buffers, which are 1032 bytes each and live on the stack
+/// because this component has no writable statics and no heap (see
+/// `roottask/link.ld`). M14 added a third and fourth scenario
+/// branch, LLVM gave `main` a frame large enough for all of their
+/// locals at once, and the frame crossed a page.
+///
+/// The symptom was a #PF at `rip=0x400311` with `cr2 == rsp ==
+/// 0x4fffb0`, sixteen bytes below the stack's base — inside LLVM's
+/// **stack probe**, the `sub $0x1000; movq $0,(%rsp)` sequence it
+/// emits precisely so that a frame larger than a page touches each
+/// page in turn rather than skipping over a guard. The probe did
+/// its job: it found the end of the stack before anything was
+/// written past it.
+///
+/// Four rather than two, because the next scenario should not have
+/// to rediscover this. The cost is three frames of a 256 MiB
+/// machine.
+const ROOT_STACK_PAGES: usize = 4;
 
 /// Radix of the root task's root CNode: 4 slots.
 ///
@@ -173,7 +198,7 @@ const KSLOT_VSPACE: usize = KSLOT_TCB + 1;
 const KSLOT_TABLES: usize = KSLOT_VSPACE + 1;
 const KSLOT_CODE: usize = KSLOT_TABLES + TABLE_COUNT;
 const KSLOT_STACK: usize = KSLOT_CODE + ROOT_CODE_PAGES;
-const KSLOT_BOOTINFO: usize = KSLOT_STACK + 1;
+const KSLOT_BOOTINFO: usize = KSLOT_STACK + ROOT_STACK_PAGES;
 const KSLOT_KSTACK: usize = KSLOT_BOOTINFO + 1;
 /// One past the last slot this module touches.
 const KSLOT_END: usize = KSLOT_KSTACK + KSTACK_FRAMES;
@@ -820,8 +845,17 @@ fn build_address_space(
     }
     .expect("could not retype the root task's code frames");
     // SAFETY: As above.
-    unsafe { untyped::retype(parent, CapType::Frame, 0, 1, cnode, KSLOT_STACK) }
-        .expect("could not retype the root task's stack frame");
+    unsafe {
+        untyped::retype(
+            parent,
+            CapType::Frame,
+            0,
+            ROOT_STACK_PAGES,
+            cnode,
+            KSLOT_STACK,
+        )
+    }
+    .expect("could not retype the root task's stack frames");
     // SAFETY: As above.
     unsafe { untyped::retype(parent, CapType::Frame, 0, 1, cnode, KSLOT_BOOTINFO) }
         .expect("could not retype the root task's BootInfo frame");
@@ -923,19 +957,30 @@ fn build_address_space(
         });
     }
 
-    // The stack, read-write.
-    // SAFETY: Index in range.
-    let stack = unsafe { cnode.slot(KSLOT_STACK) };
-    // SAFETY: As above.
-    unsafe {
-        vspace::map_frame(
-            root,
-            stack,
-            VirtAddr::new(abi::ROOT_STACK_ADDRESS),
-            MapPermissions::ReadWrite,
-        )
+    // The stack, read-write. Four pages from M14, growing **down**
+    // from `ROOT_STACK_TOP` towards `ROOT_STACK_ADDRESS` -- which is
+    // why that constant names the lowest page rather than the first
+    // one the root task touches.
+    for page in 0..ROOT_STACK_PAGES {
+        let address = abi::ROOT_STACK_ADDRESS + (page as u64) * FRAME_SIZE;
+        // SAFETY: Index in range.
+        let stack = unsafe { cnode.slot(KSLOT_STACK + page) };
+        // SAFETY: As above.
+        unsafe {
+            vspace::map_frame(
+                root,
+                stack,
+                VirtAddr::new(address),
+                MapPermissions::ReadWrite,
+            )
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "could not map the root task's stack at {:#018x}: {}",
+                address, e
+            )
+        });
     }
-    .expect("could not map the root task's stack");
 
     // BootInfo, **read-only**.
     //
@@ -1071,6 +1116,38 @@ fn build_thread(
 fn write_boot_info(frame: ObjectRef, untyped_count: u32, accounting: &Accounting) {
     note_privileged_op("write BootInfo");
 
+    // The screen, if there is one (M14, ADR 049).
+    //
+    // Two sources that must agree: the geometry comes from the copy
+    // `bootinfo::capture` made before reclaim, and the slot from
+    // `cap::boot`'s seeding pass. Either can be absent -- a machine
+    // with no framebuffer has neither -- and a machine that had
+    // geometry but no slot would mean the seeding loop ran out of
+    // CNode space, which is worth refusing rather than reporting as
+    // "no screen".
+    let fb = crate::memory::bootinfo::get().framebuffer();
+    let fb_untyped = crate::cap::boot::framebuffer_untyped();
+
+    assert_eq!(
+        fb.is_some(),
+        fb_untyped.is_some(),
+        "the bootloader {} a framebuffer but the capability system {} \
+         device Untypeds for it. The two come from different passes \
+         (ADR 049's copy and ADR 050's seeding) and disagreeing means \
+         one of them silently gave up -- most likely the Untyped CNode \
+         filled before the device pass ran.",
+        if fb.is_some() {
+            "reported"
+        } else {
+            "did not report"
+        },
+        if fb_untyped.is_some() {
+            "has"
+        } else {
+            "has no"
+        }
+    );
+
     let header = abi::BootInfo {
         magic: abi::BOOTINFO_MAGIC,
         version: abi::BOOTINFO_VERSION,
@@ -1091,6 +1168,20 @@ fn write_boot_info(frame: ObjectRef, untyped_count: u32, accounting: &Accounting
         usable_bytes: accounting.usable * FRAME_SIZE,
         kernel_bytes: accounting.kernel * FRAME_SIZE,
         lost_bytes: accounting.lost * FRAME_SIZE,
+
+        // Zero means "no screen" (ADR 049). The slot is an index into
+        // the same leaf CNode the ordinary Untypeds live in, offset
+        // the same way, because a device Untyped *is* an Untyped --
+        // the flag is on the capability, not in a separate list.
+        framebuffer_untyped_slot: match fb_untyped {
+            Some((first, _)) => (SLOT_UNTYPED_FIRST + first) as u32,
+            None => 0,
+        },
+        framebuffer_width: fb.map_or(0, |f| f.width as u32),
+        framebuffer_height: fb.map_or(0, |f| f.height as u32),
+        framebuffer_pitch: fb.map_or(0, |f| f.pitch as u32),
+        framebuffer_bpp: fb.map_or(0, |f| f.bpp as u32),
+        framebuffer_address: fb.map_or(0, |f| f.address),
     };
 
     // SAFETY: The frame came from a retype so nothing else owns it,

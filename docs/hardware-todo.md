@@ -282,3 +282,110 @@ vermez.
 `vmovdqu` dene, `#UD` bekle. Hem QEMU'da hem donanımda —
 `-cpu qemu64` AVX bildirmiyor, yani QEMU'da `#UD` yanlış sebepten
 gelebilir ve test vacuous olur. Donanımda anlamlı.
+
+---
+
+## 9. Pitch kullanıldığı QEMU'da kanıtlanamıyor — mutasyon hayatta kaldı (M14)
+
+**İddia** ([ADR 049](adr/049-bootinfo-framebuffer.md)): bir satırın ilk
+pikseli `y * pitch` adresinde, `y * width * bpp / 8` adresinde değil.
+Donanım satırları kendi hoşlandığı bir hizaya dolduruyor ve aradaki
+baytlar kimseye ait değil.
+
+**Ölçüm — ve bu listedeki en net sonuç.** `Geometry::offset` içindeki
+`pitch`, `width * bpp / 8` ile değiştirildi:
+
+```rust
+fn offset(&self, x: u64, y: u64) -> u64 {
+    y * (self.width * (self.bpp / 8)) + x * (self.bpp / 8)
+}
+```
+
+Dört M14 senaryosunun dördü de geçti. **Mutasyon hayatta kalıyor.**
+
+Sebep aritmetik: QEMU'nun bildirdiği geometri 1280×800×32, yani
+`pitch = 5120` ve `width * bpp / 8 = 1280 * 4 = 5120`. İki ifade
+**aynı sayı**. Doldurma yok, dolayısıyla doldurmayı yok saymanın bir
+bedeli de yok.
+
+**Bu bir test eksikliği değil, ortamın sınırı.** ADR 023'ün K5'i
+"her koruyucu kendi yokluğundan ayırt edilebilmeli" diyor; burada
+koruyucu ile yokluğu **bu makinede özdeş**. Yapılabilecek en dürüst
+şey, testin bunu her koşuda söylemesi — `fbtest::report_pitch`
+yapıyor:
+
+```
+[fb] pitch 5120 bytes equals width x bpp / 8 on this machine, so
+     criterion 5 cannot be falsified here. MUTATION SURVIVES: ...
+```
+
+Alternatif — "ikisi farklı olmalı" diye assert etmek — elimizdeki tek
+donanımda senaryoyu kırardı, yani emülatörü test etmek olurdu.
+
+**Ne kontrol ediliyor.** Bileşen row 1'in başına bir imleç yazıp aynı
+ifadeyle geri okuyor. Bu yalnızca aritmetiğin **kendisiyle tutarlı**
+olduğunu gösteriyor; `pitch` alanının kullanıldığını göstermiyor.
+
+**Gerçek donanımda.** Satırlarını dolduran bir ekran modu bul — pek
+çok gerçek GPU 1366×768'de `pitch`'i 5504 ya da 6144'e yuvarlıyor,
+`1366 * 4 = 5464` iken. O makinede:
+
+1. Değiştirilmemiş kodla `fb-test` koş. Beklenen:
+   `[fb] pitch N bytes against M bytes of visible pixels: this
+   machine pads its rows by N-M` satırı, ve senaryo geçer.
+2. Mutasyonu uygula. Beklenen: `verify()` ikinci satırdan itibaren
+   kayan adresler yüzünden kırılır — köşe pikselleri ya da
+   dikdörtgen kenarları tutmaz.
+
+İkinci adım kırılmazsa testler yetersiz demektir, iddia değil.
+
+**Yanlış çıkarsa.** `pitch` alanı gereksiz olurdu ve `offset` bir
+çarpma kazanırdı. Ama Limine onu ayrı bir alan olarak bildiriyor,
+ve bir alanın var olması onun bazen farklı olduğunun kanıtı.
+
+---
+
+## 10. Write-combining'in faydası ölçülemiyor (M14)
+
+**İddia** ([ADR 051](adr/051-pat-ve-write-combining.md)): PAT girdisi
+4 write-combining'e ayarlandı, ve framebuffer bu tiple eşlendi. WC'nin
+kazancı, ardışık yazmaları 64 baytlık patlamalar hâlinde toplamak —
+her pikseli ayrı bir bus işlemine çevirmek yerine.
+
+**Ölçüm.** Tam ekran dolduruluyor ve sayılıyor:
+
+```
+[fb] full-screen fill: 120541869 cycles for 1024000 pixels
+     (117 cycles each), write-combining
+```
+
+**Bu sayı bir taban, bir maliyet değil.** QEMU'nun TCG'si bir
+write-combining tamponu modellemiyor: her `write_volatile` bir
+fonksiyon çağrısına dönüşüyor ve 117 döngünün neredeyse tamamı
+emülasyon yükü. Gerçek donanımda beklenen büyüklük mertebesi tek
+haneli döngü.
+
+**İkinci bir ölçüm neden yok.** İlk plan, WC'li ve WC'siz iki rakam
+raporlamaktı. Vazgeçildi: TCG WC'yi modellemediği için iki rakam
+gürültü kadar farklı çıkardı, ve yan yana basılan iki eşit sayı
+okuyanı "WC'nin faydası yok" sonucuna davet ederdi. **Anlam
+taşıyamayacak bir karşılaştırmayı davet etmek, karşılaştırma
+yapmamaktan kötü.**
+
+Ölçümün koruduğu tek iddia şu: WC yolu **çalışıyor** — eşleme
+kuruluyor, pikseller doğru yere düşüyor, geri okunuyor.
+
+**Gerçek donanımda.** Aynı dolguyu iki kez koş, biri
+`perm::READ_WRITE_COMBINING` biri `perm::READ_WRITE` ile, ve iki TSC
+rakamını karşılaştır. Beklenen: WC belirgin biçimde hızlı — bir
+framebuffer'da tipik olarak birkaç kat. Değilse ya PAT girdisi
+yazılmamış ya da sayfa tablosu biti yanlış yerde; `cpu::init_pat`
+MSR'ı geri okuyor, yani ilk ihtimal boot'ta yakalanır.
+
+**Ek olarak: PAT biti ile PS biti.** ADR 051'in asıl bulgusu ölçüm
+değildi: seviye 1'de bit 7 **PAT**, seviye 2–3'te **PS**. `is_huge()`
+bunu ayırmıyordu ve yalnızca `walk_lookup`'ın `level == 1 ||`
+kısa devresi yüzünden kazara doğru çalışıyordu. Artık `is_huge`
+seviyeyi alıyor. Bu, donanım doğrulaması gerektirmiyor — SDM Vol. 3A
+Tablo 4-19 yeterli — ama 2 MiB sayfa kullanan ilk kod o kısa devreye
+güvenemeyecek.

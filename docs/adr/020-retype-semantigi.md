@@ -251,3 +251,102 @@ bellek kullanabilirsin" diyebilmeli. İkisi de var.
   ([ADR 017](017-nesne-kumesi.md)). Faz 1'de denetleniyor,
   `DeviceUntypedFrameOnly`.
 - Dokuz hata türü, hepsi faz 1'de.
+
+---
+
+## M14 eki — sıfırlama kuralı RAM'e özgüdür
+
+Yukarıdaki 4. bölüm şunu yazıyor:
+
+> **Retype, belleği nesneyi başlatmadan önce sıfırlar.** Her zaman,
+> istisnasız.
+>
+> **İstisna yok.**
+
+**Bu cümle RAM için doğru, device bellek için yanlıştı.** M14'te ilk
+gerçek device Untyped ortaya çıktığında kernel bir `#PF` ile durdu:
+`memset`, `pmap_base + 0xfd000000` adresine yazmaya çalıştı.
+
+Kural değişmiyor; **kapsamı yazılıyor.** Device bellek muaf, ve
+gerekçe iki ayrı sebep — ikisi de tek başına yeterli.
+
+### (i) İmkânsız
+
+Fiziksel pencere yalnızca RAM'i kapsıyor
+([ADR 027](027-vspace-modeli.md), değişmez 2) ve `vm::init`
+framebuffer bölgelerini zaten dışarıda bırakıyor. `phys_to_virt` o
+adres için eşlenmemiş bir sanal adres üretir; yazma sayfa hatası
+verir.
+
+Bu, "dikkatli olalım" değil, aritmetik: sıfırlamak için bir eşleme
+gerekir, ve o eşleme bilerek yok.
+
+### (ii) Yanlış
+
+Eşlenseydi bile yapılmamalıydı. Bir framebuffer'ı sıfırlamak ekranı
+siler. Bir aygıtın register penceresini sıfırlamak, o register'lara
+yazmaktır — yani `retype`, bir muhasebe işleminin yan etkisi olarak
+**donanım komutu verir**. Framebuffer'da bu görsel bir bozulma; bir
+disk denetleyicisinde bir reset.
+
+ADR 017'nin device Untyped'ı icat etme gerekçesi tam olarak buydu:
+aygıt belleğine kernel'in kendi amaçları için yazmak, aygıta komut
+vermekle aynı şey.
+
+### Sızıntı argümanı neden taşınmıyor
+
+4. bölümün savı şu: bir nesnenin baytları, o belleğin **bir sonraki
+sahibine** ulaşmamalı. Argüman bir *geçmişle* ilgili — önceki
+sahibin kalıntısı.
+
+Framebuffer'ın içeriği önceki bir sahibin kalıntısı değil. **Cihazın
+şu anki durumu.** Ekranda ne varsa odur, ve ekran zaten paylaşılan
+bir şey: yanındaki kişi de görüyor. Yeni sahibin okuyabileceği hiçbir
+şey, ekrana bakarak zaten öğrenemeyeceği bir şey değil.
+
+Dolayısıyla sıfırlama burada bir güvenlik önlemi değil, hiçbir şeyi
+korumayan bir yazma olurdu — ve (ii) gereği zararlı bir yazma.
+
+### Kodda
+
+`untyped.rs`'nin 2. fazında tek bir koşul:
+
+```rust
+if !untyped.is_device() {
+    // ... write_bytes(start, 0, ...)
+}
+```
+
+Dal, adlandırılmış bir karar olarak duruyor: yorumu bu paragrafa
+atıf veriyor, yoksa bir okuyucu onu bir optimizasyon sanabilir —
+ki 4. bölümün açıkça reddettiği şey o.
+
+### Bu kuralın üçüncü kırılması
+
+Aynı varsayımdan — *"bir Untyped'ın belleği yazılabilir RAM'dir"* —
+M14'te üç kural birden kırıldı:
+
+| # | Kural | Nerede yaşıyordu | Device için |
+|---|---|---|---|
+| 1 | Untyped kendi başlığını taşır | ilk 16 bayt | başlık yok |
+| 2 | watermark başlıkta | ilk 8 bayt | kernel tablosunda ([ADR 050](050-boot-device-untyped-tohumlama.md)) |
+| 3 | retype her zaman sıfırlar | bu ADR | muaf, yukarıdaki iki sebeple |
+
+Üçü de M5'te yazıldı, dokuz milestone boyunca doğru kaldı, ve ilk
+gerçek aygıt belirdiğinde aynı anda kırıldı. [ADR 023](023-test-disiplini.md)'ün
+K11'i bu gözlemden doğdu.
+
+### Tarandı: dördüncüsü var mıydı
+
+`retype` / `copy` / `revoke` / `delete` yolları device gözüyle bir kez
+daha tarandı. Dördüncü bir *kural* kırılması bulunmadı, ama bir **kod**
+hatası bulundu: `boot::root_untyped_with_room` device belleği
+elemiyordu — dört kardeşi (`roottask`, `usertest`, `vspacetest`,
+`vspaceuser`) eliyordu, bu en eskisi olduğu için eklenmemişti.
+Düzeltildi.
+
+Negatif sonuç da sonuçtur: `copy`, `revoke` ve `delete` device
+Untyped'ın belleğine hiç dokunmuyor — ilki yalnızca slot yazıyor,
+diğer ikisi yalnızca slot temizliyor. Nesne *yok etme* device
+Untyped'a ulaşmıyor çünkü ondan yalnızca Frame çıkabiliyor ve bir
+Frame'in yok edilmesi bir eşlemeyi kaldırmaktan ibaret.

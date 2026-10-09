@@ -103,19 +103,21 @@ ASSERT(SIZEOF(.got) <= 64,
 /* And the whole image has to fit the frames the kernel maps.
  *
  * One page in the first draft; two when the image came out at 7432
- * bytes and scripts/build-roottask.sh said so; **four from M13**,
- * when the root task began embedding the serial driver's flat image
- * in its own .rodata.
+ * bytes and scripts/build-roottask.sh said so; four from M13, when
+ * the root task began embedding the serial driver's flat image in
+ * its own .rodata; **eight from M14**, which added a second one.
  *
  * That embedding is not incidental. The kernel has no ELF loader and
  * must not grow one -- loading is a component's job (ADR 043) -- so
- * the component that loads the driver is the one that carries it.
- * The root task's own code barely changed; its payload did.
+ * the component that loads the others is the one that carries them.
+ * The root task's own code barely changes; its payload is what
+ * grows, and it grows once per component.
  *
  * Every figure here was measured rather than chosen, and each time
- * the check fired before anything subtle happened: the two-page
- * build failed at the link naming this limit, rather than producing
- * a program with its tail silently missing.
+ * the check fired before anything subtle happened. M14's four-page
+ * build failed at the link naming this limit rather than producing
+ * a root task with its tail missing -- which is what the guard is
+ * for, and the third time it has earned its place.
  */
-ASSERT(__image_end - 0x400000 <= 4 * 4096,
-       "the root task's image exceeds the four pages the kernel maps for it")
+ASSERT(__image_end - 0x400000 <= 8 * 4096,
+       "the root task's image exceeds the eight pages the kernel maps for it")

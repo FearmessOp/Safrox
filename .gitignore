@@ -31,3 +31,9 @@ __pycache__/
 
 # Cargo.lock is committed: the kernel is a binary, and a reproducible build
 # needs pinned dependency versions.
+
+# Scratch disassembly from debugging sessions (M14).
+f1.txt
+
+# soak.sh keeps the first failing run here (ADR 023, K8).
+build/soak/

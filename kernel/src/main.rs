@@ -58,6 +58,7 @@ mod cpu;
 mod drivertest;
 mod emergency;
 mod faults;
+mod fbtest;
 mod gdt;
 mod heaptest;
 mod idt;
@@ -81,8 +82,8 @@ mod vspacetest;
 mod vspaceuser;
 
 use limine::request::{
-    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
-    MemmapRequest, StackSizeRequest,
+    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
+    HhdmRequest, MemmapRequest, StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -153,6 +154,21 @@ static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static MEMMAP: MemmapRequest = MemmapRequest::new();
+
+/// The screen, if there is one (M14, ADR 049).
+///
+/// Asking costs nothing on a machine without one: the response is
+/// simply absent, and `bootinfo::capture` treats that as "no screen"
+/// rather than as a failure.
+///
+/// Asking also *does* something on a machine with one — Limine sets
+/// up a linear framebuffer and leaves the mode set. That is why the
+/// request exists rather than the kernel programming a display
+/// controller, which would be a driver, in the kernel, in the
+/// milestone whose point is that drivers are not in the kernel.
+#[used]
+#[link_section = ".limine_requests"]
+static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]
@@ -373,6 +389,17 @@ pub extern "C" fn kstart() -> ! {
         cpu::init();
     }
 
+    // The PAT, so that a write-combining mapping can be expressed at
+    // all (ADR 051). Before any mapping is made, and before the
+    // framebuffer exists as far as the capability system is
+    // concerned.
+    //
+    // SAFETY: Called once, at CPL 0, on the single-threaded boot
+    // path, before anything asks for a write-combining mapping.
+    unsafe {
+        cpu::init_pat();
+    }
+
     // ---- syscall/sysret (M8) -------------------------------------------
     //
     // After `gdt::init`, because STAR names selectors from the GDT and
@@ -414,7 +441,7 @@ pub extern "C" fn kstart() -> ! {
 
     // SAFETY: First and only call, while the responses are still valid.
     unsafe {
-        memory::bootinfo::capture(&BOOTLOADER_INFO, &CMDLINE, &MEMMAP);
+        memory::bootinfo::capture(&BOOTLOADER_INFO, &CMDLINE, &MEMMAP, &FRAMEBUFFER);
     }
 
     memory::vm::set_kernel_slide(kernel_slide);
@@ -1065,7 +1092,23 @@ extern "C" fn kmain() -> ! {
         None
     };
 
-    if let Some(which) = driver_scenario {
+    // M14's four, same discipline. `fb-test` is checked last
+    // because it is a prefix of nothing but is the shortest token,
+    // and the habit of putting the short one last is cheaper than
+    // checking each time whether this particular set overlaps.
+    let fb_scenario = if cmdline.contains("fb-device-untyped-misuse") {
+        Some(safrox_abi::scenario::FB_DEVICE_UNTYPED_MISUSE)
+    } else if cmdline.contains("fb-out-of-bounds") {
+        Some(safrox_abi::scenario::FB_OUT_OF_BOUNDS)
+    } else if cmdline.contains("fb-no-cap") {
+        Some(safrox_abi::scenario::FB_NO_CAP)
+    } else if cmdline.contains("fb-test") {
+        Some(safrox_abi::scenario::FB_TEST)
+    } else {
+        None
+    };
+
+    if let Some(which) = driver_scenario.or(fb_scenario) {
         roottest::select_scenario(which);
     }
 
@@ -1073,6 +1116,7 @@ extern "C" fn kmain() -> ! {
         || cmdline.contains("root-no-untyped")
         || cmdline.contains("root-dies")
         || driver_scenario.is_some()
+        || fb_scenario.is_some()
         || cmdline.is_empty();
 
     if wants_root_task {
@@ -1114,6 +1158,27 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("driver-dies") {
         println!("[boot] cmdline requested the dead-driver test");
         drivertest::run_dies();
+    }
+
+    // M14. Longer tokens first, as above.
+    if cmdline.contains("fb-device-untyped-misuse") {
+        println!("[boot] cmdline requested the device-untyped misuse test");
+        fbtest::run_device_misuse();
+    }
+
+    if cmdline.contains("fb-out-of-bounds") {
+        println!("[boot] cmdline requested the out-of-bounds framebuffer test");
+        fbtest::run_out_of_bounds();
+    }
+
+    if cmdline.contains("fb-no-cap") {
+        println!("[boot] cmdline requested the no-framebuffer-capability test");
+        fbtest::run_no_cap();
+    }
+
+    if cmdline.contains("fb-test") {
+        println!("[boot] cmdline requested the framebuffer tests");
+        fbtest::run();
     }
 
     if cmdline.contains("driver-test") {

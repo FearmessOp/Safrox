@@ -89,6 +89,14 @@ static mut ROOT_UNTYPED_BYTES: u64 = 0;
 /// How many root Untypeds were created.
 static mut ROOT_UNTYPED_COUNT: usize = 0;
 
+/// Where the framebuffer's device Untypeds are, if there are any
+/// (M14, ADR 050).
+///
+/// `(first index in the Untyped CNode, how many)`. `None` on a
+/// machine with no screen, which is an ordinary condition rather than
+/// a failure — everything up to M13 ran headless.
+static mut FRAMEBUFFER_UNTYPED: Option<(usize, usize)> = None;
+
 /// The init CSpace.
 ///
 /// # Panics
@@ -119,6 +127,43 @@ pub fn root_untyped_count() -> usize {
         let addr = &raw const ROOT_UNTYPED_COUNT;
         *addr
     }
+}
+
+/// The framebuffer's device Untypeds: `(first index, count)`.
+///
+/// `None` if the machine has no screen. They sit at the end of the
+/// Untyped CNode, after every ordinary one, because they are seeded
+/// after the memory-map pass (ADR 050).
+pub fn framebuffer_untyped() -> Option<(usize, usize)> {
+    // SAFETY: As above.
+    unsafe {
+        let addr = &raw const FRAMEBUFFER_UNTYPED;
+        *addr
+    }
+}
+
+/// Index of the highest root Untyped that is ordinary memory.
+///
+/// **"The last Untyped" stopped meaning "the last usable Untyped" in
+/// M14.** Device Untypeds are seeded after the memory-map pass, so
+/// they occupy the top of the CNode, and a caller that wanted memory
+/// to carve a kernel object from would get the framebuffer.
+///
+/// That is not a hypothetical: `create_boot_tcb` did exactly this
+/// and died with `DeviceUntypedFrameOnly { asked: Tcb }` the first
+/// time a real device Untyped existed. The invariant caught it,
+/// which is the invariant doing its job; this function is so that
+/// the question is asked once, by name, rather than by arithmetic
+/// at each use site.
+///
+/// Returns `None` only if every root Untyped is device memory, which
+/// would mean boot found no usable RAM at all.
+pub fn last_ram_untyped() -> Option<usize> {
+    (0..root_untyped_count()).rev().find(|&index| {
+        // SAFETY: Index below the count.
+        let slot = unsafe { root_untyped(index) };
+        !slot.is_device()
+    })
 }
 
 /// Allocate a run of contiguous frames for a CNode.
@@ -435,6 +480,145 @@ pub unsafe fn init_from_regions(regions: &[MemoryRegion]) {
         }
     }
 
+    // --- The framebuffer, as device Untypeds (M14, ADR 050) --------------
+    //
+    // **ADR 017 said this in M5 and nothing did it until now.** The
+    // device flag, `DeviceUntypedFrameOnly`, and the flag's descent
+    // into Frames have all existed and been tested since then --
+    // against an Untyped the test marked by hand. This is the first
+    // device Untyped that names a real device.
+    //
+    // Three things differ from the loop above, and each is a decision:
+    //
+    //  1. **The allocator is not consulted.** Its bitmap covers RAM,
+    //     and the framebuffer is not in it -- so `is_used` would
+    //     answer "taken" for every frame and nothing would be seeded.
+    //     The failure would be silent: a slot of zero and a root task
+    //     reporting no screen on a machine that has one.
+    //
+    //  2. **Nothing is counted towards `total_bytes`.** Device memory
+    //     is not usable memory; folding it in would make M12's
+    //     accounting identity wrong by exactly the size of the
+    //     screen.
+    //
+    //  3. **`device` is true**, which is the whole point. It descends
+    //     into every Frame retyped from here (`untyped.rs`), so a
+    //     component cannot launder device memory into a TCB by going
+    //     through a Frame.
+    //
+    // The blocking is the same: `2^k` bytes at a `2^k` boundary
+    // (ADR 020), so one framebuffer usually becomes several Untypeds.
+    // BootInfo names the first and they are consecutive.
+    let mut device_created = 0usize;
+    let mut device_bytes = 0u64;
+    let framebuffer_first_slot = created;
+
+    if let Some(fb) = crate::memory::bootinfo::get().framebuffer() {
+        let mut addr = fb.address & !(FRAME_SIZE - 1);
+        let end = (fb.address + fb.size()).next_multiple_of(FRAME_SIZE);
+
+        while addr < end {
+            if created >= untyped_cnode.len() {
+                break;
+            }
+
+            let mut bits = MAX_ROOT_UNTYPED_BITS;
+            while bits >= UNTYPED_MIN_BITS {
+                let size = 1u64 << bits;
+                if addr.is_multiple_of(size) && addr + size <= end {
+                    break;
+                }
+                bits -= 1;
+            }
+            if bits < UNTYPED_MIN_BITS {
+                addr += FRAME_SIZE;
+                continue;
+            }
+
+            let size = 1u64 << bits;
+
+            // **No `Untyped::initialise` and no zeroing.** That call
+            // writes a header into the memory, which is right for RAM
+            // about to become kernel objects and catastrophic here:
+            // the first bytes of a framebuffer are the top-left of
+            // the screen, and more to the point the memory belongs to
+            // a device whose registers may be anywhere in the window.
+            //
+            // The watermark that header would have held goes into the
+            // kernel's device table instead, reserved here so that the
+            // row exists before the capability does. `seed_root`
+            // asserts exactly that, because the first draft of this
+            // loop did it in the wrong order -- and the first draft of
+            // ADR 050 claimed `size_bits` in the slot was enough,
+            // which was a mechanism that did not exist (ADR 050's
+            // correction, ADR 023 K10).
+            //
+            // Running out of rows is a **panic**, not a `break`.
+            // Stopping quietly would hand the component a framebuffer
+            // with a hole in it, and the symptom would be a band of
+            // the screen that never changes -- which nobody traces
+            // back to a table size. The message carries both figures
+            // so the fix is a one-line edit rather than an
+            // investigation.
+            assert!(
+                super::untyped::reserve_device(PhysAddr(addr), size),
+                "the framebuffer needs more than {} device-Untyped \
+                 table rows: {} were reserved before the block at \
+                 {:#x} ({} KiB) had nowhere to put its watermark. The \
+                 region {:#x}..{:#x} blocks into more pieces than \
+                 `untyped::MAX_DEVICE_UNTYPED` allows (ADR 050).",
+                super::untyped::MAX_DEVICE_UNTYPED,
+                device_created,
+                addr,
+                size / 1024,
+                fb.address,
+                fb.address + fb.size()
+            );
+
+            // SAFETY: Index below the CNode's length, checked above;
+            // the slot was zeroed when the CNode was created.
+            unsafe {
+                let slot = untyped_cnode.slot(created);
+                cnode::seed_root(
+                    slot,
+                    ObjectRef(PhysAddr(addr)),
+                    CapType::Untyped,
+                    Rights::ALL,
+                    bits as u32,
+                    true,
+                )
+                .expect("a freshly zeroed Untyped slot was not empty");
+            }
+
+            created += 1;
+            device_created += 1;
+            device_bytes += size;
+            addr += size;
+        }
+
+        println!(
+            "[cap] framebuffer: {} device Untyped(s) from slot {}, {} KiB \
+             covering {:#x}..{:#x}; device memory may only become Frames \
+             (ADR 017, ADR 050) and is not counted as usable",
+            device_created,
+            framebuffer_first_slot,
+            device_bytes / 1024,
+            fb.address,
+            fb.address + fb.size()
+        );
+        super::untyped::device_report();
+    }
+
+    // SAFETY: Single-threaded boot path; nothing else reads this yet.
+    unsafe {
+        let slot = &raw mut FRAMEBUFFER_UNTYPED;
+        slot.write(if device_created > 0 {
+            Some((framebuffer_first_slot, device_created))
+        } else {
+            None
+        });
+    }
+
     // --- IRQControl (M10, ADR 041) ---------------------------------------
     //
     // One capability, seeded as a root. Not retyped from an Untyped,
@@ -585,10 +769,29 @@ pub unsafe fn create_boot_tcb() -> &'static mut super::tcb::Tcb {
     // ROOT_SLOT_OBJECTS is seeded with a CNode there.
     let cnode = unsafe { leaf_cnode(ROOT_SLOT_OBJECTS) };
 
-    // From the last root Untyped, so the test fixtures' Untypeds stay
-    // untouched. The boot TCB is permanent and must not share an
-    // Untyped with anything that gets revoked.
-    let index = root_untyped_count() - 1;
+    // From the last root Untyped **that is not device memory**, so
+    // the test fixtures' Untypeds stay untouched. The boot TCB is
+    // permanent and must not share an Untyped with anything that gets
+    // revoked.
+    //
+    // The device test is M14's, and leaving it out was a real
+    // failure rather than a hypothetical one: the framebuffer's
+    // Untypeds are seeded after the memory-map pass (ADR 050), so
+    // "the last one" became one of them and the kernel died at this
+    // line with `DeviceUntypedFrameOnly { asked: Tcb }`.
+    //
+    // That is the invariant working exactly as ADR 017 intended --
+    // a TCB in a device window would put the scheduler's saved
+    // registers on top of the screen, or on top of a control
+    // register. What was wrong was this function's assumption that
+    // the last Untyped is ordinary memory, which held for nine
+    // milestones and stopped holding the moment a real device
+    // appeared.
+    let index = last_ram_untyped().expect(
+        "no non-device root Untyped to carve the boot TCB from. Every \
+         Untyped boot created is device memory, which cannot hold a \
+         kernel object (ADR 017).",
+    );
     // SAFETY: Index below the count.
     let parent = unsafe { root_untyped(index) };
 
@@ -724,6 +927,22 @@ pub unsafe fn root_untyped_with_room(bytes: u64) -> &'static mut Slot {
 /// statement about *need* rather than about the memory map, and still
 /// fails loudly if it cannot be met.
 ///
+/// # Device memory is skipped
+///
+/// **The fourth place "the last Untyped is RAM" was assumed**, found
+/// by the M14 sweep rather than by failing. Its four siblings --
+/// `roottask`, `usertest`, `vspacetest` and `vspaceuser` each have a
+/// local `untyped_with_room` -- all test `!is_device()`; this one did
+/// not, because it predates them and nothing device-backed existed
+/// when it was written.
+///
+/// Every caller wants memory to carve a kernel object from, and a
+/// device Untyped can only become a Frame (ADR 017). Returning one
+/// would produce `DeviceUntypedFrameOnly` at the retype, naming a
+/// type the caller asked for rather than the lookup that handed back
+/// the wrong region -- exactly the misdirection `create_boot_tcb`
+/// suffered before `last_ram_untyped` existed.
+///
 /// # Safety
 ///
 /// As [`root_untyped_with_room`].
@@ -732,6 +951,7 @@ pub unsafe fn root_untyped_with_room_from(bytes: u64, skip: usize) -> &'static m
     let mut largest_remaining = 0u64;
     let mut found: Option<usize> = None;
     let mut skipped = 0usize;
+    let mut device_skipped = 0usize;
 
     for index in 0..count {
         // SAFETY: Index below the count, and the caller guarantees the
@@ -741,6 +961,14 @@ pub unsafe fn root_untyped_with_room_from(bytes: u64, skip: usize) -> &'static m
         let Ok(untyped) = (unsafe { super::untyped::Untyped::from_slot(slot) }) else {
             continue;
         };
+
+        // Device memory is not memory for this purpose. Skipped
+        // before `largest_remaining` is updated, so the panic below
+        // does not offer the framebuffer as a near miss.
+        if untyped.is_device() {
+            device_skipped += 1;
+            continue;
+        }
 
         let remaining = untyped.remaining();
         if remaining > largest_remaining {
@@ -765,14 +993,16 @@ pub unsafe fn root_untyped_with_room_from(bytes: u64, skip: usize) -> &'static m
         Some(index) => unsafe { root_untyped(index) },
         None => panic!(
             "no root Untyped has {} bytes free after skipping {}: {} were \
-             examined and the most any of them had left was {}. Either \
-             the request is larger than a root Untyped can be (the \
+             examined ({} of them device memory, which cannot hold a \
+             kernel object) and the most any of the rest had left was {}. \
+             Either the request is larger than a root Untyped can be (the \
              largest is 2^{} = {} bytes), earlier fixtures have used the \
              memory up, or the skip count is higher than the number of \
              Untypeds that can satisfy the request",
             bytes,
             skip,
             count,
+            device_skipped,
             largest_remaining,
             MAX_ROOT_UNTYPED_BITS,
             1u64 << MAX_ROOT_UNTYPED_BITS

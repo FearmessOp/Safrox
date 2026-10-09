@@ -33,7 +33,10 @@ use crate::{echo, first_error, invoke, slot, take, take_run, Code, CHANNEL};
 /// the same way: there is no filesystem, no loader and no second
 /// thing to load from. The build script checks the size and the
 /// entry point, because this component copies bytes and jumps.
-static DRIVER_IMAGE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../build/serial-driver.bin"));
+static DRIVER_IMAGE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build/serial-driver.bin"
+));
 
 /// Pages the root task maps for the driver's code.
 ///
@@ -158,12 +161,54 @@ impl Component {
     }
 }
 
+/// Radix of the CNode an ordinary component gets: 64 slots.
+///
+/// Enough for a driver's five capabilities and a client's one, with
+/// room to spare. A component that owns a large device needs more —
+/// see `screen::SCREEN_CNODE_RADIX`, which is 11 because a
+/// framebuffer is a thousand Frames and each needs a slot.
+const COMPONENT_CNODE_RADIX: u64 = 6;
+
 /// Create the objects a component is made of.
 pub fn retype_component(
     untyped: CPtr,
     own_cnode: CPtr,
     component: &Component,
     code_pages: u32,
+) -> u64 {
+    retype_component_sized(
+        untyped,
+        own_cnode,
+        component,
+        code_pages,
+        COMPONENT_CNODE_RADIX,
+    )
+}
+
+/// As [`retype_component`], with the CSpace's size spelled out.
+///
+/// # Why the radix became a parameter
+///
+/// It was 6 for everybody, which is 64 slots, and that was right for
+/// every component up to M13 — a driver holds five capabilities and
+/// a client holds one.
+///
+/// The screen component holds **one per page of the framebuffer**,
+/// because mapping is per page and each mapping needs a Frame
+/// capability in a slot. A 1280x800 screen is 1000 of them. With 64
+/// slots the component mapped 47 pages and the 48th retype came back
+/// `CPtrOutOfRange` — the CSpace, not the memory, was what ran out.
+///
+/// A parameter rather than raising the constant for everyone: a
+/// 64 KiB CNode for a component that needs six slots would be waste
+/// charged to the wrong budget, and ADR 022's point is that somebody
+/// pays for every object.
+pub fn retype_component_sized(
+    untyped: CPtr,
+    own_cnode: CPtr,
+    component: &Component,
+    code_pages: u32,
+    cnode_radix: u64,
 ) -> u64 {
     let mut worst = 0u64;
     worst = first_error(
@@ -172,7 +217,14 @@ pub fn retype_component(
     );
     worst = first_error(
         worst,
-        crate::retype(untyped, cap_type::CNODE, 6, 1, own_cnode, component.cnode),
+        crate::retype(
+            untyped,
+            cap_type::CNODE,
+            cnode_radix,
+            1,
+            own_cnode,
+            component.cnode,
+        ),
     );
     worst = first_error(
         worst,
@@ -229,6 +281,25 @@ pub fn setup_component(
     image: &[u8],
     code_pages: u32,
 ) -> u64 {
+    setup_component_patched(info, component, image, code_pages, None)
+}
+
+/// As [`setup_component`], but patching each code page after it is
+/// copied and before it is mapped read-execute.
+///
+/// One caller: the screen component, whose geometry has to be in its
+/// image before it runs (ADR 049).
+///
+/// A second entry point rather than a fifth parameter on the first,
+/// because four of the five callers have nothing to patch and
+/// `None` at each of them would be noise that has to be read.
+pub fn setup_component_patched(
+    info: &BootInfo,
+    component: &Component,
+    image: &[u8],
+    code_pages: u32,
+    patch: Option<&dyn Fn(u32, *mut u8)>,
+) -> u64 {
     let own_cnode = slot(info.root_cnode_slot);
     let mut worst = 0u64;
 
@@ -284,10 +355,7 @@ pub fn setup_component(
         );
     }
 
-    worst = first_error(
-        worst,
-        load_image(info, component, image, code_pages),
-    );
+    worst = first_error(worst, load_image(info, component, image, code_pages, patch));
 
     worst = first_error(
         worst,
@@ -340,7 +408,31 @@ const SCRATCH: u64 = 0x0070_0000;
 /// Map a frame here, write a page of the program into it, unmap, map
 /// it into the child executable. Once per page: the scratch address
 /// is reused, which is why the unmap is not optional.
-fn load_image(info: &BootInfo, component: &Component, image: &[u8], code_pages: u32) -> u64 {
+///
+/// `patch` is applied to each page **after** the copy, while the
+/// page is still writable through the scratch mapping. It is given
+/// the page number and may write anywhere in the 4 KiB there.
+///
+/// # Why patching happens here
+///
+/// The screen component needs its geometry written into its image
+/// before it runs (ADR 049). The obvious way is to copy the image
+/// into a buffer, patch the buffer, and load that — and the obvious
+/// way overflowed the root task's stack, which is **one page**. A
+/// 16 KiB buffer on a 4 KiB stack faulted at `0x4fffb0`, sixteen
+/// bytes below the stack's base.
+///
+/// There is no buffer to overflow if the patch happens where the
+/// copy already is. The scratch page is mapped writable for exactly
+/// this window and unmapped immediately after, so nothing here is
+/// reachable once the component starts.
+fn load_image(
+    info: &BootInfo,
+    component: &Component,
+    image: &[u8],
+    code_pages: u32,
+    patch: Option<&dyn Fn(u32, *mut u8)>,
+) -> u64 {
     let own_vspace = slot(info.vspace_slot);
 
     for page in 0..code_pages {
@@ -376,6 +468,13 @@ fn load_image(info: &BootInfo, component: &Component, image: &[u8], code_pages: 
                     end - start,
                 );
             }
+        }
+
+        // The patch, while the page is still writable here. After
+        // the unmap below it is mapped read-execute in the child
+        // and could not be written even by the component itself.
+        if let Some(patch) = patch {
+            patch(page, SCRATCH as *mut u8);
         }
 
         let r = invoke(own_vspace.0, method::FRAME_UNMAP, SCRATCH, 0, 0, 0);

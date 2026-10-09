@@ -28,12 +28,31 @@
 /// Where the kernel maps the root task's code.
 pub const ROOT_CODE_ADDRESS: u64 = 0x0040_0000;
 
-/// Where the kernel maps the root task's stack (one page).
+/// Where the kernel maps the **lowest page** of the root task's
+/// stack.
 pub const ROOT_STACK_ADDRESS: u64 = 0x0050_0000;
 
-/// The root task's initial RSP: top of the stack page, 16-byte
-/// aligned as the SysV ABI requires at a function entry.
-pub const ROOT_STACK_TOP: u64 = ROOT_STACK_ADDRESS + 4096 - 16;
+/// How many pages that stack is.
+///
+/// **Four from M14, one before that.** The root task assembles its
+/// children's programs into 1032-byte buffers that live on the
+/// stack — it has no writable statics and no heap — and M14's extra
+/// scenario branch gave `main` a frame spanning more than a page.
+///
+/// LLVM emits a stack probe for a frame that large, touching each
+/// page in turn, and the probe faulted: `cr2 == rsp == 0x4fffb0`,
+/// sixteen bytes below the single page's base. That is the probe
+/// working, finding the end of the stack before anything was
+/// written past it.
+pub const ROOT_STACK_PAGES: u64 = 4;
+
+/// The root task's initial RSP: top of the highest stack page,
+/// 16-byte aligned as the SysV ABI requires at a function entry.
+///
+/// The stack grows **down** from here towards
+/// [`ROOT_STACK_ADDRESS`], which is why that constant names the
+/// lowest page rather than the first one used.
+pub const ROOT_STACK_TOP: u64 = ROOT_STACK_ADDRESS + ROOT_STACK_PAGES * 4096 - 16;
 
 /// Where the kernel maps [`BootInfo`]. **Read-only** (ADR 044).
 ///
@@ -42,11 +61,46 @@ pub const ROOT_STACK_TOP: u64 = ROOT_STACK_ADDRESS + 4096 - 16;
 /// back its own words as though they were the kernel's.
 pub const BOOTINFO_ADDRESS: u64 = 0x0060_0000;
 
+/// Where the screen component maps the framebuffer, in its own
+/// address space (M14).
+///
+/// 16 MiB: clear of any component's code at 4 and stack at 5.
+///
+/// **In the ABI because the kernel's test needs it**, which is a
+/// weaker reason than the other constants here and is worth being
+/// honest about. The address is the component's own business — it
+/// holds the VSpace and decides what goes where (ADR 043) — and
+/// nothing in the kernel consults it.
+///
+/// What needs it is `fb-out-of-bounds`. That scenario's claim is
+/// that CR2 lands exactly one page past the mapping, and the kernel
+/// cannot learn the address from the component: the component
+/// announces it and then faults, with no syscall in between, so the
+/// waiting kernel thread is never scheduled to hear. Computing it
+/// from this constant and the geometry is how the expected value
+/// gets printed *before* the fault rather than never.
+pub const FRAMEBUFFER_BASE: u64 = 0x0100_0000;
+
 /// `"SafrBIV1"`, big-endian so it reads as text in a hex dump.
 pub const BOOTINFO_MAGIC: u64 = 0x5361_6672_4249_5631;
 
 /// The version this header describes.
-pub const BOOTINFO_VERSION: u32 = 1;
+///
+/// **2 since M14** (ADR 049). M13 added `ioport_control_slot` without
+/// bumping this, and that was right: a root task that did not read
+/// the field lost nothing by not reading it.
+///
+/// M14's fields are different in kind. `framebuffer_untyped_slot`
+/// *identifies* a capability inside the Untyped list — a device
+/// Untyped that may only become a Frame (ADR 050). A root task that
+/// does not know about it treats the framebuffer as ordinary memory,
+/// tries to retype a TCB out of it, is refused with
+/// `DeviceUntypedFrameOnly`, and concludes it has run out of memory.
+/// The refusal is correct and the diagnosis is wrong.
+///
+/// A version bump turns that silent misreading into a stated
+/// mismatch.
+pub const BOOTINFO_VERSION: u32 = 2;
 
 /// How many Untyped descriptors fit in the BootInfo page.
 ///
@@ -182,6 +236,85 @@ pub struct BootInfo {
     /// rather than left as `reserved`, because a reserved field
     /// quietly given a meaning is how an ABI stops being one.
     pub scenario: u32,
+
+    // ---- Framebuffer (M14, ADR 049) ---------------------------------
+    //
+    // Appended, like everything before them. The geometry is copied
+    // out of Limine's response during boot, before the reclaim that
+    // makes that response unreadable (ADR 013).
+    /// Leaf index of the framebuffer's device Untyped, or **0 if the
+    /// machine has no framebuffer**.
+    ///
+    /// Zero is a real answer rather than an error. A machine booted
+    /// headless over serial has no framebuffer, and everything from
+    /// M0 to M13 worked that way — so "no screen" must stay a
+    /// condition the root task reports rather than one it fails on.
+    ///
+    /// The Untyped is **device memory**: it may only be retyped into
+    /// Frames (ADR 017, ADR 050). Several consecutive slots may cover
+    /// one framebuffer, because an Untyped is `2^k` bytes at a `2^k`
+    /// boundary and a screen rarely is; this names the first.
+    pub framebuffer_untyped_slot: u32,
+    /// Visible width in pixels.
+    pub framebuffer_width: u32,
+    /// Visible height in pixels.
+    pub framebuffer_height: u32,
+    /// **Bytes** per scanline.
+    ///
+    /// Not `width * bpp / 8`. Hardware pads rows to an alignment it
+    /// likes, so the first pixel of row `y` is at `y * pitch`, and
+    /// the bytes between `width * bpp / 8` and `pitch` belong to
+    /// nobody.
+    ///
+    /// On QEMU the two are usually equal, which makes this the most
+    /// dangerous field in the struct: code that multiplies instead of
+    /// using it works perfectly until it meets real hardware. M14's
+    /// test checks the row boundary for exactly this reason.
+    pub framebuffer_pitch: u32,
+    /// **Bits** per pixel, as Limine reports it. Typically 32.
+    pub framebuffer_bpp: u32,
+    /// Physical address of the first byte of the framebuffer.
+    ///
+    /// Reported so a component can check that what it mapped is what
+    /// the kernel was told about. It is not an authority: mapping it
+    /// requires the Untyped above, and a bare address is a number
+    /// rather than a capability (ADR 050).
+    pub framebuffer_address: u64,
+}
+/// Report channels for `Echo`.
+///
+/// **One place, because three was a hazard and it fired.** M13 had
+/// these numbers written out in the kernel's test, in the root task
+/// and in the driver. The hostile component reported on bit 28 while
+/// the test listened on bit 31, so three refusals happened, were
+/// reported, and were recorded nowhere — the scenario failed saying
+/// the attempts never occurred.
+///
+/// The note left behind then said the right fix was for this to live
+/// in the ABI crate, which both sides already depend on. M14 adds a
+/// second component, which would have made it four copies rather
+/// than three; so it is here instead.
+///
+/// `Echo` names no capability, which is what frees its CPtr argument
+/// to carry a channel number — and is why a test channel costs no
+/// debug syscall the kernel would then own forever (ADR 044).
+pub mod channel {
+    /// The root task's own reports. The low byte is the step number.
+    pub const ROOT: u64 = 1 << 28;
+    /// The root task finished.
+    pub const ROOT_DONE: u64 = 1 << 29;
+    /// The root task's panic handler ran.
+    pub const ROOT_PANIC: u64 = 1 << 30;
+    /// The serial driver and its clients (M13).
+    pub const DRIVER: u64 = 1 << 31;
+    /// The screen component (M14).
+    pub const SCREEN: u64 = 1 << 27;
+
+    /// A component's panic handler ran: its channel OR this.
+    ///
+    /// `0xFF` rather than another bit, because the low byte is the
+    /// step and 255 is not a step any component reports.
+    pub const PANIC_STEP: u64 = 0xFF;
 }
 
 /// Values for [`BootInfo::scenario`].
@@ -207,6 +340,16 @@ pub mod scenario {
     pub const DRIVER_RESTART: u32 = 3;
     /// Give a component no port or IRQ authority and watch it try.
     pub const DRIVER_HOSTILE: u32 = 4;
+
+    // ---- M14 ---------------------------------------------------------
+    /// Build a screen component and let it draw.
+    pub const FB_TEST: u32 = 5;
+    /// A component with no framebuffer capability tries to reach it.
+    pub const FB_NO_CAP: u32 = 6;
+    /// The screen component writes past the end of the framebuffer.
+    pub const FB_OUT_OF_BOUNDS: u32 = 7;
+    /// The screen component tries to retype a TCB from device memory.
+    pub const FB_DEVICE_UNTYPED_MISUSE: u32 = 8;
 }
 
 /// One Untyped the root task holds. 16 bytes.
@@ -395,6 +538,25 @@ pub mod cap_type {
 /// has no encoding, so W^X is unrepresentable rather than merely
 /// forbidden.
 pub mod perm {
+    /// Readable and writable, **write-combining** (M14, ADR 051).
+    ///
+    /// For a framebuffer and nothing else so far. Writes gather in a
+    /// buffer and leave in bursts, which is right for a surface where
+    /// ordering between pixels does not matter and wrong for a
+    /// control register, where it does — those use the kernel's
+    /// `NO_CACHE`, which is not exposed here because no component has
+    /// ever needed to ask for it.
+    ///
+    /// Appended after [`READ_EXECUTE`], because these numbers are an
+    /// ABI. Listed first in the source only because the doc comment
+    /// is long and the others are one-liners.
+    ///
+    /// The cache type is inert unless the kernel has programmed PAT
+    /// entry 4, which `cpu::init_pat` does at boot. A mapping made
+    /// with this on a kernel that had not would be write-back:
+    /// correct pixels, invisible until something flushed them.
+    pub const READ_WRITE_COMBINING: u64 = 3;
+
     /// Readable. Not writable, not executable.
     pub const READ_ONLY: u64 = 0;
     /// Readable and writable. Not executable.
@@ -533,6 +695,20 @@ impl CPtr {
         (self.0 & 0xFFFF) as u16
     }
 }
+
+/// The most objects one `Retype` may create.
+///
+/// **Part of the ABI because a component has to know it.** Retype is
+/// bounded so that a single invocation cannot occupy the CPU for an
+/// unbounded time (ADR 020), and the bound is not discoverable: a
+/// component that asks for more gets `TOO_MANY_OBJECTS` and has no
+/// way to learn what would have been allowed except by searching.
+///
+/// The screen component needs a thousand Frames and found this out
+/// the hard way — it asked for all of them at once, was refused, and
+/// its retry loop read the refusal as "this Untyped is spent". The
+/// figure belongs here, where both sides read it from one place.
+pub const RETYPE_MAX_COUNT: u64 = 256;
 
 /// Pack `Retype`'s type and size into one argument word.
 ///

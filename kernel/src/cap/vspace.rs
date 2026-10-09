@@ -305,6 +305,18 @@ pub enum MapPermissions {
     /// change what is in it, and putting something there needs
     /// `WRITE`. The two steps are what W^X separates.
     ReadExecute,
+    /// Readable and writable, **write-combining** (M14, ADR 051).
+    ///
+    /// The same authority as [`ReadWrite`](Self::ReadWrite) — it
+    /// needs `Rights::WRITE` and nothing more — and a different cache
+    /// type. That split is deliberate: a cache type is not a
+    /// permission, and asking for write-combining grants no access
+    /// the holder did not already have.
+    ///
+    /// It is a separate variant rather than a flag on `ReadWrite`
+    /// because the enum is what the ABI's `perm` numbers map onto,
+    /// and a component says which of these it wants with one number.
+    ReadWriteCombining,
 }
 
 impl MapPermissions {
@@ -313,6 +325,7 @@ impl MapPermissions {
             MapPermissions::ReadOnly => "r--",
             MapPermissions::ReadWrite => "rw-",
             MapPermissions::ReadExecute => "r-x",
+            MapPermissions::ReadWriteCombining => "rw- wc",
         }
     }
 }
@@ -362,6 +375,19 @@ fn permissions_to_flags(rights: Rights, requested: MapPermissions) -> Result<Pag
         }
         MapPermissions::ReadExecute => {
             flags |= PageFlags::EXEC;
+        }
+        MapPermissions::ReadWriteCombining => {
+            // The same rights test as ReadWrite. A cache type is not
+            // an authority: write-combining lets the holder write no
+            // byte it could not already write, it only changes when
+            // those writes reach the device.
+            if !rights.contains(Rights::WRITE) {
+                return Err(CapError::InsufficientRights {
+                    needed: Rights::WRITE,
+                    held: rights,
+                });
+            }
+            flags |= PageFlags::WRITE | PageFlags::WRITE_COMBINING;
         }
     }
 

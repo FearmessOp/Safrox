@@ -295,7 +295,10 @@ fn main() -> ! {
     // enabled receive interrupts at all and the figure was arbitrary.
     worst = first_error(
         worst,
-        out8(REG_FCR, FCR_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX | FCR_TRIGGER_1),
+        out8(
+            REG_FCR,
+            FCR_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX | FCR_TRIGGER_1,
+        ),
     );
 
     // OUT2 is what connects the interrupt line to the bus.

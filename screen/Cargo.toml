@@ -1,0 +1,60 @@
+# The screen component: the second user-space driver.
+#
+# M13 moved the serial port out of the kernel. This does the same for
+# the framebuffer, and the point of doing it twice is that the second
+# time adds no kernel mechanism — the capability system already had
+# everything a device needs, and M14 only found the first real user
+# of ADR 017's device Untyped.
+#
+# A separate crate for the reason `driver/` is one: the compiler
+# enforces what the design claims. This binary links against `core`
+# and the ABI, so a line of it that needed a kernel type would not
+# build.
+cargo-features = ["trim-paths"]
+
+[package]
+name = "screen"
+version = "0.1.0"
+edition = "2021"
+description = "Safrox screen component: the framebuffer, driven from CPL 3"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "screen"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+safrox-abi = { path = "../abi" }
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = true
+codegen-units = 1
+# `s` for the reason the driver uses it: this image is embedded in
+# the root task's .rodata and copied into a fixed number of frames.
+#
+# Unlike the driver, this component *does* have a hot path -- filling
+# a screen is a million stores -- but the fill loop is a few
+# instructions either way and the cost is the memory bus, not the
+# code. Measured rather than assumed: see the figures fb-test prints.
+opt-level = "s"
+lto = false
+trim-paths = "all"
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+trim-paths = "all"

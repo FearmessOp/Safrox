@@ -203,7 +203,14 @@ pub const UNTYPED_MIN_BITS: u8 = 4;
 pub const UNTYPED_MAX_BITS: u8 = 47;
 
 /// Most objects one `retype` may produce (ADR 020).
-pub const RETYPE_MAX_COUNT: usize = 256;
+///
+/// **The ABI's figure, not a second one.** A component has to know
+/// this bound — it is refused with `TooManyObjects` otherwise and
+/// cannot discover what would have been allowed — so it is declared
+/// in `safrox_abi` and read here. Two copies that agreed today would
+/// be one renumbering away from a component asking for exactly one
+/// more than the kernel permits.
+pub const RETYPE_MAX_COUNT: usize = safrox_abi::RETYPE_MAX_COUNT as usize;
 
 /// Deepest a capability may be derived (ADR 019).
 pub const MAX_DERIVATION_DEPTH: u8 = 8;

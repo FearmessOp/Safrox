@@ -278,6 +278,21 @@ fn report(frame: &ExceptionFrame) {
             "[trap] cr2={:#018x}  ({} {} {})",
             cr2, mode, access, present
         );
+
+        // **A scenario may have predicted this address** (M14).
+        //
+        // `fb-out-of-bounds` computes where the faulting store
+        // should land, from the framebuffer's geometry and the
+        // address the component maps at, and arms the prediction
+        // before the component runs. Checking it here is what turns
+        // "a #PF happened" into "the #PF happened *there*".
+        //
+        // It has to be here rather than in the scenario: the
+        // component's last two actions are a report and the store,
+        // with no scheduling point between them, so no kernel thread
+        // runs again before the fault. The only code that sees both
+        // the prediction and CR2 is this handler.
+        crate::fbtest::check_predicted_fault(cr2);
     }
 }
 

@@ -299,6 +299,61 @@ yerine teşhisle düşüyor.
   bakıldı ve düşük iterasyon sayıları (31770) yarışın hâlâ gerçek
   olduğunu, sadece artık yakalandığını gösterdi.
 
+### K8'in M14'te ikinci kez ortaya çıkışı — ve `scripts/soak.sh`
+
+M14'ün kabul koşusunda dört `make test`'in ikisi düştü, **farklı
+senaryolarda**: biri M11'in `vsuserro`'su, biri M13'ün
+`driverdies`'ı. İkisi de "beklenen satır eksik" dedi, ve ikisinin de
+log'unda o satır **vardı**.
+
+Sebep log'un kendisinde görünüyordu:
+
+```text
+...when they stopped existing[ipc] notification at 0x...4418000 was
+ so did it.
+```
+
+İki tam mesaj, iç içe geçmiş, ve **hiçbiri artık bir satır değil.**
+`print!` bir thread switch'e karşı korunmuyordu: uzun bir mesaj
+binlerce `outb` demek, ve M6'dan beri araya bir timer kesmesi girip
+başka bir thread'e geçebiliyor. Kurban, tick geldiğinde kim
+yazıyorsa o.
+
+Bu M6'dan kalma gizli bir kusurdu, M14'ün değil. Ortaya çıkması için
+uzun bir satır ve meşgul bir an gerekiyordu; M14 ikisini de getirdi
+(üçüncü bir bileşen ve birkaç çok satırlı rapor).
+
+Düzeltme `print!`'e bir `PreemptGuard` — `InterruptGuard` değil,
+ADR 025'in ayrımıyla: satırı bozan şey *thread değişimi*, kesme
+değil.
+
+**Ama asıl ders teşhiste.** İlk tanı denemesi yanlış sonuca vardı:
+başarısız koşunun seri log'u okundu, temiz çıktı, "tekrarlanamıyor"
+denildi. Log temizdi çünkü **sonraki, başarılı koşu onu üzerine
+yazmıştı** — her senaryo sabit bir dosya adına yazıyor.
+
+Bu K9'un kardeşi: orada kalıntı bir *artefakt* eksik bir bağımlılığı
+gizledi, burada taze bir artefakt bir arızanın kanıtını sildi.
+
+Kural değişmiyor, araç ekleniyor:
+
+> Kararsız bir arıza araştırılırken, koşu döngüsü **ilk kırmızıda
+> durmalı ve kanıtı saklamalı.** Bir sonraki koşunun üzerine yazdığı
+> bir log, hiç üretilmemiş bir logdan daha kötüdür: var olduğu için
+> okunur, ve yanlış şeyi söyler.
+
+[`scripts/soak.sh`](../../scripts/soak.sh) bunu yapıyor: N kez koşar,
+ilk başarısızlıkta durur, bütün seri log'ları `build/soak/`'a
+kopyalar.
+
+**Kapanmadı, ve öyle yazılıyor.** Düzeltmeden sonra 15 ardışık temiz
+`make test` (67/67) ve 15 ardışık `run-ipccapcost` görüldü; öncesinde
+4 koşuda 2 arıza vardı. Ama düzeltmeden *sonra* da bir kez
+`ipccapcost` düştü — farklı bir belirtiyle (panic), ve o log
+yakalanamadan üzerine yazıldı. Oran düştü, sıfırlandığı
+gösterilemedi. Bir sonraki milestone bir arıza görürse ilk bakacağı
+yer burasıdır.
+
 ### K9 — Kabul koşusu `distclean`'den başlar
 
 M12'den sonra, yeniden adlandırma teslimi sırasında yakalandı.
@@ -339,6 +394,90 @@ genişletiyor; oraya yazılsa boş dizgeye açılır, hata vermez, uyarmaz.
 M12 aynı tuzağı `$(KERNEL)` için belgelemişti. İkinci kez, kimsenin
 bakmayı düşünmediği bir hedefte.
 
+### K10 — Bir ADR var olmayan bir mekanizmayı tarif edemez
+
+M14'te yazıldı, [ADR 050](050-boot-device-untyped-tohumlama.md)'nin
+ilk hâli yüzünden. O ADR şunu söylüyordu:
+
+> Bir device Untyped'ın muhasebesi capability'de yaşar, adlandırdığı
+> bellekte değil — ki `size_bits`'in slot'ta olmasının sebebi bu.
+
+Cümle bir **gereksinimi**, sanki bir **olguymuş** gibi yazıyordu.
+Öyle bir muhasebe yoktu: `size_bits` bölgenin boyutu, hiç
+değişmiyor, ve watermark'ın gidecek bir yeri yoktu.
+
+Kimse fark etmedi çünkü fark edecek bir şey yoktu — cümle doğru
+*görünüyordu*, ve ilk gerçek device Untyped ortaya çıkana kadar
+hiçbir kod yolu onu sınamadı. Sınadığında kernel
+`cr2=0xffff8000fd000000` ile durdu.
+
+Bu, K5'in yapısının **belgeye** taşınmış hâli. K5 diyor ki: bir
+koruyucu, kendi yokluğundan ayırt edilebilmeli. K10 diyor ki:
+
+> Bir karar bir mekanizmaya dayanıyorsa, ADR ya o mekanizmayı
+> uygulayan kodu **adıyla** göstermeli ya da "henüz yok" diye
+> işaretlemeli. Tarif edilmiş ama var olmayan bir mekanizma, var
+> olan bir mekanizmadan ayırt edilemez — ta ki ilk müşterisi gelene
+> kadar.
+
+İki kabul edilebilir biçim:
+
+```markdown
+<!-- (a) adıyla -->
+Watermark `untyped.rs`'deki `DEVICE_UNTYPEDS` tablosunda,
+base adresle anahtarlı (`device_watermark`).
+
+<!-- (b) borç olarak -->
+Watermark'ın nerede duracağı **henüz çözülmedi**. Bugün device
+Untyped yok, dolayısıyla soru da yok; ilk gerçek aygıtı ekleyen
+milestone bunu cevaplamak zorunda.
+```
+
+(b) daha az tatmin edici ve daha dürüst. ADR 017'nin "boot device
+Untyped üretir" cümlesi de aynı hatanın daha büyük hâliydi: dokuz
+milestone boyunca bir niyet, bir olgu kılığında durdu.
+
+Bu ADR'nin kendi geçmişinde de bir örneği var: M9c, `cnode.rs`'de
+"bir sonraki milestone bu arm'ı eklemek zorunda kalacak" diye not
+bıraktı ve bırakmakla kalmadı — `match`'i exhaustive yaparak
+derleyiciyi o notun uygulayıcısı yaptı. **(b)'yi derleyiciye
+söyletebiliyorsanız, söyletin.**
+
+### K11 — Bir kural, yazıldığı bağlamı taşır
+
+K10'un kardeşi, ve aynı milestone'da doğdu. K10 *yazılanın var
+olmamasıyla* ilgili; K11 *yazılanın her yerde geçerli
+sanılmasıyla*.
+
+[ADR 020](020-retype-semantigi.md) üç kural koydu, üçü de M5'te,
+üçü de "bir Untyped'ın belleği yazılabilir RAM'dir" varsayımı
+altında:
+
+| Kural | M5'teki ifadesi | M14'te |
+|---|---|---|
+| Untyped kendi başlığını taşır | ilk 16 bayt | device'ta başlık yok |
+| watermark başlıkta | ilk 8 bayt | kernel tablosunda |
+| retype **her zaman** sıfırlar | "istisna yok" | device muaf |
+
+Üçü de dokuz milestone boyunca doğru kaldı, ve ilk gerçek aygıt
+belirdiğinde **aynı anda** kırıldı. Hiçbiri yanlış yazılmamıştı;
+hepsi, yazıldıkları bağlamın dışına taşındıklarında yanlış oldu.
+
+> Bir kuralı yeni bir bağlama genişletmeden önce, **hangi
+> varsayımlar altında doğru olduğu** sorulmalı. Varsayım yazılı
+> değilse, kuralı ilk kez farklı bir şeye uygulayan kişi onu
+> bulmak zorunda — ve genellikle bir `#PF` ile bulur.
+
+Pratik karşılığı, K5'inki kadar ucuz: bir kural yeni bir tür
+kaynağa uygulanırken, o kuralın gerekçesindeki her cümle için
+"bu, yeni kaynak için de doğru mu?" diye sorulur. ADR 020'nin
+sızıntı gerekçesi bu soruyu geçemedi — çünkü "önceki sahibin
+kalıntısı" kavramı, durumu cihazın kendisine ait olan bir bellek
+için anlamsız.
+
+Bu soruyu sormanın maliyeti bir paragraf; sormamanın maliyeti M14'te
+üç ayrı hata ayıklama turu oldu.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -377,6 +516,10 @@ başarısız oldu.
   zamanlamasına değil. Kararsız bir arıza tek yeşil koşuyla kapanmaz.
 - **K9:** Kabul koşusu `distclean`'den başlar; kalıntı bir artefakt
   eksik bir bağımlılığı gizler. Rapor komutu olduğu gibi göstermeli.
+- **K10:** Bir ADR var olmayan bir mekanizmayı tarif edemez. Ya kodu
+  adıyla gösterir ya "henüz yok" der; mümkünse derleyiciye söyletir.
+- **K11:** Bir kural yazıldığı bağlamı taşır. Yeni bir kaynak türüne
+  genişletmeden önce gerekçesinin her cümlesi yeniden sorgulanır.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten

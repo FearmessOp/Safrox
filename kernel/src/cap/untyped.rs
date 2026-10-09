@@ -13,6 +13,16 @@
 //!   destruction would need remembering at every one of several exits.
 //!
 //! See ADR 020.
+//!
+//! # Where the watermark lives
+//!
+//! For ordinary memory, in the Untyped's own first sixteen bytes. For
+//! device memory, in a kernel-side table at the bottom of this file,
+//! keyed by base address. The two places hold the same quantity and
+//! the split is forced by physics rather than chosen -- see
+//! [`Untyped::watermark`] and ADR 050.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::cnode::{self, CNode, Slot};
 use super::{
@@ -83,7 +93,24 @@ impl Untyped {
         })
     }
 
+    /// The header, which lives in the Untyped's **own memory**.
+    ///
+    /// # Panics
+    ///
+    /// On a device Untyped, where there is no such header. See
+    /// [`watermark`](Self::watermark) for why, and `device_watermark`
+    /// for where the figure lives instead.
     fn header(&self) -> &'static mut UntypedHeader {
+        debug_assert!(
+            !self.device,
+            "header() on a device Untyped at {:#x}. Device memory holds \
+             no header: it is outside the physical window, so this would \
+             fault, and even mapped it would mean writing a watermark \
+             onto the top-left corner of a screen or over a control \
+             register. The figure lives in `device_watermark` instead \
+             (ADR 050).",
+            self.base.0
+        );
         // SAFETY: The first HEADER_SIZE bytes of the region are reserved
         // for this header and written by `initialise`. PMAP maps all RAM
         // writably.
@@ -91,8 +118,46 @@ impl Untyped {
     }
 
     /// Bytes handed out so far, including alignment padding.
+    ///
+    /// # Two places, one meaning
+    ///
+    /// For ordinary memory the figure is in the Untyped's own first
+    /// sixteen bytes. That is not an implementation detail but the
+    /// answer to a question: **several capabilities may name one
+    /// Untyped** (`Copy` and `Mint` both make one), and they must
+    /// all see the same watermark. A counter in the capability
+    /// would give each copy its own, and two copies would hand out
+    /// the same bytes twice.
+    ///
+    /// Device memory cannot hold it. It is outside the physical
+    /// window by construction -- `vm::init` excludes framebuffer
+    /// regions -- so the write would fault; and if it were mapped,
+    /// the bytes being written on are the top-left of a screen, or
+    /// a device's control registers.
+    ///
+    /// So device Untypeds keep their watermark in a kernel-side
+    /// table, **keyed by base address** so that the "all copies
+    /// agree" property is preserved exactly as it is for RAM
+    /// (ADR 050).
     pub fn watermark(&self) -> u64 {
-        self.header().watermark
+        if self.device {
+            device_watermark(self.base)
+        } else {
+            self.header().watermark
+        }
+    }
+
+    /// Move the watermark to `value`.
+    ///
+    /// The single writer, so that "where does this number live" is
+    /// answered once rather than at each of the three call sites
+    /// that used to reach into `header()` directly.
+    fn set_watermark(&self, value: u64) {
+        if self.device {
+            set_device_watermark(self.base, value);
+        } else {
+            self.header().watermark = value;
+        }
     }
 
     /// Bytes still available, ignoring alignment.
@@ -135,7 +200,10 @@ impl Untyped {
     /// or the objects they name will be handed out again underneath
     /// them.
     unsafe fn reset(&self) {
-        self.header().watermark = HEADER_SIZE;
+        // Device memory has no header to skip past, so its watermark
+        // starts at zero rather than at HEADER_SIZE -- the whole
+        // region is available.
+        self.set_watermark(if self.device { 0 } else { HEADER_SIZE });
     }
 }
 
@@ -322,17 +390,48 @@ pub unsafe fn retype(
     // and nothing can yield: a syscall does not switch threads (ADR 019),
     // so no other code can observe the half-written state.
 
-    // SAFETY: The region is inside this Untyped, which owns it, and the
-    // range was checked above. Zeroing before the objects are initialised
-    // is what makes information leakage impossible -- ADR 020 -- and it
-    // is unconditional on purpose.
-    unsafe {
-        let start = crate::memory::phys_to_virt(PhysAddr(untyped.base.0 + plan.first));
-        core::ptr::write_bytes(
-            start.as_ptr::<u8>(),
-            0,
-            (plan.object_size * count as u64) as usize,
-        );
+    // **Zeroing is scoped to RAM** (ADR 020, as corrected in M14).
+    //
+    // ADR 020 said retype zeroes "not sometimes, not when the memory
+    // looks suspicious", and that is still the rule for ordinary
+    // memory: one `memset` at the single door makes information
+    // leakage structurally impossible.
+    //
+    // Device memory is exempt, for two separate reasons and either
+    // alone would be enough:
+    //
+    //  1. **It is impossible.** The physical window covers RAM only
+    //     (ADR 027), and `vm::init` excludes framebuffer regions by
+    //     construction. The write faults -- `#PF` at
+    //     `pmap_base + 0xfd000000`, which is how this was found.
+    //  2. **It is wrong.** Zeroing a framebuffer blanks the screen;
+    //     zeroing a device's register window issues commands to the
+    //     hardware. A retype would have *hardware effects* as a side
+    //     effect of bookkeeping, and on some other device that means
+    //     a reset.
+    //
+    // The leakage argument does not transfer. It is about one
+    // object's bytes reaching the **next owner of that memory**. A
+    // framebuffer's contents are not a previous owner's residue;
+    // they are the device's present state, and the device is a shared
+    // thing by its nature. Nothing is being leaked that the next
+    // holder could not see by looking at the screen.
+    //
+    // This is the third rule of ADR 020's that assumed "an Untyped's
+    // memory is writable RAM", after the header and the watermark.
+    // See ADR 023's K11.
+    if !untyped.is_device() {
+        // SAFETY: The region is inside this Untyped, which owns it,
+        // the range was checked above, and the Untyped is RAM, so
+        // PMAP maps it writably.
+        unsafe {
+            let start = crate::memory::phys_to_virt(PhysAddr(untyped.base.0 + plan.first));
+            core::ptr::write_bytes(
+                start.as_ptr::<u8>(),
+                0,
+                (plan.object_size * count as u64) as usize,
+            );
+        }
     }
 
     for index in 0..count {
@@ -371,7 +470,7 @@ pub unsafe fn retype(
     // The watermark moves last, so that a reader seeing it advanced also
     // sees finished objects. Single-threaded today; the ordering costs
     // nothing and will still be right when it stops being.
-    untyped.header().watermark = plan.first + plan.object_size * count as u64;
+    untyped.set_watermark(plan.first + plan.object_size * count as u64);
 
     Ok(())
 }
@@ -403,4 +502,288 @@ pub unsafe fn revoke_untyped(slot: &mut Slot) -> Result<cnode::RevokeReport, Cap
     }
 
     Ok(report)
+}
+
+// ---- The device watermark table (ADR 050) ------------------------------
+//
+// **This table is the mechanism ADR 050 described before it existed.**
+//
+// The ADR said, of a device Untyped, that "its bookkeeping lives in the
+// capability, not in the memory it names -- which is what `size_bits`
+// in the slot is for". The first half of that sentence was a
+// requirement stated as though it were a fact, and the second half was
+// wrong: `size_bits` is the region's *size*, which never changes. The
+// watermark changes on every retype and had nowhere to go.
+//
+// Nothing noticed until the first real device Untyped was used, at
+// which point `header()` dereferenced an address outside the physical
+// window and the kernel took a page fault at 0xffff8000fd000000. See
+// ADR 023's K10, which this produced.
+//
+// # Why not a field in the slot
+//
+// Because **an Untyped capability can be copied.** Two capabilities
+// naming one Untyped must see one watermark, or each hands out the
+// same bytes to a different holder. That is the same argument that
+// puts the figure in the object's own memory for RAM: the watermark
+// belongs to the *object*, and a capability is not the object.
+//
+// So the key is the **base address**, which is what identifies the
+// object, and copies agree by construction.
+//
+// # Shape
+//
+// `ioport::RANGES`' shape, for `ioport::RANGES`' reason: a fixed table
+// read from inside an invocation, which may not allocate (ADR 022).
+// Atomics rather than a lock because every caller already holds an
+// InterruptGuard and a lock between a syscall and nothing else would
+// protect nothing.
+
+/// How many device Untypeds the kernel can track at once.
+///
+/// Sixteen, and the figure is arithmetic rather than taste. A device
+/// region is blocked into `2^k` pieces at `2^k` boundaries like any
+/// other Untyped (ADR 020), and a framebuffer's size is almost never
+/// a power of two. QEMU's default 1280x800 at 32 bpp is 4 096 000
+/// bytes, which decomposes into **six** blocks: 2 MiB, 1 MiB,
+/// 512 KiB, 256 KiB, 128 KiB, 32 KiB. One screen therefore costs six
+/// entries, so eight would leave room for almost nothing; sixteen
+/// leaves room for a second device and matches
+/// [`crate::cap::ioport::MAX_RANGES`], which is fixed for the same
+/// reason.
+pub const MAX_DEVICE_UNTYPED: usize = 16;
+
+/// One tracked device Untyped.
+///
+/// `size` is the liveness marker, and that is a decision rather than
+/// a convenience: a live Untyped is at least `1 << UNTYPED_MIN_BITS`
+/// bytes, so zero is a value no real entry can hold. Using `base`
+/// would have needed a separate flag -- physical address zero is a
+/// perfectly good address, and the same trap `ioport::LIVE` exists to
+/// avoid.
+struct DeviceUntyped {
+    /// Physical base address of the region. The key.
+    base: AtomicU64,
+    /// Bytes in the region. Zero means the entry is free.
+    size: AtomicU64,
+    /// First byte not yet handed out, as an offset from `base`.
+    ///
+    /// Starts at **zero**, not at `HEADER_SIZE`: there is no header
+    /// here to step over, so the whole region is available.
+    watermark: AtomicU64,
+    /// How many capabilities name this Untyped.
+    ///
+    /// Not a nicety. The entry must outlive every capability that
+    /// could still retype from it, and no longer -- an entry that
+    /// stayed behind would make the base unreusable and would hand a
+    /// later Untyped at the same address a stale watermark.
+    refs: AtomicU32,
+}
+
+impl DeviceUntyped {
+    /// A free entry.
+    ///
+    /// `#[allow]` because clippy is right in general and wrong here.
+    /// A `const` holding atomics is usually a trap: every *use* of
+    /// the name produces a fresh value, so `COUNTER.fetch_add(..)`
+    /// would increment a temporary and discard it.
+    ///
+    /// This one is used in exactly one place, inside the
+    /// `[const { .. }; N]` initialiser below, where producing a
+    /// fresh value per element is precisely what is wanted — the
+    /// alternative, `[DeviceUntyped { .. }; N]`, needs `Copy`, and
+    /// an atomic must not be `Copy`.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: DeviceUntyped = DeviceUntyped {
+        base: AtomicU64::new(0),
+        size: AtomicU64::new(0),
+        watermark: AtomicU64::new(0),
+        refs: AtomicU32::new(0),
+    };
+}
+
+static DEVICE_UNTYPEDS: [DeviceUntyped; MAX_DEVICE_UNTYPED] =
+    [const { DeviceUntyped::EMPTY }; MAX_DEVICE_UNTYPED];
+
+/// The entry for `base`, if there is one.
+fn device_entry(base: PhysAddr) -> Option<&'static DeviceUntyped> {
+    DEVICE_UNTYPEDS.iter().find(|entry| {
+        entry.size.load(Ordering::Acquire) != 0 && entry.base.load(Ordering::Acquire) == base.0
+    })
+}
+
+/// Whether `base` is a tracked device Untyped.
+///
+/// Used by `cnode::seed_root` as a tripwire: a device Untyped
+/// capability whose entry does not exist is the exact mistake ADR 050
+/// made in prose, and boot is where it would be made again.
+pub fn has_device_entry(base: PhysAddr) -> bool {
+    device_entry(base).is_some()
+}
+
+/// The entry for `base`, or stop.
+///
+/// A missing entry is not a caller's error but a kernel one: the
+/// device flag and the entry are set together and released together,
+/// so a capability marked device with no entry means one of the two
+/// paths forgot. Carrying on would read a watermark of zero and hand
+/// out memory that is already in use.
+fn entry_or_panic(base: PhysAddr) -> &'static DeviceUntyped {
+    device_entry(base).unwrap_or_else(|| {
+        panic!(
+            "no device-Untyped entry for base {}. The capability says \
+             this is device memory, so its watermark lives in the \
+             kernel table (ADR 050) -- but no entry was reserved for \
+             it. Every path that sets the device flag must call \
+             `reserve_device` first: boot's framebuffer seeding and \
+             `cnode::mark_device` are the only two.",
+            base
+        )
+    })
+}
+
+/// Bytes handed out so far from the device Untyped at `base`.
+fn device_watermark(base: PhysAddr) -> u64 {
+    entry_or_panic(base).watermark.load(Ordering::Acquire)
+}
+
+/// Move the device Untyped's watermark.
+fn set_device_watermark(base: PhysAddr, value: u64) {
+    let entry = entry_or_panic(base);
+    let size = entry.size.load(Ordering::Acquire);
+    debug_assert!(
+        value <= size,
+        "device Untyped at {} asked to move its watermark to {}, past \
+         the end of its {} bytes",
+        base,
+        value,
+        size
+    );
+    entry.watermark.store(value, Ordering::Release);
+}
+
+/// Start tracking a device Untyped. Returns false if the table is full.
+///
+/// Called at the moment the device flag goes on, which is the only
+/// moment at which the two can be kept in step. Two callers and no
+/// more: boot's framebuffer seeding (ADR 050) and
+/// [`cnode::mark_device`].
+///
+/// # Panics
+///
+/// If `base` is already tracked. Two live Untypeds cannot share a base
+/// -- they would be the same object -- so this means a region was
+/// seeded twice, and the second seeding would give the first one's
+/// holders a watermark that moves underneath them.
+#[must_use]
+pub fn reserve_device(base: PhysAddr, size: u64) -> bool {
+    debug_assert!(size > 0, "a zero-sized device Untyped at {}", base);
+
+    assert!(
+        device_entry(base).is_none(),
+        "two device Untypeds claim base {}; a region has been seeded \
+         twice and both holders would share one watermark",
+        base
+    );
+
+    for entry in &DEVICE_UNTYPEDS {
+        if entry.size.load(Ordering::Acquire) == 0 {
+            entry.base.store(base.0, Ordering::Relaxed);
+            entry.watermark.store(0, Ordering::Relaxed);
+            entry.refs.store(1, Ordering::Relaxed);
+            // `size` last. It is the liveness marker, so the entry
+            // becomes findable only once the rest of it is written.
+            entry.size.store(size, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// A second capability now names this device Untyped.
+///
+/// Called from [`cnode::copy`], which is the only operation that
+/// produces one: `mint` refuses an Untyped by type, and `retype`
+/// cannot produce an Untyped from device memory at all
+/// (`DeviceUntypedFrameOnly`).
+pub fn retain_device(base: PhysAddr) {
+    entry_or_panic(base).refs.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A capability naming this device Untyped has gone.
+///
+/// Returns `Some(watermark)` if that was the last one and the entry
+/// has been released, `None` if others remain.
+///
+/// The counterpart of [`crate::cap::irq::release_line`] and
+/// [`crate::cap::ioport::release_range`], reached from the same hook
+/// in `release_ipc_references` -- and with one difference worth
+/// naming. Those two release on the *first* delete, because an
+/// IrqHandler or an IoPort is a single object that one capability
+/// names. An Untyped can be copied, so releasing on the first delete
+/// would retire an entry that surviving capabilities still retype
+/// from, and the next `reserve_device` for the same base would reset
+/// their watermark to zero.
+pub fn release_device(base: PhysAddr) -> Option<u64> {
+    let entry = entry_or_panic(base);
+
+    let before = entry.refs.fetch_sub(1, Ordering::AcqRel);
+    assert!(
+        before > 0,
+        "the device Untyped at {} was released once more than it was \
+         retained; the reference count has gone negative",
+        base
+    );
+    if before > 1 {
+        return None;
+    }
+
+    let watermark = entry.watermark.load(Ordering::Acquire);
+    // `size` first, for the mirror of the reason it was written last:
+    // clearing the liveness marker retires the entry before any of its
+    // fields are reused.
+    entry.size.store(0, Ordering::Release);
+    entry.base.store(0, Ordering::Relaxed);
+    entry.watermark.store(0, Ordering::Relaxed);
+    Some(watermark)
+}
+
+/// Report the device Untypeds, for the acceptance test.
+pub fn device_report() {
+    use crate::println;
+
+    let mut live = 0usize;
+    let mut bytes = 0u64;
+    let mut handed_out = 0u64;
+
+    for entry in &DEVICE_UNTYPEDS {
+        let size = entry.size.load(Ordering::Acquire);
+        if size == 0 {
+            continue;
+        }
+        let base = entry.base.load(Ordering::Acquire);
+        let watermark = entry.watermark.load(Ordering::Acquire);
+        println!(
+            "[cap] device untyped {:#x}..{:#x} ({} KiB), {} B handed \
+             out, {} capability/ies",
+            base,
+            base + size,
+            size / 1024,
+            watermark,
+            entry.refs.load(Ordering::Acquire)
+        );
+        live += 1;
+        bytes += size;
+        handed_out += watermark;
+    }
+
+    println!(
+        "[cap] {} device untyped(s) of {} table slots, {} KiB total, \
+         {} KiB handed out; watermarks live in this table and not in \
+         the memory they describe (ADR 050)",
+        live,
+        MAX_DEVICE_UNTYPED,
+        bytes / 1024,
+        handed_out / 1024
+    );
 }

@@ -352,10 +352,50 @@ impl fmt::Write for Console {
 /// it would have been a change to 59 scenarios in exchange for
 /// nothing — the point of M13 is what the kernel stopped *doing*, not
 /// what its printing is called.
+///
+/// # Why a preempt guard
+///
+/// **A line is an output unit, and it has to leave the kernel
+/// whole.** A long message is thousands of `outb`s; from M6 a timer
+/// interrupt can land in the middle of them and switch threads. The
+/// other thread then prints its own line *into* the first.
+///
+/// Observed in M14's suite run, in the log itself:
+///
+/// ```text
+/// ...when they stopped existing[ipc] notification at 0x...4418000
+///  so did it.
+/// ```
+///
+/// Two complete messages, interleaved, and **neither one is a line
+/// any more**. Every acceptance expectation is anchored with `^` and
+/// `$`, so both vanish from the runner's point of view — which is
+/// how one suite run reported `vsuserro` missing a line that was
+/// plainly in its log, and another reported the same of
+/// `driverdies`. Different scenarios each time, because the victim
+/// is whoever happens to be printing when the tick arrives.
+///
+/// This was a latent defect from M6, not from M14. It needed a long
+/// line and a busy moment, and M14 supplied both: a third component
+/// to schedule and several multi-line reports.
+///
+/// **`PreemptGuard`, not `InterruptGuard`**, and the distinction is
+/// ADR 025's. What corrupts a line is a *thread switch*, not an
+/// interrupt; an interrupt that merely counts a tick and returns
+/// does no harm. Disabling interrupts for the duration of a
+/// thousand-character message would lose device interrupts for
+/// milliseconds, which ADR 019 refused for revoke and which is no
+/// more acceptable here.
+///
+/// The guard costs one atomic increment and one decrement per
+/// `print!`.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
         use ::core::fmt::Write as _;
+        // Held for the whole write, so a tick in the middle defers
+        // its switch until the line is out.
+        let _preempt = $crate::sched::PreemptGuard::new();
         // Writing is infallible by construction (see
         // `Console::write_str`), so the Result cannot be an error.
         let _ = ::core::write!(&mut $crate::emergency::Console, $($arg)*);
@@ -363,12 +403,17 @@ macro_rules! print {
 }
 
 /// Print a line to the emergency console.
+///
+/// **One guard, not two.** The body is a single `print!` with the
+/// newline formatted in rather than two calls, because two calls
+/// would release the guard between them and leave the gap this
+/// exists to close — a switch after the message and before the `\n`
+/// produces exactly the same interleaving.
 #[macro_export]
 macro_rules! println {
     () => { $crate::print!("\n") };
     ($($arg:tt)*) => {{
-        $crate::print!($($arg)*);
-        $crate::print!("\n");
+        $crate::print!("{}\n", ::core::format_args!($($arg)*));
     }};
 }
 

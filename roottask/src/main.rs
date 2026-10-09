@@ -30,6 +30,7 @@
 //! the build rather than letting it fault at run time.
 
 mod driver;
+mod screen;
 
 use safrox_abi as abi;
 use safrox_abi::{cap_type, method, perm, scenario, BootInfo, CPtr, UntypedDesc};
@@ -283,6 +284,10 @@ fn main() -> ! {
     // field entirely would still do what it did before.
     match info.scenario {
         scenario::ROOT_TEST => build_and_connect(info, untypeds),
+        scenario::FB_TEST
+        | scenario::FB_NO_CAP
+        | scenario::FB_OUT_OF_BOUNDS
+        | scenario::FB_DEVICE_UNTYPED_MISUSE => screen_scenarios(info, untypeds),
         _ => driver_scenarios(info, untypeds),
     }
 
@@ -538,6 +543,90 @@ fn driver_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
     // same one and the client never learns anything happened.
     let r = invoke(slot(client.tcb).0, method::RESUME, 0, 0, 0, 0);
     echo(CHANNEL | driver::STEP_CLIENT_RESUME, r);
+}
+/// The M14 scenarios: the framebuffer, driven from a component.
+///
+/// All four start the same way, and for the reason `driver_scenarios`
+/// gives: a negative that built its component differently would be
+/// testing its own construction.
+///
+/// The exception is `fb-no-cap`, which deliberately builds a
+/// component with *less* — that is the whole scenario, and it uses
+/// the same `setup_component` so that what differs is the
+/// capabilities and nothing else.
+fn screen_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
+    let Some(budget) = largest_untyped(info, untypeds) else {
+        echo(
+            CHANNEL | STEP_CHILD_RETYPE,
+            abi::ERROR_FLAG | abi::error::NOT_ENOUGH_MEMORY,
+        );
+        return;
+    };
+
+    let untyped = slot(budget);
+    let own_cnode = slot(info.root_cnode_slot);
+    let mut next = info.free_slot_first;
+
+    // **No screen is a reported condition, not a failure.**
+    //
+    // A machine booted over serial has no framebuffer and everything
+    // up to M13 ran that way. Saying so and stopping is different
+    // from stopping silently: the kernel's test reads this and fails
+    // the scenario with "there is no framebuffer to test", which is
+    // a better message than a missing line.
+    let Some(fb) = screen::Framebuffer::from_bootinfo(info, untypeds) else {
+        echo(
+            CHANNEL | screen::STEP_FB_GEOMETRY,
+            abi::ERROR_FLAG | abi::error::INVALID_ARGUMENT,
+        );
+        return;
+    };
+
+    // --- fb-no-cap: a component holding nothing ----------------------
+    //
+    // Built first and returned from, because it is the one scenario
+    // that must *not* have the framebuffer handed to it.
+    if info.scenario == scenario::FB_NO_CAP {
+        let hostile = driver::Component::allocate(&mut next, 1);
+        let mut worst = driver::retype_component(untyped, own_cnode, &hostile, 1);
+
+        let program = screen::no_cap_program();
+        if program.overflowed() {
+            echo(
+                CHANNEL | STEP_CHILD_SETUP,
+                abi::ERROR_FLAG | abi::error::INVALID_ARGUMENT,
+            );
+            return;
+        }
+
+        worst = first_error(
+            worst,
+            driver::setup_component(info, &hostile, program.as_slice(), 1),
+        );
+        echo(CHANNEL | STEP_CHILD_SETUP, worst);
+        if worst == 0 {
+            echo(
+                CHANNEL | STEP_CHILD_RESUME,
+                invoke(slot(hostile.tcb).0, method::RESUME, 0, 0, 0, 0),
+            );
+        }
+        return;
+    }
+
+    // --- The screen component itself ---------------------------------
+    //
+    // What it should do once started: draw, or one of the two
+    // misbehaviours. The numbers are the component's own (see
+    // `local_scenario` in screen/src/main.rs) rather than the ABI's,
+    // because several ABI scenarios start it the same way and the
+    // translation belongs here, where both are known.
+    let what = match info.scenario {
+        scenario::FB_OUT_OF_BOUNDS => 1,
+        scenario::FB_DEVICE_UNTYPED_MISUSE => 2,
+        _ => 0,
+    };
+
+    screen::build_and_start(info, untyped, &mut next, &fb, what);
 }
 
 // There is deliberately no `wait_for_driver` helper here.

@@ -296,6 +296,8 @@ fn check_root_untypeds() {
     let mut total = 0u64;
     let mut smallest = u64::MAX;
     let mut largest = 0u64;
+    let mut device_count = 0usize;
+    let mut device_bytes = 0u64;
 
     for index in 0..count {
         // SAFETY: Index below the reported count.
@@ -327,6 +329,27 @@ fn check_root_untypeds() {
             untyped.size()
         );
 
+        // **Device memory is counted apart** (M14, ADR 050).
+        //
+        // The shape checks above apply to every Untyped -- a device
+        // one is still `2^k` bytes at a `2^k` boundary -- but the
+        // *sum* must not include it. `boot::root_untyped_bytes`
+        // deliberately excludes device memory, because the
+        // framebuffer is not memory anyone may allocate from and
+        // folding it in would make M12's accounting identity wrong
+        // by exactly the size of the screen.
+        //
+        // This assertion fired the first time a real device Untyped
+        // existed: 203816960 against 199720960, a difference of
+        // 4096000 -- the framebuffer, to the byte. The test was
+        // written in M5 when every Untyped was RAM, which is
+        // ADR 023's K11 arriving in a test rather than in a rule.
+        if untyped.is_device() {
+            device_count += 1;
+            device_bytes += untyped.size();
+            continue;
+        }
+
         total += untyped.size();
         smallest = smallest.min(untyped.size());
         largest = largest.max(untyped.size());
@@ -338,17 +361,27 @@ fn check_root_untypeds() {
     // error nothing else here would notice.
     assert_eq!(
         total, reported,
-        "the Untyped capabilities total {} bytes but boot reported {}",
-        total, reported
+        "the non-device Untyped capabilities total {} bytes but boot \
+         reported {}. {} device Untyped(s) covering {} bytes were \
+         excluded from both figures; if the difference equals that, \
+         something has started counting device memory as usable.",
+        total, reported, device_count, device_bytes
     );
 
     println!(
         "[captest] root untypeds: {} covering {} MiB, sizes {} KiB .. {} KiB, \
          all power-of-two and self-aligned",
-        count,
+        count - device_count,
         total / (1024 * 1024),
         smallest / 1024,
         largest / 1024
+    );
+    println!(
+        "[captest] plus {} device untyped(s) covering {} KiB, counted \
+         separately: device memory may only become Frames (ADR 017) and \
+         is not part of the usable total (ADR 050)",
+        device_count,
+        device_bytes / 1024
     );
 }
 

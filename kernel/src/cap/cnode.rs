@@ -491,6 +491,22 @@ pub unsafe fn copy(src: &mut Slot, dest: &mut Slot, rights: Rights) -> Result<()
         return Err(CapError::DerivationTooDeep { depth });
     }
 
+    // **A device Untyped gains a reference here, and this is the only
+    // place it can** (ADR 050).
+    //
+    // Its watermark lives in a kernel table rather than in the memory
+    // it names, and that table's entry has to outlive every capability
+    // that could still retype from it. `copy` is the one operation
+    // that makes a second such capability: `mint` refuses an Untyped
+    // by type, and a device Untyped cannot be retyped into another
+    // Untyped at all.
+    //
+    // Counted *after* every check above, so a refused copy does not
+    // leave a reference behind.
+    if src.cap_type() == CapType::Untyped && src.is_device() {
+        super::untyped::retain_device(src.object().0);
+    }
+
     dest.fill(
         src.object(),
         src.cap_type(),
@@ -836,8 +852,35 @@ unsafe fn release_ipc_references(slot: &Slot) {
         // conclusions had to be reached deliberately. A `_ => {}`
         // would have given the right answer for three of them and
         // silently the wrong one for the fourth.
+        CapType::Untyped => {
+            // **M14's arm, and the one that is conditional.**
+            //
+            // Only a *device* Untyped holds anything outside itself: a
+            // row in `untyped`'s watermark table, because device
+            // memory cannot carry its own header (ADR 050). An
+            // ordinary Untyped's watermark is in its own first
+            // sixteen bytes and goes when the memory does.
+            //
+            // Unlike the IrqHandler and IoPort arms above, this does
+            // not release on the first delete. Those name objects
+            // that one capability names; an Untyped can be copied, and
+            // retiring the row while a sibling still existed would
+            // reset that sibling's watermark to zero the next time the
+            // base was reserved. So `release_device` counts, and the
+            // row goes when the last capability does.
+            if slot.is_device() {
+                if let Some(watermark) = crate::cap::untyped::release_device(slot.object().0) {
+                    crate::println!(
+                        "[cap] the last capability for the device Untyped \
+                         at {} is gone; its table row is released after {} \
+                         byte(s) were handed out (ADR 050)",
+                        slot.object(),
+                        watermark
+                    );
+                }
+            }
+        }
         CapType::Null
-        | CapType::Untyped
         | CapType::CNode
         | CapType::Frame
         | CapType::PageTable
@@ -950,10 +993,27 @@ pub unsafe fn revoke(slot: &mut Slot) -> Result<RevokeReport, CapError> {
 /// *clear* the flag on a real device region and place a TCB on a disk
 /// controller. Keeping the flag kernel-only removes the question.
 ///
-/// Boot will call this once the memory map's device regions are
-/// enumerated (M8); until then the acceptance test is the only caller,
-/// and it flags ordinary RAM, because what is under test is the
-/// restriction the flag imposes rather than the address it names.
+/// Boot does **not** call this. Its framebuffer pass seeds device
+/// Untypeds directly with `seed_root`, because they have no parent to
+/// be marked after the fact (ADR 050). This function is for an Untyped
+/// that already exists, which is the acceptance test's case: it flags
+/// ordinary RAM, because what is under test is the restriction the flag
+/// imposes rather than the address it names.
+///
+/// # The flag and the table are set together
+///
+/// Turning the flag on moves the Untyped's watermark from its own
+/// memory into `untyped`'s table, so a row has to exist before the
+/// next read. Doing it here rather than leaving it to the caller is
+/// what makes "flagged but untracked" unrepresentable — the state that
+/// faulted the kernel when ADR 050 described the table before it was
+/// written.
+///
+/// The watermark is **not** carried across, and the asymmetry is the
+/// safety condition below rather than an oversight: nothing may have
+/// been retyped out of this Untyped yet, so the only thing the old
+/// watermark records is the sixteen-byte header, and the new region
+/// has no header to skip.
 ///
 /// # Safety
 ///
@@ -969,6 +1029,17 @@ pub unsafe fn mark_device(slot: &mut Slot) -> Result<(), CapError> {
             found: slot.cap_type(),
         });
     }
+
+    // The row first. If the table is full the flag is not set, so the
+    // Untyped stays ordinary memory rather than becoming device memory
+    // with nowhere to keep its figures.
+    let size = 1u64 << slot.as_size_bits();
+    if !crate::cap::untyped::reserve_device(slot.object().0, size) {
+        return Err(CapError::TooManyObjects {
+            count: crate::cap::untyped::MAX_DEVICE_UNTYPED + 1,
+        });
+    }
+
     slot.packed |= 1 << DEVICE_BIT;
     Ok(())
 }
@@ -993,6 +1064,27 @@ pub unsafe fn seed_root(
     if !slot.is_empty() {
         return Err(CapError::SlotNotEmpty);
     }
+
+    // **The tripwire for the mistake ADR 050 made in prose** (ADR 023,
+    // K10). A device Untyped keeps its watermark in a kernel table,
+    // and a capability seeded without a row would read a watermark of
+    // zero the first time somebody asked — or, before the table
+    // existed at all, fault on an address outside the physical window.
+    //
+    // Boot is the only caller that passes `device: true`, and it is
+    // exactly the place where the two steps could drift apart: the row
+    // is reserved in one loop and the capability written in the next
+    // statement. An assertion here costs nothing at boot and makes the
+    // drift impossible to commit.
+    debug_assert!(
+        !(device && cap_type == CapType::Untyped)
+            || crate::cap::untyped::has_device_entry(object.0),
+        "a device Untyped is being seeded at {} with no row in the \
+         watermark table. The flag says its bookkeeping lives in the \
+         kernel (ADR 050); call `untyped::reserve_device` first.",
+        object
+    );
+
     slot.fill(object, cap_type, rights, 0, extra, device);
     slot.mdb_prev = PhysAddr(0);
     slot.mdb_next = PhysAddr(0);

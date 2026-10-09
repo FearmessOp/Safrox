@@ -94,18 +94,23 @@ if [ "$ENTRY" != "0x400000" ]; then
     exit 1
 fi
 
-# Two pages, and the figure is measured rather than chosen: the
-# first version of this check said one page and the image came out
-# at 7432 bytes. The kernel maps exactly this many frames, the
-# linker script asserts the same bound, and they are written down
-# in both places so that a change has to be made twice on purpose
-# rather than once by accident.
-MAX=16384
+# Eight pages, and every figure in this check's history was measured
+# rather than chosen: one in the first draft, two when the image came
+# out at 7432 bytes, four when M13 embedded the serial driver, eight
+# when M14 embedded the screen component too.
+#
+# The kernel maps exactly this many frames and the linker script
+# asserts the same bound, written down in both places so that a
+# change has to be made twice on purpose rather than once by
+# accident. M14 had to make it three times -- the `const _` in
+# kernel/src/roottask.rs carries a minimum size as well -- and all
+# three refused the build until they agreed.
+MAX=32768
 SIZE=$(stat -c %s "$OUT")
 if [ "$SIZE" -gt "$MAX" ]; then
     echo "roottask image is $SIZE bytes; the kernel maps $MAX." >&2
-    echo "Either raise ROOT_IMAGE_PAGES in the kernel and the" >&2
-    echo "ASSERT in roottask/link.ld together, or make the root" >&2
+    echo "Either raise ROOT_CODE_PAGES in kernel/src/roottask.rs and" >&2
+    echo "the ASSERT in roottask/link.ld together, or make the root" >&2
     echo "task smaller." >&2
     exit 1
 fi

@@ -14,7 +14,9 @@
 //! the stack Limine gave it. See gate 3.
 
 use limine::memmap;
-use limine::request::{BootloaderInfoRequest, ExecutableCmdlineRequest, MemmapRequest};
+use limine::request::{
+    BootloaderInfoRequest, ExecutableCmdlineRequest, FramebufferRequest, MemmapRequest,
+};
 
 use super::frame_allocator;
 use super::vm;
@@ -52,6 +54,37 @@ pub struct MemoryRegion {
     pub kind: u64,
 }
 
+/// The screen's geometry, copied out of bootloader memory (ADR 049).
+///
+/// Six numbers. The framebuffer's *contents* are not copied and could
+/// not be: they live in the device's own memory, which is the one
+/// place reclaim does not touch.
+#[derive(Clone, Copy)]
+pub struct Framebuffer {
+    /// Physical address of the first byte.
+    pub address: u64,
+    /// Visible width in pixels.
+    pub width: u64,
+    /// Visible height in pixels.
+    pub height: u64,
+    /// **Bytes** per scanline. Not `width * bpp / 8` -- see ADR 049.
+    pub pitch: u64,
+    /// **Bits** per pixel.
+    pub bpp: u16,
+}
+
+impl Framebuffer {
+    /// Total bytes the framebuffer occupies.
+    ///
+    /// `height * pitch`, and the pitch is why this is a method rather
+    /// than an open-coded multiplication at each use site: every
+    /// caller that reached for `width * height * bpp / 8` would be
+    /// right on QEMU and wrong on hardware that pads its rows.
+    pub fn size(&self) -> u64 {
+        self.height * self.pitch
+    }
+}
+
 /// Everything the kernel still needs from Limine, in memory we own.
 pub struct BootInfo {
     name: [u8; MAX_STRING],
@@ -62,6 +95,8 @@ pub struct BootInfo {
     cmdline_len: usize,
     memmap: [MemoryRegion; MAX_MEMMAP_ENTRIES],
     memmap_len: usize,
+    /// `None` on a machine with no screen, which is not an error.
+    framebuffer: Option<Framebuffer>,
 }
 
 impl BootInfo {
@@ -79,6 +114,7 @@ impl BootInfo {
                 kind: 0,
             }; MAX_MEMMAP_ENTRIES],
             memmap_len: 0,
+            framebuffer: None,
         }
     }
 
@@ -98,6 +134,16 @@ impl BootInfo {
 
     pub fn memory_map(&self) -> &[MemoryRegion] {
         &self.memmap[..self.memmap_len]
+    }
+
+    /// The screen, if the machine has one.
+    ///
+    /// `None` is a legitimate answer: a machine booted headless over
+    /// serial has no framebuffer, and M0 to M13 all ran that way. The
+    /// `Option` is what keeps "no screen" from being confused with
+    /// "a screen at address zero".
+    pub fn framebuffer(&self) -> Option<Framebuffer> {
+        self.framebuffer
     }
 }
 
@@ -140,6 +186,7 @@ pub unsafe fn capture(
     info: &BootloaderInfoRequest,
     cmdline: &ExecutableCmdlineRequest,
     memmap: &MemmapRequest,
+    framebuffer: &FramebufferRequest,
 ) {
     // SAFETY: Single-threaded boot, called once, and nothing else holds a
     // reference to the cell yet.
@@ -175,6 +222,51 @@ pub unsafe fn capture(
         };
     }
     dst.memmap_len = entries.len();
+
+    // **The framebuffer, and the reason it is copied here** (ADR 049).
+    //
+    // The response lives in reclaimable memory like every other one,
+    // so reading it after gate 5 would mean reading poison. Six
+    // numbers are cheap to keep and the alternative is a dangling
+    // `&'static` the compiler will never warn about.
+    //
+    // No response, or a response with no framebuffers, is not an
+    // error: a machine booted over serial has no screen. The first
+    // framebuffer is taken and any others ignored -- multi-head is a
+    // policy question for a display server, and this kernel has one
+    // job here, which is to hand the memory over.
+    dst.framebuffer = framebuffer.response().and_then(|response| {
+        response.framebuffers().first().map(|fb| Framebuffer {
+            // `address` is the *virtual* address Limine mapped it at,
+            // inside the HHDM. The physical address is what a device
+            // Untyped needs (ADR 050), and subtracting the HHDM
+            // offset is how the rest of this kernel goes the other
+            // way.
+            address: fb.address() as u64 - super::hhdm_offset(),
+            width: fb.width,
+            height: fb.height,
+            pitch: fb.pitch,
+            bpp: fb.bpp,
+        })
+    });
+
+    match dst.framebuffer {
+        Some(fb) => println!(
+            "[boot] framebuffer: {}x{} at {:#x}, pitch {} bytes, {} bpp, \
+             {} KiB total",
+            fb.width,
+            fb.height,
+            fb.address,
+            fb.pitch,
+            fb.bpp,
+            fb.size() / 1024
+        ),
+        None => println!(
+            "[boot] framebuffer: none. The bootloader reported no screen, \
+             which is what a serial-only machine looks like and is not an \
+             error -- nothing from M0 to M13 needed one."
+        ),
+    }
 
     println!(
         "[boot] captured: name/version, cmdline ({} bytes), {} memory map \

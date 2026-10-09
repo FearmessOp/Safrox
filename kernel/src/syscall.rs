@@ -828,6 +828,7 @@ fn dispatch(
             && !crate::irqtest::record_user_report(cptr_bits, arg0)
             && !crate::vspaceuser::record_step(cptr_bits, arg0)
             && !crate::drivertest::record_step(cptr_bits, arg0)
+            && !crate::fbtest::record_step(cptr_bits, arg0)
             && !crate::roottest::record_step(cptr_bits, arg0)
         {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);
@@ -1519,6 +1520,12 @@ fn decode_permissions(bits: u64) -> Result<crate::cap::vspace::MapPermissions, C
         0 => Ok(crate::cap::vspace::MapPermissions::ReadOnly),
         1 => Ok(crate::cap::vspace::MapPermissions::ReadWrite),
         2 => Ok(crate::cap::vspace::MapPermissions::ReadExecute),
+        // M14, ADR 051. Same access as 1, different cache type --
+        // which is why it is a fourth number rather than a flag bit
+        // on the others: the encoding stays a small set of named
+        // combinations instead of a word with independent fields,
+        // and W^X stays unrepresentable by construction.
+        3 => Ok(crate::cap::vspace::MapPermissions::ReadWriteCombining),
         _ => Err(CapError::InvalidArgument),
     }
 }

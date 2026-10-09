@@ -801,3 +801,63 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: driver-hostile
+
+
+/+Safrox (M14: the framebuffer, driven from a component)
+    comment: The root task builds a screen component, hands it the
+    comment: framebuffer as a device Untyped, and the component maps
+    comment: the pages into its own address space and draws.
+    comment: What makes this worth a milestone is what it did NOT
+    comment: need. M13's serial port required a new capability type,
+    comment: because x86 I/O ports are in no address space. A
+    comment: framebuffer is memory: device Untyped -> Frames -> map,
+    comment: all of which existed in M5 and M11. The missing piece
+    comment: was a device Untyped naming a real device (ADR 050).
+    comment: The component reads its own pixels back, because nothing
+    comment: here can look at a screen.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fb-test
+
+/+Safrox (M14: a component with no framebuffer capability)
+    comment: A component holding only an Endpoint tries to retype a
+    comment: Frame from a slot it was never given, and is refused at
+    comment: CPtr resolution.
+    comment: The claim is worth making for memory specifically. One
+    comment: might expect a physical address to be enough for a
+    comment: device that IS memory -- it is not. An address is a
+    comment: number; mapping needs a capability, and a component
+    comment: cannot name what it does not hold (ADR 018, ADR 050).
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fb-no-cap
+
+/+Safrox (M14: writing past the end of the framebuffer)
+    comment: The screen component maps the framebuffer correctly and
+    comment: then writes one page past its end.
+    comment: Expected: #PF, with CR2 at that address. This is the
+    comment: only scenario of the four that exits 35, and the reason
+    comment: is that it is a FAULT rather than a refusal -- the proof
+    comment: that a device Untyped's size is a real boundary and not
+    comment: a number in a struct. A run that exited 33 would be one
+    comment: where the write had quietly worked.
+    comment: Exit 35.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fb-out-of-bounds
+
+/+Safrox (M14: a TCB out of device memory)
+    comment: The screen component asks the framebuffer's device
+    comment: Untyped for a TCB rather than a Frame.
+    comment: Expected: DeviceUntypedFrameOnly. M5 tested this rule
+    comment: against an Untyped a test had marked by hand; this is
+    comment: the same rule met by a component that holds a real
+    comment: device and would rather have a thread. A TCB in a
+    comment: framebuffer would put the scheduler's saved registers
+    comment: on the screen, which is ADR 017's argument exactly.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: fb-device-untyped-misuse

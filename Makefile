@@ -999,3 +999,108 @@ run-driverhostile: $(ISO_DRIVERHOSTILE)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_DRIVERHOSTILE) --expect driverhostile -- $(QEMU_FLAGS)
 
 test: run-drivertest run-driverdies run-driverrestart run-driverhostile
+
+
+# ---- M14: the framebuffer, driven from a component --------------------
+#
+# Appended, as every milestone's block is (ADR 023, K7).
+#
+# A third user component, and the dependency chain gains a parallel
+# branch rather than a fourth level:
+#
+#     serial-driver.bin ─┐
+#                        ├─> roottask.bin -> kernel.elf
+#     screen.bin ────────┘
+#
+# Both are embedded in the root task with `include_bytes!`, for the
+# reason M13 gave: the kernel has no ELF loader and must not grow one
+# (ADR 043), so the component that loads them carries them.
+#
+# One thing differs from the driver's build. `scripts/build-screen.sh`
+# emits a second file beside the image -- the byte offset of the
+# geometry struct, read out of the symbol table -- because the root
+# task patches the screen's dimensions into the image before copying
+# it. A hard-coded offset would break the first time a line moved
+# above that struct, and break silently.
+
+SCREEN_BIN := $(BUILD_DIR)/screen.bin
+SCREEN_GEOM := $(BUILD_DIR)/screen-geometry-offset
+
+SCREEN_SRCS := screen/src/main.rs screen/link.ld screen/Cargo.toml \
+               abi/src/lib.rs
+
+$(SCREEN_BIN): $(SCREEN_SRCS)
+	@echo "  CARGO   screen"
+	@bash scripts/build-screen.sh
+
+# The offset file is written by the same script. Declared as a
+# separate target depending on the image so that make knows it
+# exists; without this, a build that needed only the offset would not
+# know how to produce it.
+$(SCREEN_GEOM): $(SCREEN_BIN)
+
+screen: $(SCREEN_BIN)
+
+# **The root task depends on both component images.** Appended as a
+# further rule for the same target rather than edited into M13's, for
+# the reason written there: make expands a prerequisite list when it
+# *parses* the rule, so `$(SCREEN_BIN)` has to be defined above the
+# line that uses it. It is defined twenty lines up.
+$(ROOTTASK_BIN): $(SCREEN_BIN) $(SCREEN_GEOM)
+
+# And clippy, which compiles kernel/src/main.rs, which reaches the
+# root task image, which reaches this one. M13's follow-up commit
+# existed because this edge was missing for the driver; the same edge
+# is added here in the same breath rather than after `make distclean`
+# finds it (ADR 023, K9).
+clippy: $(SCREEN_BIN) $(SCREEN_GEOM)
+
+ISO_FBTEST := $(BUILD_DIR)/safrox-fbtest.iso
+ISO_FBNOCAP := $(BUILD_DIR)/safrox-fbnocap.iso
+ISO_FBOOB := $(BUILD_DIR)/safrox-fboob.iso
+ISO_FBMISUSE := $(BUILD_DIR)/safrox-fbmisuse.iso
+
+ALL_ISOS += $(ISO_FBTEST) $(ISO_FBNOCAP) $(ISO_FBOOB) $(ISO_FBMISUSE)
+
+.PHONY: screen run-fbtest run-fbnocap run-fboob run-fbmisuse
+
+# Entry indices into boot/limine.conf.in, which had 62 entries before
+# M14 appended four.
+$(ISO_FBTEST): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,63)
+
+$(ISO_FBNOCAP): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,64)
+
+$(ISO_FBOOB): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,65)
+
+$(ISO_FBMISUSE): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,66)
+
+# **Three exit 33 and one exits 35**, and the split is the point.
+#
+# `fb-no-cap` and `fb-device-untyped-misuse` are *refusals*: a
+# component asked for something it may not have and was told no. A
+# kernel that stopped for either would be one any component could
+# halt by asking.
+#
+# `fb-out-of-bounds` is a **fault**: the component wrote to an
+# address nothing is mapped at, and the kernel reports #PF with CR2
+# at that address. That is the proof the device Untyped's size is a
+# real boundary rather than a number in a struct -- and a scenario
+# that exited 33 would be one where the write had quietly worked.
+
+run-fbtest: $(ISO_FBTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_FBTEST) --expect fbtest -- $(QEMU_FLAGS)
+
+run-fbnocap: $(ISO_FBNOCAP)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_FBNOCAP) --expect fbnocap -- $(QEMU_FLAGS)
+
+run-fboob: $(ISO_FBOOB)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_FBOOB) --expect fboob -- $(QEMU_FLAGS)
+
+run-fbmisuse: $(ISO_FBMISUSE)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_FBMISUSE) --expect fbmisuse -- $(QEMU_FLAGS)
+
+test: run-fbtest run-fbnocap run-fboob run-fbmisuse
