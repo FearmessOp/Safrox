@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The one system call.
 //!
 //! ADR 017 fixed the syscall count at one: everything is a capability

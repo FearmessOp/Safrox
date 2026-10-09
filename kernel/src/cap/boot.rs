@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Building the first CSpace.
 //!
 //! Every capability in the system descends from one created here. Boot

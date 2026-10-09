@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Context switching and the round-robin scheduler.
 //!
 //! Two things live here and they are deliberately separable:

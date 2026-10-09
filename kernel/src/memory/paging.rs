@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Page tables: entries, flags, and map/unmap/translate.
 //!
 //! Mechanism only. This module never decides *where* something should be

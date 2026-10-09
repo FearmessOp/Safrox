@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Interrupt handling as a capability (ADR 041, ADR 042).
 //!
 //! This is the milestone where a hardware interrupt reaches a thread

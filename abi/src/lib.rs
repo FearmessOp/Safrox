@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 #![no_std]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

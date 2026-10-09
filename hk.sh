@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MPL-2.0
 cd /mnt/c/Users/user/pyth || exit 1
 rm -f build/kernel.elf
 make kernel >/tmp/k.log 2>&1

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Raw x86 port I/O and CPU halt primitives.
 //!
 //! These are the only places in the kernel that emit `in`/`out` instructions.

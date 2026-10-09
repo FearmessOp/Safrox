@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The virtual address space layout.
 //!
 //! These constants are the executable form of docs/address-space.md, and

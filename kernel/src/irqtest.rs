@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Interrupt handling acceptance tests (M10, ADR 041 and 042).
 //!
 //! M10's claim is narrow and checkable: **a hardware interrupt reaches

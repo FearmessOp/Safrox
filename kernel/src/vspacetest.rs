@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Address space acceptance tests.
 //!
 //! The check that matters is the fifth: two threads reading the *same*

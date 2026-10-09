@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The I/O APIC: masking an interrupt line in hardware (M10's debt).
 //!
 //! M10 masked lines with [`crate::cap::irq`]'s software flag and said

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Kernel heap acceptance tests, run inside the kernel.
 //!
 //! Like `memtest` and `vmtest`, these run against the real heap on the real

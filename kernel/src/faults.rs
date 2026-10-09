@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Deliberate fault triggers for the M1 acceptance tests.
 //!
 //! These exist so the exception machinery can be exercised on the shipping

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 #
 # M10 build helper.
 #

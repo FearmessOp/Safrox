@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! QEMU `isa-debug-exit` integration: how the kernel terminates the VM with a
 //! status the host test runner can decode.
 

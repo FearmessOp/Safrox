@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Copying out of bootloader memory, then reclaiming it.
 //!
 //! Limine's responses live in `BOOTLOADER_RECLAIMABLE`, and the crate hands

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Thread and scheduler acceptance tests.
 //!
 //! M6's risk is not the context switch -- that is forty lines of

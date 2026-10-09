@@ -17,7 +17,7 @@ name = "roottask"
 version = "0.1.0"
 edition = "2021"
 description = "Safrox root task: the first user component"
-license = "BSD-2-Clause"
+license = "MPL-2.0"
 publish = false
 
 [[bin]]

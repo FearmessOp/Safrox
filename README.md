@@ -3,6 +3,12 @@
 A capability-based microkernel for x86-64, written in Rust, booted by
 [Limine](https://github.com/limine-bootloader/limine).
 
+**Licensed under the [MPL-2.0](LICENSE).** The copyleft is per *file*,
+which is the boundary this project wants: change a file in this
+repository and you share it, but components built on top — a
+filesystem, a network stack, a personality — are yours to license as
+you like ([ADR 052](docs/adr/052-lisans-secimi.md)).
+
 **Current milestone: M12 — the root task, and the kernel that
 stops.** The kernel now creates exactly one thread and then **seals
 itself**. Everything else in the system is built from
@@ -2454,6 +2460,17 @@ M7:
 - [038 — Notification ve bağlı bekleme](docs/adr/038-notification-ve-bagli-bekleme.md)
 - [039 — Ölüm ve iptal: bloke bir thread'in başına gelenler](docs/adr/039-ipc-olum-ve-iptal.md)
 - [040 — Hızlı yol M9'da yok, ve yavaş yol ölçülecek](docs/adr/040-hizli-yol-yok.md)
+
+M14 sonrası:
+
+- [052 — Lisans: MPL-2.0](docs/adr/052-lisans-secimi.md)
+
+On dört milestone boyunca kaynak dosyalarda bir `BSD-2-Clause` SPDX
+satırı vardı ve kökte `LICENSE` dosyası yoktu. Satır ilk dosyanın
+şablonundan gelmişti; hiçbir ADR'de tartışılmamıştı. ADR 052 ilk kez
+bilinçli bir seçim yapıyor ve neden MPL-2.0 olduğunu — Apache/MIT
+çekirdeği korumasız bırakır, GPLv3 gömülü ve savunma pazarını
+kapatır — yazıyor.
 
 033–040 bir **architect pass**: kod yazılmadan önce IPC'nin
 semantiği sabitlendi. Üç eski ADR bu sırada düzeltildi —

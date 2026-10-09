@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Global Descriptor Table and Task State Segment.
 //!
 //! Limine hands us a working GDT, but it is the bootloader's, living in

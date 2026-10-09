@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 #
 # Wire M9c's four scenarios into the Makefile and the Limine config.
 #

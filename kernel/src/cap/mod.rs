@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The capability object model.
 //!
 //! Every kernel resource is an object, and every access to an object goes

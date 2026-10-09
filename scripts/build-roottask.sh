@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 #
 # Build the root task and emit its flat image.
 #

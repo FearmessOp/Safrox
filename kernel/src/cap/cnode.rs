@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Slots, CNodes, and the derivation list.
 //!
 //! A slot is 32 bytes and carries everything about one capability: what

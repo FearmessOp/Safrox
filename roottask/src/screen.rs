@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Building the screen component, from CPL 3 (M14).
 //!
 //! **The second device, and the point is what it did not need.**

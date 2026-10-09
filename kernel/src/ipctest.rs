@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! IPC acceptance tests — **all of M9**.
 //!
 //! M9 landed in three parts, and this file covers them all: an

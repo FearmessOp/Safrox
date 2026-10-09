@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Capability system acceptance tests, run inside the kernel.
 //!
 //! Written to ADR 023's rules: every check reports a number, resource

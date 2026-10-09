@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Ring 3 acceptance tests.
 //!
 //! M7 proved the address space. This proves the privilege level, and

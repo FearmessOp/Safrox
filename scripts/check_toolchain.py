@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 """Report which build tools are present and how to install the missing ones."""
 
 from __future__ import annotations

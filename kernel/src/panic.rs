@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The kernel panic handler.
 //!
 //! A panic is unrecoverable: we report it on the emergency console

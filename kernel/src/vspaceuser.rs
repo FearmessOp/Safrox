@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! M11: a user component managing its own address space.
 //!
 //! M7 built an address space out of capabilities, from inside the

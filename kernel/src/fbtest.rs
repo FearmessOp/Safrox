@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! M14 acceptance: the framebuffer, driven from a component.
 //!
 //! **What this milestone did not need is the point of it.** M13

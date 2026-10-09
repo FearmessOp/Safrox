@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Building our own address space and switching to it.
 //!
 //! Limine hands us a working set of page tables, but they are the

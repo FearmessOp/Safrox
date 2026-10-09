@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Probe for ADR 034's open question 7.
 //!
 //! The question: a message is 128 words, the first three of which travel

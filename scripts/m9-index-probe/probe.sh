@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 #
 # ADR 034, open question 7: what does `buffer[i - 3]` cost?
 #

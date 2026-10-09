@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 #
 # M10 commit. A script rather than `git commit -m "..."` because the
 # message is long and multi-paragraph, and quoting it through

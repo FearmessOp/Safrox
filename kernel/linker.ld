@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: MPL-2.0
  *
  * Safrox kernel link script — x86_64, Limine boot protocol (base revision 3).
  *

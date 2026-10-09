@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! M13 acceptance: the first user-space driver.
 //!
 //! **The claim is what the kernel stopped doing.** Every log line

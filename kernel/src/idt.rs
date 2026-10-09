@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Interrupt Descriptor Table.
 //!
 //! The IDT maps a vector number to a gate descriptor telling the CPU where

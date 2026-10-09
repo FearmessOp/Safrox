@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Thread control blocks.
 //!
 //! A TCB is 2048 bytes (ADR 017): a saved context, a kernel stack

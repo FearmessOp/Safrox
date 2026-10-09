@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! User address spaces, built out of capabilities.
 //!
 //! A VSpace is a root `PageTable` capability (ADR 027). There is no

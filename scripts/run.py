@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 """Boot a Safrox ISO under QEMU and validate the acceptance criteria.
 
 Why a runner instead of plain `qemu ... && echo ok`?

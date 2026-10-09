@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: MPL-2.0
 """Static sanity checks on the linked kernel ELF.
 
 These catch the classic silent-boot-failure causes before we ever spin up

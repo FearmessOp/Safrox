@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! I/O port access as a capability (ADR 045).
 //!
 //! **The gap ADR 017 left.** The device Untyped model was built for

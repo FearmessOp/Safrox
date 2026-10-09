@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Resolving a capability pointer to a slot.
 //!
 //! This is the first thing every syscall does, so it is written to have a

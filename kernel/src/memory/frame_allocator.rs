@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Physical frame allocator: a bitmap over all of physical memory.
 //!
 //! One bit per 4 KiB frame. Set means the frame is in use or must never be

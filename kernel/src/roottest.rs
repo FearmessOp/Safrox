@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! M12 acceptance: the root task, and the kernel that stops.
 //!
 //! Four criteria, and they are not equally hard:

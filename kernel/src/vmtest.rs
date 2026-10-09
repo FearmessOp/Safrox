@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Virtual memory acceptance tests, run inside the kernel.
 //!
 //! Like `memtest`, these run against the real machine and the kernel checks

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Untyped memory and `retype`.
 //!
 //! `retype` is the only way memory becomes a kernel object, and the only

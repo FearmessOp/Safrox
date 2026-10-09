@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! The emergency console (ADR 046).
 //!
 //! **What is left of the kernel's serial driver, and the measure of

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: MPL-2.0
  *
  * The screen component's layout.
  *

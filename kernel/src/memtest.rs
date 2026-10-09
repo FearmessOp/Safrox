@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Frame allocator acceptance tests, run inside the kernel.
 //!
 //! These are not unit tests on the host: they exercise the allocator

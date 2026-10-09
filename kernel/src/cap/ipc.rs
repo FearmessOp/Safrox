@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Synchronous IPC: endpoints, notifications, and the rendezvous.
 //!
 //! This is M9, and it is the milestone the object model was built for.

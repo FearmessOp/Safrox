@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Local APIC and its timer.
 //!
 //! M6 needs exactly one interrupt source: a periodic timer, so that a

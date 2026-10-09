@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Building the serial driver, from CPL 3 (M13).
 //!
 //! **The root task is the loader.** The kernel has no ELF loader and

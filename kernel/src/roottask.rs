@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MPL-2.0
 //! Starting the root task, and then stopping (ADR 044).
 //!
 //! **This module is the whole of what the kernel does for user space

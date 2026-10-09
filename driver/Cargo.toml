@@ -16,7 +16,7 @@ name = "serial-driver"
 version = "0.1.0"
 edition = "2021"
 description = "Safrox serial driver: the first device driver outside the kernel"
-license = "BSD-2-Clause"
+license = "MPL-2.0"
 publish = false
 
 [[bin]]
