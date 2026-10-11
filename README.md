@@ -3,10 +3,11 @@
 Safrox — a capability-based microkernel and operating system,
 written in Rust.
 
-<!-- The image is held out until the file exists. A broken-image
-     icon on the first screen of the repository is worse than
-     silence here. See assets/.gitkeep. -->
-<!-- ![Safrox running](assets/screenshot.png) -->
+![Safrox running](assets/screenshot.png)
+
+*The console component drawing characters from the keyboard
+component into the framebuffer — both at ring 3, with no code path
+through the kernel between the IRQ and the pixel.*
 
 Safrox is an x86-64 kernel that boots on QEMU through Limine. The
 kernel manages memory, scheduling, and the capability system that
