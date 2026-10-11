@@ -134,6 +134,11 @@ only thing they share is the Endpoint they were given.
 - [`docs/hardware-todo.md`](docs/hardware-todo.md) — the
   thirteen things that work on QEMU and have not been verified on
   real hardware.
+- [`docs/m5-acik-sorular.md`](docs/m5-acik-sorular.md) and
+  [`docs/m9-acik-sorular.md`](docs/m9-acik-sorular.md) —
+  intermediate output from two architect passes. Every question is
+  closed; the files are kept because they record how alternatives
+  were argued and which ones were ruled out. Also in Turkish.
 - [`docs/`](docs/) also carries address-space, interrupt and IPC
   design notes.
 

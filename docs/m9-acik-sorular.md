@@ -1,24 +1,28 @@
 # M9 architect pass — karara bağlanamayanlar
 
-> **Durum: yedisi de cevaplandı** (M9 uygulama öncesi). Her sorunun
-> altında **Karar** başlığı var; belge, kararların *nasıl*
-> alındığının kaydı olarak duruyor. Kararların kendileri ilgili
-> ADR'lere işlendi.
+> **Status: closed.** Bu dosya M9 architect pass'inin ara
+> çıktısıdır: o anda tek başıma karara bağlayamadığım noktalar,
+> seçenekleriyle birlikte. Hepsi cevaplandı ve uygulandı;
+> aşağıdaki hiçbir soru açık değil. Dosya silinmedi çünkü
+> ADR'lerin kaydetmediği bir şeyi kaydediyor: alternatiflerin
+> nasıl tartışıldığı ve hangi gerekçeyle elendiği.
 >
-> | # | Konu | Verilen karar | ADR |
+> | # | Konu | Karar | ADR |
 > |---|---|---|---|
-> | 1 | Üç word mü dört mü | **(b)** her iki yönde üç | 034 düzeltildi |
-> | 2 | `Reply` cap asimetrisi | **(a)**, gerekçe değişti | 035 düzeltildi |
-> | 3 | Notification önceliği | **(c)** dönüşümlü, şimdi | 038 düzeltildi |
-> | 4 | Badge 32 bit | **(a)** + ham `extra()` yasak | 037 düzeltildi |
-> | 5 | `NBSend` yokluğu | **(a)+(c)** Notification ile | 033 düzeltildi |
-> | 6 | `cancel_ipc` maliyeti | **(b)** çift yönlü, şimdi | 033 düzeltildi |
-> | 7 | Tamponun ilk word'leri | ölçüldü → **(a)** | 034'e yazıldı |
+> | 1 | Üç word mü dört mü | **(b)** her iki yönde üç | 034 |
+> | 2 | `Reply` cap asimetrisi | **(a)**, gerekçe değişti | 035 |
+> | 3 | Notification önceliği | **(c)** dönüşümlü | 038 |
+> | 4 | Badge 32 bit | **(a)** + ham `extra()` yasak | 037 |
+> | 5 | `NBSend` yokluğu | **(a)+(c)** Notification ile | 033 |
+> | 6 | `cancel_ipc` maliyeti | **(b)** çift yönlü | 033 |
+> | 7 | Tamponun ilk word'leri | ölçüldü → **(a)** | 034 |
 >
 > **Eğilimimin değiştiği iki yer, ikisi de gerekçe düzeyinde:**
 > soru 2'de savunmanın *türü* (politika değil yapı), soru 3'te
 > "ölçmeden ekleme" kuralının *sınırı* (garanti ölçülmez). Üçü
 > (1, 6, 7) eğilimimi doğruladı, ikisi (4, 5) kabul edildi.
+> Yedincisi — tahminim ölçümde çürüdü, ve o soru en öğretici
+> olanı.
 
 Aşağıdaki yedi nokta ya sizin kararınızı gerektiriyor ya da tek
 başıma verdiğim kararın gözden geçirilmesini istiyorum. Her biri
@@ -33,6 +37,10 @@ yazıyorum.
 ---
 
 ## Soru 1 — Register'da üç word mü dört mü? (ABI çelişkisi)
+
+**Sonuç:** (b) seçildi — ADR 034. Her iki yönde üç word register'da,
+`mr[3..]` tamponda. "Kaç word register'da" sorusunun tek bir cevabı
+oldu.
 
 **Durum:** [ADR 034](adr/034-mesaj-formati.md) "ilk dört word
 register'da" dedi. [docs/ipc.md](ipc.md) bölüm 1'i yazarken bir
@@ -93,6 +101,10 @@ alternatifler ve sonuç.
 ---
 
 ## Soru 2 — `Reply`'nin cap taşımasındaki asimetri
+
+**Sonuç:** (a) seçildi — ADR 035, ama gerekçe değişti: "varsayılan
+güvenli" (bir ayar) yerine "yapısal olarak zorlanamaz" (bir
+imkânsızlık). Receive slot açılmamışsa yazılacak yer yok.
 
 **Durum:** [ADR 035](adr/035-capability-transferi.md) bölüm "İki
 yönlü mü".
@@ -163,6 +175,10 @@ bölümü, elenen alternatifler ve sonuç.
 
 ## Soru 3 — Bağlı Notification'ın önceliği ve açlık
 
+**Sonuç:** (c) seçildi — ADR 038. Dönüşümlü teslim: bir bit, bir
+dal. "Ölçmeden ekleme" kuralı optimizasyonlar için, açlık
+*garantisi* için değil — ya vardır ya yoktur.
+
 **Durum:** [ADR 038](adr/038-notification-ve-bagli-bekleme.md).
 
 Bir thread hem Endpoint'te bekliyor hem bağlı Notification'ı var.
@@ -229,6 +245,11 @@ ADR 038 düzeltildi.
 ---
 
 ## Soru 4 — Badge 32 bit: ADR 021'i düzeltmek doğru mu?
+
+**Sonuç:** (a) seçildi — ADR 037: 32 bit, `extra` alanında. Ham
+`extra()` erişimi `pub` olmaktan çıktı; `slot.as_badge()`,
+`as_radix()`, `as_size_bits()` ile tipli — yanlış okuma derleme
+hatası.
 
 **Durum:** [ADR 037](adr/037-badge.md), ADR 021'in "64 bitlik bir
 etiket" ifadesini **32 bite düzeltti.**
@@ -306,6 +327,10 @@ ADR 037 düzeltildi (başlık dahil: "64 bit" → "32 bit").
 
 ## Soru 5 — `NBSend`/`NBRecv` yokluğu M13'ü zorlar mı?
 
+**Sonuç:** (a)+(c) seçildi — ADR 033. Bloke olmayan IPC yok;
+sağlık kontrolü Notification ile — zaten doğru desen, `Call`
+yanlış soruyu sorar.
+
 **Durum:** [ADR 033](adr/033-rendezvous-semantigi.md) bloke
 olmayan varyantları almadı.
 
@@ -370,6 +395,10 @@ ADR 033 düzeltildi.
 ---
 
 ## Soru 6 — `cancel_ipc`'in O(kuyruk) maliyeti bir DoS mu?
+
+**Sonuç:** (b) seçildi — ADR 033/039. Çift yönlü kuyruk, TCB'ye
+`ipc_prev`. İptal O(1); `ipc-cancel-cost` 50 ve 500 thread'de iki
+ölçümle kanıtlıyor — tek sayı değil, iki sayının *eşitliği*.
 
 **Durum:** [ADR 039](adr/039-ipc-olum-ve-iptal.md).
 
@@ -436,6 +465,11 @@ alternatifler ve sonuç.
 ---
 
 ## Soru 7 — IPC tamponunun ilk 32 baytı israf
+
+**Sonuç:** (a) seçildi — ADR 034, ama ölçümle: `objdump` ile iki
+varyant karşılaştırıldı, `buffer[i-3]` IPC kopya döngüsünü 14
+komuttan 40'a çıkardı. Tahminim çürüdü, eğilimim (b) idi, ölçüm
+(a)'yı seçti.
 
 **Durum:** [ADR 034](adr/034-mesaj-formati.md).
 

@@ -1,5 +1,25 @@
 # M5 architect pass — karara bağlanamayanlar
 
+> **Status: closed.** Bu dosya M5 architect pass'inin ara
+> çıktısıdır: o anda tek başıma karara bağlayamadığım noktalar,
+> seçenekleriyle birlikte. Hepsi cevaplandı ve uygulandı;
+> aşağıdaki hiçbir soru açık değil. Dosya silinmedi çünkü
+> ADR'lerin kaydetmediği bir şeyi kaydediyor: alternatiflerin
+> nasıl tartışıldığı ve hangi gerekçeyle elendiği.
+>
+> | # | Konu | Karar | ADR |
+> |---|---|---|---|
+> | 1 | Revoke'un maliyeti | **(a)** kabul, ölçümde 120 kat aştı | 019 |
+> | 2 | Slot yeniden kullanımı (ABA) | **(b)** nesil sayacı | 018 |
+> | 3 | MMIO'yu ne temsil ediyor | **(a)** device Untyped | 017, 050 |
+> | 4 | Paylaşımlı bellek | **(a)** M11'e ertelendi | 020 |
+> | 5 | IPC tamponu nerede | **(b)** TCB içinde | 017 |
+> | 6 | Invocation mekanizması | **(a)** tek `invoke` syscall'ı | 030 |
+>
+> Soru 1'in cevabı eğilimle aynı çıktı ama **ölçüm tahmini
+> çürüttü**: ADR 019'un sonucunda yazıyor. Diğer beş karar
+> uygulandı ve değişmedi.
+
 Aşağıdaki altı nokta ya sizin kararınızı gerektiriyor ya da tek başıma
 verdiğim kararın gözden geçirilmesini istiyorum. Her biri için seçenekler
 ve benim eğilimim yazılı; M5 uygulamasına başlamadan önce cevaplanmalı,
@@ -10,6 +30,10 @@ Numaralar ADR'lerden referans veriliyor.
 ---
 
 ## Soru 1 — Revoke: 56 ms kabul edilebilir mi?
+
+**Sonuç:** (a) seçildi — ADR 019; ama ölçüm tahmini 120 kat
+aştı (cap başına 2424 TSC çevrimi), ve ADR 019'un sonucu
+"M10'da yeniden ele alınması artık isteğe bağlı değil" diyor.
 
 **Durum:** [ADR 019](adr/019-derivation-tree.md). Revoke'un en kötü
 durumu 256 MiB'lık bir makinede **~56 ms**, ve o süre boyunca hiçbir
@@ -40,6 +64,10 @@ sonradan eklemek CPtr formatını ve her lookup'ı değiştirir.
 ---
 
 ## Soru 2 — Slot yeniden kullanımı: ABA riski
+
+**Sonuç:** (b) seçildi — ADR 018 nesil sayacını aldı: slot başına
+8 bit, CPtr'ın üst bitleri slot'un nesli, çözümlemede
+karşılaştırılıyor.
 
 **Durum:** [ADR 018](adr/018-cptr-ve-cspace.md). Bir slot silinip
 yeniden doldurulduğunda, eski CPtr'ı elinde tutan bir bileşen **yeni
@@ -73,6 +101,11 @@ değiştirmek.
 ---
 
 ## Soru 3 — MMIO'yu ne temsil ediyor?
+
+**Sonuç:** (a) seçildi — ADR 017 ve ADR 050. Boot sırasında
+MMIO bölgeleri için "device Untyped"lar üretiliyor; retype
+yalnızca Frame'e, ve bu Frame'ler `NO_CACHE` ile eşleniyor.
+Yeni bir nesne tipi yok, bir bayrak var.
 
 **Durum:** [ADR 017](adr/017-nesne-kumesi.md). M12'de bir cihaz
 sürücüsü register penceresine erişecek. Şimdilik cevap "bir Frame, ama
@@ -108,6 +141,11 @@ göreceğim?
 
 ## Soru 4 — Paylaşımlı bellek M11'e kadar yok
 
+**Sonuç:** (a) seçildi — ADR 020. Paylaşımlı bellek M11'e
+ertelendi; M9'un IPC tasarımı küçük mesajları register'da ve
+TCB'nin IPC tamponunda taşıyor, büyük veri transferi için
+paylaşımlı bellek yok.
+
 **Durum:** [ADR 020](adr/020-retype-semantigi.md). Bir Frame en fazla
 bir yere eşlenebilir. Sebep: revoke sırasında bir Frame'in tüm
 eşlemelerini bulmak, Frame başına bir eşleme listesi tutmayı gerektirir.
@@ -142,6 +180,10 @@ birkaç küçük servis ise hayır.
 
 ## Soru 5 — TCB 1024 bayt: IPC tamponu nerede?
 
+**Sonuç:** (b) seçildi — ADR 017: TCB **2048 bayt** oldu
+(1024 bağlam + 1024 IPC tamponu). Kernel'in ayrı bir Frame
+eşlemesi yapmasına gerek kalmıyor, IPC yolu basitleşiyor.
+
 **Durum:** [ADR 017](adr/017-nesne-kumesi.md). TCB 1024 bayt olarak
 tahmin edildi: kayıtlar + `fxsave` alanı (512 B) + zamanlayıcı durumu +
 kök cap'ler.
@@ -174,6 +216,10 @@ mesaj boyutu ~1 KiB ile sınırlanıyor. Yeterli mi?
 ---
 
 ## Soru 6 — Hangi invocation mekanizması?
+
+**Sonuç:** (a) seçildi — ADR 030. Tek bir `invoke` syscall'ı:
+RDI = CPtr, RSI = method numarası. İşlem numarası nesne tipine
+göre yorumlanıyor.
 
 **Durum:** Hiçbir ADR'de karara bağlanmadı, çünkü M8'in konusu. Ama
 nesne modelini etkiliyor, bu yüzden şimdi soruyorum.
