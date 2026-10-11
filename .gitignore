@@ -42,5 +42,20 @@ __pycache__/
 # Scratch disassembly from debugging sessions (M14).
 f1.txt
 
+# Shell scripts at the repository root.
+#
+# `git add -A` has twice staged a stray debugging script that
+# happened to be sitting here -- `riso.sh` in M15. The project's
+# scripts live in `scripts/` by convention, and this rule enforces
+# the convention rather than relying on remembering it.
+#
+# Narrow on purpose: `/*.sh` and not `*.sh`, so nested
+# `scripts/*.sh` is not touched; and `hk.sh` is unignored by name,
+# because it is the one tracked script that does belong at the
+# root. Any new tracked root script has to be added here on
+# purpose, which is the test this is for.
+/*.sh
+!/hk.sh
+
 # soak.sh keeps the first failing run here (ADR 023, K8).
 build/soak/

@@ -578,6 +578,44 @@ scripts/soak.sh 30 run-kbdisolation
 Ve rapora: **koşu sayısı ile sonuç**. "Temiz koştu" bir cümle
 değil, bir ölçüm.
 
+### K14 — Bir commit'in içeriği kasıtlıdır, dizinin anlık hali değildir
+
+M15'te iki kez `git add -A` yapıldı, ikisi de bir dizini olduğu
+gibi aldı. Birincisinde (`cc961d6`, 41 dosya) şans eseri sadece
+niyet edilen dosyalar vardı. İkincisinde (`aaeeda9`, 7 dosya) kök
+dizinde kalmış `riso.sh` — bir doğrulama script'i, projenin dosyası
+değil — commit'e girdi. İki koşunun ikincisi takip edildi.
+
+> Bir commit'in dosya listesi **kasıtlı** olmalı. `git add -A`
+> ya da `git commit -a` otomatik olarak çalıştığında, commit'in
+> içeriği çalışma dizininin o anki hali oluyor — ki bu bir hata
+> yüzeyidir, bir araç değil.
+
+Pratik karşılığı iki parça, ikisi de ucuz:
+
+1. Commit'ten önce `git status --porcelain` okunur ve **tam liste**
+   doğrulanır. Yeni dosyalar isimle, değişiklikler sayıyla.
+2. `git add -A` kullanılacaksa, dizin önce temiz tutulur:
+   geçici betikler, log'lar, deneme dosyaları commit öncesinde
+   taşınır ya da `.gitignore`'a girer. `.gitignore` burada bir
+   sigorta, politika değil — asıl politika *ne eklediğini
+   bilmek*.
+
+Üçüncü hat: bir commit'ten sonra `git log -1 --stat` ile ne
+girdiğini okumak. Bu da hata yakalamak için değil, bir sonraki
+commit için bir alışkanlık kazanmak için.
+
+İki vaka da aynı şekilde olmuştu: dizinde ilgisiz bir dosya
+*vardı*, komutun onu toplamayacağı farz edildi. Araç bunun için
+yapılmadı; işini yaptı. Alışkanlık burada tek koruyucu, ve
+alışkanlıklar yazıldığında daha güvenilir.
+
+M15'in `.gitignore` eki (`/*.sh` + `!/hk.sh`) K14'ün uygulaması
+değil, bir dayanağı: kök dizinde bir .sh daha unutulsa bile
+commit'e girmeyecek. Ama **kuralın kendisi listede değildir, kafada
+dır**: bir .gitignore gözden kaçırılabilir, bir alışkanlık
+kaçırılamaz.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -627,6 +665,9 @@ başarısız oldu.
   temiz koşu** ile gösterilir ve koşu sayısı rapora yazılır. 30,
   "on koşuda birden daha seyrek değil" demektir; daha seyrek bir
   arıza için sayı yükseltilir ve gerekçesi yazılır.
+- **K14:** Bir commit'in içeriği kasıtlıdır. `git add -A`'den önce
+  `git status --porcelain` okunur ve dosya listesi doğrulanır;
+  `.gitignore` bir sigorta, bilerek eklemek politika.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten
