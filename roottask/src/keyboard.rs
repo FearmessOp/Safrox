@@ -532,21 +532,6 @@ pub fn wire_keyboard(info: &BootInfo, component: &Component, caps: &KeyboardCaps
 pub struct Built {
     pub keyboard: Component,
     pub keyboard_caps: KeyboardCaps,
-    /// The Endpoint the two share.
-    ///
-    /// **Named here as well as in both caps structures, and that is
-    /// not a third copy of the same thing.** The `*Caps` structures
-    /// record *what was handed to a component* — the keyboard's
-    /// badged mint, the console's unbadged copy. This field records
-    /// *what the root task still holds*, which is the distinction
-    /// `kill_keyboard` rests on: it revokes everything in
-    /// `keyboard_caps` and deliberately leaves this one alone,
-    /// because the console is still waiting on it.
-    ///
-    /// Reaching it through `keyboard_caps` would compile and would
-    /// say the wrong thing: that the object belongs to the component
-    /// about to be destroyed.
-    pub endpoint: u32,
 }
 
 /// Build both components, wire them together, and start them.
@@ -623,9 +608,32 @@ pub fn build_and_start(
         return Err(result);
     }
 
-    // The isolation scenario's console reports and stops rather than
-    // serving, so there is nobody to ping.
-    if console_scenario != CONSOLE_SCENARIO_ISOLATION {
+    if console_scenario == CONSOLE_SCENARIO_ISOLATION {
+        // **Wait for the console's half before starting the
+        // keyboard**, and this is a correctness requirement rather
+        // than tidiness.
+        //
+        // The isolation console does not serve: it names an IOPort
+        // it does not hold, reports the refusal, sends once, and
+        // stops. The keyboard's half is a #PF, which ends the run
+        // the moment it happens — the kernel has no fault recovery
+        // and resuming would re-execute the faulting instruction
+        // forever.
+        //
+        // So if the keyboard faults first, the console's refusal is
+        // never reported and the scenario fails on a missing line
+        // while both components behaved exactly as intended. That
+        // is what happened: the scenario passed about two runs in
+        // three, and the one in three looked like the serial
+        // interleaving M14 chased — it was not. The line was
+        // absent, not mangled.
+        //
+        // `Recv` here is a rendezvous (ADR 033), so its return
+        // means the console has already made its attempt and said
+        // so. Not a delay, an event (ADR 023, K8).
+        let heard = invoke(slot(endpoint).0, method::RECV, 0, 0, 0, 0);
+        echo(CHANNEL | STEP_CON_READY, heard);
+    } else {
         // **Blocks until the console is receiving.** Not a delay:
         // `Send` returns when a receiver takes the message, so its
         // return means the console has mapped the framebuffer,
@@ -701,7 +709,6 @@ pub fn build_and_start(
     Ok(Built {
         keyboard,
         keyboard_caps,
-        endpoint,
     })
 }
 
@@ -781,12 +788,4 @@ pub fn isolation_scenario() -> u64 {
 /// The console scenario value that makes it try to drive an IOPort.
 pub fn console_isolation_scenario() -> u64 {
     CONSOLE_SCENARIO_ISOLATION
-}
-
-/// Receive one message on the shared Endpoint.
-///
-/// Used by `kbd-isolation`, where both components report and stop
-/// rather than serving.
-pub fn wait_for(endpoint: u32) -> u64 {
-    invoke(slot(endpoint).0, method::RECV, 0, 0, 0, 0)
 }

@@ -636,7 +636,27 @@ pub fn check_predicted_fault(cr2: u64) {
          the screen",
         cr2
     );
+
     println!("[kbd] M15 kbd-isolation checks passed");
+
+    // **Exiting from the fault handler is correct, and it is only
+    // correct because the two halves are ordered elsewhere.**
+    //
+    // There is no choice about ending the run here: the kernel has
+    // no fault recovery, and returning would re-execute the
+    // faulting instruction forever.
+    //
+    // That makes the keyboard's fault the end of the scenario, so
+    // the console's half has to have happened *first*. It does:
+    // the root task waits to receive the console's report before it
+    // resumes the keyboard (`roottask/src/keyboard.rs`), which is a
+    // rendezvous and not a delay.
+    //
+    // Without that ordering this scenario failed about one run in
+    // three, and the failure looked like the serial interleaving
+    // M14 chased — the expected line appeared to run into the next
+    // one. It was not interleaving: the line was never printed at
+    // all, because the component that prints it had not run yet.
     qemu::exit(qemu::EXIT_FAILURE);
 }
 

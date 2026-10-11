@@ -699,15 +699,21 @@ fn keyboard_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
 
     match info.scenario {
         scenario::KBD_ISOLATION => {
-            // **Both components report and stop.** The console's
-            // attempt returns `EmptySlot` and it sends; the
-            // keyboard's #PFs and never sends, which is the point —
-            // the kernel's handler is what reports that one.
+            // **Nothing to wait for here, and that moved on
+            // purpose.**
             //
-            // So exactly one message arrives here, and waiting for
-            // two would hang on a component that is supposed to be
-            // dead.
-            keyboard::wait_for(built.endpoint);
+            // The console's message is received inside
+            // `build_and_start`, before the keyboard is resumed,
+            // because the keyboard's half of this scenario is a
+            // #PF — and a #PF ends the run. If the keyboard got
+            // there first, the console's report was never printed
+            // and the test failed on a missing line while both
+            // components had behaved correctly. Roughly one run in
+            // three.
+            //
+            // Receiving here instead would block forever: the
+            // console sent once and stopped, and the keyboard
+            // never sends at all.
         }
         scenario::KBD_DRIVER_DIES => {
             // Let some keys through first, so that what dies is a

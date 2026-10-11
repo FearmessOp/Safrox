@@ -189,6 +189,40 @@ root task konsola bir mesaj gönderiyor ve `Send`'in dönmesi konsolun
 `Recv`'e ulaştığı anlamına geliyor. Süre tahmini yok, olay var
 (ADR 023, K8).
 
+### `kbd-isolation` aynı sıralamayı başka bir sebeple istiyor
+
+> **Eklendi (M15, kod yazıldıktan sonra).** Bu bölüm "ölçümü
+> bozardı" diyordu. İzolasyon senaryosunda sıralama ölçümle ilgili
+> değil, **doğruluk** ile ilgili, ve bu farkı görmek bir koşu
+> kaybına mal oldu.
+
+O senaryoda konsol servis vermiyor: tutmadığı bir IOPort'u
+adlandırıyor, `EmptySlot` alıyor, bir kez gönderiyor ve duruyor.
+Klavyenin yarısı ise bir **#PF**, ve #PF koşuyu bitiriyor — kernel'in
+fault kurtarma mekanizması yok, dönmek fault eden komutu sonsuza
+kadar yeniden çalıştırmak demek.
+
+Dolayısıyla klavye önce fault ederse konsolun reddi **hiç
+raporlanmıyor**. Test eksik bir satır yüzünden düşüyor, oysa her iki
+bileşen de tam istendiği gibi davranmış.
+
+Bu yüzden root task, izolasyon senaryosunda klavyeyi `Resume`
+etmeden önce konsolun mesajını **alıyor**. `Recv` bir rendezvous
+(ADR 033): dönmesi, konsolun denemesini yapıp söylediği anlamına
+geliyor. Yine süre değil, olay.
+
+**Belirtisi yanıltıcıydı.** Log'da beklenen satır bir sonrakiyle
+birleşmiş gibi görünüyordu, ve ilk hipotez M14'ün `print!`
+araya girme yarışıydı. Değildi: satır bozulmamıştı, **hiç
+basılmamıştı**. Tanıdık bir arızaya benzeyen bir arıza, tanıdık
+olanın teşhisini davet ediyor; ayırt eden şey log'da satırın
+*aranması* oldu — `grep` hiçbir şey bulmadı.
+
+Arıza üç koşuda bir düşüyordu, ve tek bir yeşil tam tur onu
+kapattığını sanmaya yetmişti. ADR 023'e K13 bunun için eklendi:
+kararsız bir senaryo en az 30 ardışık temiz koşu ister. Düzeltmeden
+sonra `scripts/soak.sh 40 run-kbdisolation` → 40/40.
+
 ## Elenen alternatifler
 
 **(a) Notification ile bildirim, veri paylaşımlı bellekte.** Daha

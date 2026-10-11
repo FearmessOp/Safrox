@@ -518,6 +518,66 @@ görünür.
 Bedeli: `verify`'da otuz satır ve bir `u8` dizisi. Sormamanın
 bedeli beş milestone boyunca sessiz kalan bir eksiklikti.
 
+### K13 — Kararsız bir senaryo tek koşuyla kapanmaz, ve eşik sayılıdır
+
+K8 "olayı bekle, süreyi değil" diyor ve bir cümle daha ekliyordu:
+*"kararsız bir arıza tek yeşil koşuyla kapanmaz."* Kaç koşuyla
+kapandığını söylemiyordu, ve bu üç kez pahalıya mal oldu:
+
+| Milestone | Arıza | Ne oldu |
+|---|---|---|
+| M6 | `threadtest` kararsızlığı | birkaç temiz koşudan sonra kapatıldı |
+| M14 | `print!` araya girmesi | PreemptGuard eklendi, **bir kez daha düştü**, o log sonraki koşuyla üzerine yazıldı |
+| M15 | `kbd-isolation` sıralaması | tek `make test` koşusunda geçti, raporlandı, ve sahibinin makinesinde 3'te 1 düştü |
+
+Üçü de aynı hatayı yapıyor: bir yarışın yokluğunu, onu tetiklemeyen
+bir koşuyla iddia etmek. M15'teki özellikle öğretici — ben tek bir
+`distclean`'li tam tur koştum, geçti, "73 PASS" diye raporladım.
+Arıza 3'te 1 düşüyordu, yani o koşunun geçme olasılığı 2/3'tü.
+Raporum yanlış değildi; **yetersizdi**, ve aradaki fark bir
+cümleyle kapatılabilirdi: "tek koşu bir yarışı kanıtlamaz."
+
+> Bir yarışın kapandığını iddia etmek için **en az 30 ardışık temiz
+> koşu** gerekiyor, ve koşu sayısı rapora yazılır.
+
+### Neden 30
+
+Gözlemlenen düşme oranı üzerinden. Bir arıza her koşuda bağımsız
+olarak *p* olasılıkla düşüyorsa, *n* temiz koşunun olasılığı
+`(1-p)^n`:
+
+| p | 10 koşu | 30 koşu | 50 koşu |
+|---|---|---|---|
+| 1/3 (M15) | %1,7 | %0,0005 | — |
+| 1/10 | %35 | %4,2 | %0,5 |
+| 1/25 (M14) | %66 | **%29** | %13 |
+
+M14'ün arızası dört suite koşusunda bir görünüyordu. Tablo neden
+sekiz izole koşunun hiçbir şey kanıtlamadığını gösteriyor: %72
+ihtimalle zaten geçecekti.
+
+30, 1/10 ve daha sık arızalar için rahatlıkla yeterli (%4 yanlış
+pozitif) ve 1/25 için yetersiz. Yani **seçilen sayı değil, seçilen
+kapsam**: 30 koşu "bu arıza en az on koşuda bir düşmüyor" diyor,
+"hiç düşmüyor" demiyor.
+
+Bunu bilerek yazıyorum, çünkü alternatif sonsuz koşu. Daha seyrek
+bir arızadan şüpheleniliyorsa sayı yukarı çekilir ve **neden
+çekildiği** yazılır — M14'ünki bugün olsa 100 isterdi.
+
+### Pratik karşılığı
+
+`scripts/soak.sh` bunun için var: ilk kırmızıda duruyor ve seri
+logu saklıyor. M14'te ilk teşhis denemesi *sonraki koşunun* logunu
+okuyup "üretilemiyor" demişti; üretilebiliyordu, log değişmişti.
+
+```
+scripts/soak.sh 30 run-kbdisolation
+```
+
+Ve rapora: **koşu sayısı ile sonuç**. "Temiz koştu" bir cümle
+değil, bir ölçüm.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -563,6 +623,10 @@ başarısız oldu.
 - **K12:** Bir doğrulama, doğruladığı şeyin tamamını okumalı.
   Yalnızca kendi yazdığı alana bakan bir `verify`, yazılmamış
   alanların yokluğunu kanıtlayamaz.
+- **K13:** Kararsız bir senaryonun düzeldiği, en az **30 ardışık
+  temiz koşu** ile gösterilir ve koşu sayısı rapora yazılır. 30,
+  "on koşuda birden daha seyrek değil" demektir; daha seyrek bir
+  arıza için sayı yükseltilir ve gerekçesi yazılır.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten
