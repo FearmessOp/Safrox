@@ -3,7 +3,10 @@
 Safrox — a capability-based microkernel and operating system,
 written in Rust.
 
-![Safrox running](assets/screenshot.png)
+<!-- The image is held out until the file exists. A broken-image
+     icon on the first screen of the repository is worse than
+     silence here. See assets/.gitkeep. -->
+<!-- ![Safrox running](assets/screenshot.png) -->
 
 Safrox is an x86-64 kernel that boots on QEMU through Limine. The
 kernel manages memory, scheduling, and the capability system that
@@ -34,18 +37,28 @@ short on purpose.
 |---|---|
 | Acceptance scenarios (all passing) | 72 |
 | Architecture Decision Records | 56 |
-| Commits (each one passes `make test`) | 27 |
-| Rust source, kernel + user components | 55,025 lines |
+| Kernel, excluding tests (the trusted base) | 28,471 lines |
+| Tests, running inside QEMU | 19,088 lines |
 
-Commands used to measure, respectively:
+**The commit count is deliberately not in the table**: it moves
+every commit and a number that is stale half the time is worse
+than a command the reader can run. For the same reason the two
+line counts above are what they are *today* and the measurement
+below is what makes them tomorrow's.
 
 ```
 grep -cE '^    .[a-z0-9-]+.: Expectation' scripts/run.py
 ls docs/adr/*.md | wc -l
-git log --oneline | wc -l
-find kernel/src abi/src roottask/src driver/src screen/src \
-     keyboard/src console/src -name '*.rs' | xargs wc -l
+find kernel/src abi/src -name '*.rs' ! -name '*test*' \
+     | xargs wc -l
+find kernel/src -name '*test*.rs' | xargs wc -l
+git log --oneline | wc -l       # commits
 ```
+
+The point the first two numbers make is that the surface a bug
+has to cross is small, not that the repository is large: the code
+you have to trust is the first row, and the second row is what
+makes that trust testable.
 
 ## Build and run
 
