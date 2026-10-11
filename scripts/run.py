@@ -24,13 +24,16 @@ Anything else (0, a timeout, a QEMU-internal error, a signal) is a failure.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Must stay in sync with kernel/include/qemu.h
 GUEST_EXIT_SUCCESS = 0x10
@@ -77,6 +80,36 @@ class Expectation:
     status: int
     required: list[re.Pattern[str]]
     forbidden: list[re.Pattern[str]]
+
+    # ---- M15: scenarios that type ------------------------------------
+    #
+    # Declaring `keys` is what puts a scenario on the second path
+    # (ADR 056). Everything that leaves it empty -- sixty-six
+    # scenarios as of M15 -- goes through `run_plain`, which is the
+    # code that was here before this field existed, unchanged.
+    #
+    # The split is deliberate and the reasoning is in ADR 056: Popen
+    # with a reader thread has failure modes `subprocess.run` does
+    # not (pipe close ordering, thread joins, a half-read buffer at
+    # timeout), and adding them to the risk surface of every
+    # scenario buys nothing but tidiness.
+
+    #: QMP `send-key` arguments, in order. Each entry is a list of
+    #: qcodes pressed together: `["a"]`, `["shift", "a"]`.
+    keys: list[list[str]] = field(default_factory=list)
+
+    #: The line that says the guest is ready to be typed at. Waited
+    #: for before the first key -- an event, not a delay (ADR 023,
+    #: K8).
+    ready: re.Pattern[str] | None = None
+
+    #: The line the guest prints once per key it has consumed. The
+    #: runner waits for the Nth before sending the N+1th.
+    #:
+    #: `None` means "do not pace", which `kbd-flood` wants: that
+    #: scenario is about keys arriving faster than they are taken,
+    #: and waiting for each would remove the thing under test.
+    paced_by: re.Pattern[str] | None = None
 
 
 # Lines every successful boot must carry, whatever the scenario: the kernel
@@ -3524,7 +3557,558 @@ EXPECTATIONS = {
             re.compile(r"KERNEL PANIC", re.M),
         ],
     ),
+
+    # ---- M15: the keyboard and the console ---------------------------
+    #
+    # Two of these six type, and they are the only scenarios in the
+    # file that do (ADR 056). The other four declare no keys and so
+    # take the same path every earlier scenario takes.
+
+    "kbdtest": Expectation(
+        name="keyboard and console",
+        status=STATUS_SUCCESS,
+        # `saFrox`, then left arrow, then `X`.
+        #
+        # **The sequence is chosen, not typed at random**, and every
+        # part of it is an acceptance criterion:
+        #
+        #   s a      plain keys, the baseline
+        #   shift+f  a modifier held: 'F' and not 'f'
+        #   r        the *next* key unshifted, which is the only
+        #            evidence that the shift release was processed
+        #   o x      more plain keys, so a one-off is not a pattern
+        #   left     an extended key (0xE0 0x4B): the console moves
+        #            the cursor rather than drawing
+        #   shift+x  lands on the cell the arrow moved back to,
+        #            overwriting the 'x' with 'X'
+        #
+        # The kernel names the same expectation in
+        # kernel/src/kbdtest.rs as EXPECTED. Two files agreeing by
+        # hand is the hazard ADR 047 recorded; there is no channel
+        # from the harness into the guest, and inventing one for the
+        # tests is what this project keeps refusing to do.
+        keys=[
+            ["s"],
+            ["a"],
+            ["shift", "f"],
+            ["r"],
+            ["o"],
+            ["x"],
+            ["left"],
+            ["shift", "x"],
+        ],
+        ready=re.compile(
+            r"^\[kbd\] the keyboard is ready; the harness may inject keys now",
+            re.M,
+        ),
+        paced_by=re.compile(r"^\[kbd\] the console has taken \d+ key\(s\)", re.M),
+        required=[
+            *COMMON_BOOT_LINES,
+            # The console got the screen and mapped all of it.
+            re.compile(
+                r"^\[kbd\] the console mapped \d+ framebuffer page\(s\) for "
+                r"\d+x\d+x\d+ pitch \d+",
+                re.M,
+            ),
+            # Criterion 1: the characters came back.
+            re.compile(
+                r"^\[kbd\] \d+ injected keys arrived as the characters they name",
+                re.M,
+            ),
+            # Criterion 2: make and break, both halves.
+            re.compile(
+                r"^\[kbd\] the scan code decoder passed \d+ self-test cases",
+                re.M,
+            ),
+            re.compile(
+                r"^\[kbd\] a key release was decoded: the shift came back up",
+                re.M,
+            ),
+            # Criterion 3: the 0xE0 prefix.
+            re.compile(r"^\[kbd\] the 0xE0 prefix was decoded", re.M),
+            # Criterion 4: pixels read back out of the real
+            # framebuffer and matched against the font. **Zero
+            # characters verified must not pass**, which is why the
+            # count is in the pattern.
+            re.compile(
+                r"^\[kbd\] [1-9]\d* characters read back from the framebuffer "
+                r"match the font bitmap",
+                re.M,
+            ),
+            # Criterion 7: the line belongs to a component, and
+            # interrupts really arrived. A `[1-9]` rather than `\d`
+            # for the same reason.
+            re.compile(
+                r"^\[kbd\] IRQ 1 is owned by a user component; [1-9]\d* "
+                r"interrupt\(s\) delivered",
+                re.M,
+            ),
+            # Criterion 8: the measurement, with its caveat.
+            re.compile(
+                r"^\[kbd\] key-to-pixel latency over [1-9]\d* samples: \d+ "
+                r"cycles mean",
+                re.M,
+            ),
+            re.compile(
+                r"^\[kbd\] the figure is an emulated baseline, not a cost",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M15 kbd-test checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+            # The guest prints this when a key was sent and never
+            # acknowledged. Forbidden so that a run which typed into
+            # the void cannot pass on its other lines.
+            re.compile(r"^\[kbd\] no latency samples", re.M),
+            re.compile(r"^\[kbd\] no usable latency samples", re.M),
+        ],
+    ),
+
+    "kbdscroll": Expectation(
+        name="the console scrolls",
+        status=STATUS_SUCCESS,
+        # Enough newlines to push the first line off the top.
+        #
+        # The grid is 50 rows on this geometry, so 51 returns is one
+        # more than fits -- and a letter before each, because a
+        # scroll whose top row is blank proves nothing about content
+        # having moved (the check reads pixels from it).
+        keys=[key for _ in range(51) for key in (["m"], ["ret"])],
+        ready=re.compile(
+            r"^\[kbd\] the console is ready; the harness may fill the screen now",
+            re.M,
+        ),
+        paced_by=re.compile(r"^\[kbd\] the console has taken \d+ key\(s\)", re.M),
+        required=[
+            *COMMON_BOOT_LINES,
+            # Both ends read back from the glass: content moved up
+            # *and* the last row was cleared.
+            re.compile(
+                r"^\[kbd\] the screen scrolled [1-9]\d* time\(s\): the top row "
+                r"carries what was below it and the last row was cleared",
+                re.M,
+            ),
+            # The measurement, and the cell count that is the actual
+            # saving (ADR 054).
+            re.compile(
+                r"^\[kbd\] one scroll: \d+ cycles, \d+ cells repainted",
+                re.M,
+            ),
+            re.compile(
+                r"^\[kbd\] the saving against a full-screen blit is the cell "
+                r"count",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M15 kbd-scroll checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+
+    "kbdflood": Expectation(
+        name="keys faster than they are drawn",
+        status=STATUS_SUCCESS,
+        # **Unpaced, and that is the scenario.** `paced_by` is left
+        # None so the keys go out as fast as QMP accepts them, which
+        # is the condition under test: the i8042's sixteen-byte
+        # buffer against a console that is busy drawing.
+        keys=[["a"] for _ in range(64)],
+        ready=re.compile(
+            r"^\[kbd\] the console is ready; the harness may flood now",
+            re.M,
+        ),
+        paced_by=None,
+        required=[
+            *COMMON_BOOT_LINES,
+            re.compile(
+                r"^\[kbd\] [1-9]\d* characters drawn under the flood; the "
+                r"driver's batch never overflowed",
+                re.M,
+            ),
+            # Either outcome of the device queue is acceptable and
+            # the guest says which; requiring one of the two means a
+            # run that stopped reporting at all cannot pass.
+            re.compile(
+                r"^\[kbd\] the device's queue (overran \d+ time\(s\)|did not "
+                r"overrun)",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M15 kbd-flood checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            re.compile(r"EXCEPTION", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+
+    "kbdnocap": Expectation(
+        name="a keyboard with no port authority",
+        status=STATUS_SUCCESS,
+        # No keys: the component is refused before it could read one.
+        required=[
+            *COMMON_BOOT_LINES,
+            re.compile(
+                r"^\[kbd\] a keyboard component with no IOPort was refused "
+                r"with EmptySlot",
+                re.M,
+            ),
+            # **The decoder still passed its self-test**, which is
+            # what makes the refusal attributable to the missing
+            # capability rather than to a broken component.
+            re.compile(
+                r"^\[kbd\] its decoder passed its self-test, so the refusal "
+                r"is the hardware's absence",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M15 kbd-no-cap checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+
+    "kbddies": Expectation(
+        name="the keyboard dies, the console lives",
+        status=STATUS_SUCCESS,
+        required=[
+            *COMMON_BOOT_LINES,
+            # Unowned *and* masked, and the console still blocked in
+            # Recv on an Endpoint that outlived its only sender.
+            re.compile(
+                r"^\[kbd\] the keyboard's capabilities were revoked: IRQ 1 is "
+                r"unowned and masked, and the console is still waiting",
+                re.M,
+            ),
+            re.compile(r"^\[boot\] M15 kbd-driver-dies checks passed", re.M),
+        ],
+        forbidden=[
+            re.compile(r"KERNEL PANIC", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
+
+    "kbdisolation": Expectation(
+        name="neither component reaches the other's device",
+        # **35, not 33**, and the split follows M14's reasoning. The
+        # console's half is a refusal; the keyboard's half is a
+        # *fault*, and the kernel reports #PF with CR2 at the
+        # framebuffer's address. A run that exited 33 would be one
+        # where the write had quietly worked.
+        status=STATUS_PANIC,
+        required=[
+            *COMMON_BOOT_LINES,
+            # The console's half: capability model, not enforcement.
+            re.compile(
+                r"^\[kbd\] the console cannot drive the keyboard: naming an "
+                r"IOPort it does not hold returns EmptySlot",
+                re.M,
+            ),
+            # The prediction is printed before the fault, so a fault
+            # that never came is visible as a missing second line
+            # rather than as a silent pass.
+            re.compile(
+                r"^\[kbd\] expecting the keyboard component to fault at "
+                r"0x[0-9a-f]{16}",
+                re.M,
+            ),
+            # The keyboard's half: hardware protection.
+            re.compile(
+                r"^\[kbd\] the keyboard component took a #PF at 0x[0-9a-f]{16}, "
+                r"the address the console maps the framebuffer at",
+                re.M,
+            ),
+            re.compile(r"^\[kbd\] M15 kbd-isolation checks passed", re.M),
+        ],
+        forbidden=[
+            # The handler prints this when CR2 and the prediction
+            # disagree -- M14's pattern, for M14's reason: requiring
+            # the positive and forbidding the negative means a change
+            # that stops printing either cannot pass by silence.
+            re.compile(r"^\[kbd\] the keyboard component announced", re.M),
+            POISON_IN_REGISTERS,
+        ],
+    ),
 }
+
+
+# ---- Running QEMU ------------------------------------------------------
+#
+# Two paths, and the split is ADR 056's. `run_plain` is what this
+# script has always done; `run_with_keys` exists only for scenarios
+# that type.
+
+
+def run_plain(
+    cmd: list[str], timeout: float
+) -> tuple[str, int | None, bool]:
+    """Boot, collect, decode. The original path, unchanged.
+
+    Sixty-six of the seventy-two scenarios come through here. It is
+    left alone on purpose (ADR 056): a regression in one of them
+    cannot be caused by M15, because M15 did not touch this.
+    """
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        return (
+            completed.stdout.decode("utf-8", errors="replace"),
+            completed.returncode,
+            False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return (exc.stdout or b"").decode("utf-8", errors="replace"), None, True
+
+
+class _Serial:
+    """The guest's serial output, as it arrives.
+
+    A thread rather than a non-blocking read: the runner has to watch
+    for a line *while* QEMU keeps writing, and a pipe that nobody
+    drains fills its buffer and blocks the guest. The thread's only
+    job is to keep the pipe empty and hand the bytes over.
+    """
+
+    def __init__(self, stream) -> None:
+        self._chunks: list[str] = []
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._pump, args=(stream,), daemon=True
+        )
+        self._thread.start()
+
+    def _pump(self, stream) -> None:
+        while True:
+            chunk = stream.read(1)
+            if not chunk:
+                return
+            with self._lock:
+                self._chunks.append(chunk.decode("utf-8", errors="replace"))
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(self._chunks)
+
+    def wait_for(self, pattern: re.Pattern[str], deadline: float) -> bool:
+        """Block until the pattern appears, or the deadline passes."""
+        while time.monotonic() < deadline:
+            if pattern.search(self.text()):
+                return True
+            time.sleep(0.01)
+        return False
+
+    def count(self, pattern: re.Pattern[str]) -> int:
+        return len(pattern.findall(self.text()))
+
+    def wait_for_count(
+        self, pattern: re.Pattern[str], count: int, deadline: float
+    ) -> bool:
+        while time.monotonic() < deadline:
+            if self.count(pattern) >= count:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
+
+
+class _Qmp:
+    """A QMP client over TCP.
+
+    TCP and not a unix socket, so the script behaves the same from
+    WSL and from Windows (ADR 056).
+    """
+
+    def __init__(self, port: int, deadline: float) -> None:
+        self._socket = None
+        last: OSError | None = None
+        while time.monotonic() < deadline:
+            try:
+                self._socket = socket.create_connection(
+                    ("127.0.0.1", port), timeout=5
+                )
+                break
+            except OSError as exc:
+                # QEMU may not have bound the port yet. Retrying
+                # until a deadline rather than sleeping a fixed
+                # amount first: the event is the connection.
+                last = exc
+                time.sleep(0.05)
+        if self._socket is None:
+            raise RuntimeError(f"could not connect to QMP on port {port}: {last}")
+
+        self._file = self._socket.makefile("rwb")
+        self._file.readline()  # the greeting
+        self.execute("qmp_capabilities")
+
+    def execute(self, command: str, **arguments) -> dict:
+        message: dict = {"execute": command}
+        if arguments:
+            message["arguments"] = arguments
+        self._file.write((json.dumps(message) + "\n").encode())
+        self._file.flush()
+        while True:
+            line = self._file.readline()
+            if not line:
+                raise RuntimeError(f"QMP closed while waiting for {command}")
+            reply = json.loads(line)
+            # Events (RESET, SHUTDOWN, ...) arrive interleaved and
+            # are not the answer to anything.
+            if "return" in reply or "error" in reply:
+                return reply
+
+    def send_key(self, keys: list[str]) -> dict:
+        return self.execute(
+            "send-key", keys=[{"type": "qcode", "data": key} for key in keys]
+        )
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+            self._socket.close()
+        except OSError:
+            pass
+
+
+def _qmp_port(name: str) -> int:
+    """A port of this scenario's own.
+
+    Derived from the name rather than fixed, so two scenarios running
+    at once cannot collide. `make -j` does exactly that.
+
+    A checksum of the bytes and **not** `hash()`: Python seeds string
+    hashing per process, so the same scenario would get a different
+    port on every run and a port conflict would be unreproducible --
+    failing on one run, passing on the next, with nothing in the log
+    to say which port it had been.
+    """
+    checksum = 0
+    for byte in name.encode():
+        checksum = (checksum * 31 + byte) & 0xFFFF
+    return 45000 + checksum % 2000
+
+
+def run_with_keys(
+    cmd: list[str], timeout: float, expect: Expectation
+) -> tuple[str, int | None, bool]:
+    """Boot, wait to be told the guest is ready, then type.
+
+    The second path, and only scenarios declaring `keys` take it.
+
+    Every wait here is for an **event** and not a duration (ADR 023,
+    K8): the guest says it is ready, and then says it has taken each
+    key. The deadlines exist so that a broken guest fails instead of
+    hanging, not as a substitute for the events.
+    """
+    port = _qmp_port(expect.name)
+    cmd = [*cmd, "-qmp", f"tcp:127.0.0.1:{port},server=on,wait=off"]
+
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    serial = _Serial(process.stdout)
+    deadline = time.monotonic() + timeout
+    qmp: _Qmp | None = None
+
+    try:
+        if expect.ready is not None and not serial.wait_for(expect.ready, deadline):
+            # No keys are sent. The guest will then fail its own
+            # checks and say why, which is a better message than
+            # anything this script could invent -- and if it hangs,
+            # the timeout below reports that instead.
+            print(
+                f"[run] the guest never printed /{expect.ready.pattern}/; "
+                f"sending no keys",
+                file=sys.stderr,
+            )
+        else:
+            qmp = _Qmp(port, deadline)
+            for index, keys in enumerate(expect.keys, start=1):
+                # **A guest that has already finished is not an
+                # error.** `kbd-scroll` sends more keys than it
+                # strictly needs — the screen is full before the
+                # last few — so the guest runs its checks and exits
+                # while the runner is still typing. QEMU then drops
+                # the QMP connection, and sending into it raises.
+                #
+                # Caught rather than prevented: knowing in advance
+                # how many keys are "enough" means the harness
+                # computing the console's row count, which is the
+                # guest's business and would be a second place to
+                # get it wrong.
+                if process.poll() is not None:
+                    print(
+                        f"[run] the guest exited after {index - 1} key(s); "
+                        f"the rest were not needed"
+                    )
+                    break
+
+                try:
+                    reply = qmp.send_key(keys)
+                except (OSError, RuntimeError):
+                    print(
+                        f"[run] QMP closed while sending key {index}; "
+                        f"the guest has exited"
+                    )
+                    break
+
+                if "error" in reply:
+                    raise RuntimeError(f"send-key {keys} refused: {reply['error']}")
+
+                # **Wait for the guest to say it took this one.**
+                #
+                # `{'return': {}}` means QEMU accepted the command,
+                # not that a scan code reached the guest -- the
+                # distinction scripts/m15-spike/ exists to settle.
+                # The guest's own line is the only evidence.
+                if expect.paced_by is not None and not serial.wait_for_count(
+                    expect.paced_by, index, deadline
+                ):
+                    print(
+                        f"[run] the guest did not acknowledge key {index} "
+                        f"({keys}); continuing so that its own checks can "
+                        f"report what went wrong",
+                        file=sys.stderr,
+                    )
+                    break
+
+        # From here it is the guest's turn: it runs its checks and
+        # exits through isa-debug-exit.
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            timed_out = True
+    finally:
+        if qmp is not None:
+            qmp.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        # The pump thread ends when the pipe closes, which the kill
+        # above guarantees. Joined so that `text()` below sees
+        # everything rather than a prefix.
+        serial.join(5)
+        if process.stdout is not None:
+            process.stdout.close()
+
+    return serial.text(), (None if timed_out else process.returncode), timed_out
 
 
 def parse_args() -> argparse.Namespace:
@@ -3582,21 +4166,13 @@ def main() -> int:
     print(f"[run] {expect.name}: {' '.join(cmd)}")
     started = time.monotonic()
 
-    try:
-        completed = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=args.timeout,
-            check=False,
-        )
-        output = completed.stdout.decode("utf-8", errors="replace")
-        status = completed.returncode
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or b"").decode("utf-8", errors="replace")
-        status = None
-        timed_out = True
+    # **The fork, and it is one line** (ADR 056). A scenario that
+    # declares no keys cannot tell that `run_with_keys` was written.
+    if expect.keys:
+        print(f"[run] injecting {len(expect.keys)} key(s) over QMP")
+        output, status, timed_out = run_with_keys(cmd, args.timeout, expect)
+    else:
+        output, status, timed_out = run_plain(cmd, args.timeout)
 
     elapsed = time.monotonic() - started
 

@@ -1104,3 +1104,152 @@ run-fbmisuse: $(ISO_FBMISUSE)
 	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_FBMISUSE) --expect fbmisuse -- $(QEMU_FLAGS)
 
 test: run-fbtest run-fbnocap run-fboob run-fbmisuse
+
+
+
+# ---- M15: the keyboard and the console --------------------------------
+#
+# Appended, as every milestone's block is (ADR 023, K7).
+#
+# Two more user components, and the dependency graph widens again
+# rather than deepening:
+#
+#     serial-driver.bin ─┐
+#     screen.bin ────────┤
+#     keyboard.bin ──────┼─> roottask.bin -> kernel.elf
+#     console.bin ───────┘
+#
+# All four are embedded in the root task with `include_bytes!`, for
+# the reason M13 gave: the kernel has no ELF loader and must not grow
+# one (ADR 043).
+#
+# Like the screen's, each of these builds emits a second file beside
+# its image — the byte offset of the word the root task patches,
+# read out of the symbol table. The keyboard's is its scenario
+# number, the console's is its geometry struct.
+
+KEYBOARD_BIN  := $(BUILD_DIR)/keyboard.bin
+KEYBOARD_SCEN := $(BUILD_DIR)/keyboard-scenario-offset
+CONSOLE_BIN   := $(BUILD_DIR)/console.bin
+CONSOLE_GEOM  := $(BUILD_DIR)/console-geometry-offset
+
+# Listed rather than globbed, for the reason every other component's
+# source list is: a glob picks up editor backups and misses a file
+# added in a subdirectory.
+#
+# `keyboard/src/scancode.rs` is named because it is where the scan
+# code decoding lives, and a change to it that did not rebuild would
+# be a driver decoding keys by a rule the source no longer states.
+KEYBOARD_SRCS := keyboard/src/main.rs keyboard/src/scancode.rs \
+                 keyboard/link.ld keyboard/Cargo.toml abi/src/lib.rs
+
+CONSOLE_SRCS  := console/src/main.rs console/src/font.rs \
+                 console/link.ld console/Cargo.toml abi/src/lib.rs
+
+$(KEYBOARD_BIN): $(KEYBOARD_SRCS)
+	@echo "  CARGO   keyboard"
+	@bash scripts/build-keyboard.sh
+
+$(KEYBOARD_SCEN): $(KEYBOARD_BIN)
+
+$(CONSOLE_BIN): $(CONSOLE_SRCS)
+	@echo "  CARGO   console"
+	@bash scripts/build-console.sh
+
+$(CONSOLE_GEOM): $(CONSOLE_BIN)
+
+keyboard: $(KEYBOARD_BIN)
+console: $(CONSOLE_BIN)
+
+# The root task embeds both. Appended as a further rule for the same
+# target rather than edited into M13's or M14's: make expands a
+# prerequisite list when it *parses* the rule, so these variables have
+# to be defined above the line that names them. They are, forty lines
+# up — and the silent failure that taught this is recorded in M12's
+# block.
+$(ROOTTASK_BIN): $(KEYBOARD_BIN) $(KEYBOARD_SCEN) $(CONSOLE_BIN) $(CONSOLE_GEOM)
+
+# And clippy, which compiles kernel/src/main.rs, which reaches the
+# root task image, which reaches these. Added in the same breath
+# rather than after `make distclean && make test` finds it (ADR 023,
+# K9) — M13 needed a follow-up commit for exactly this edge.
+clippy: $(KEYBOARD_BIN) $(KEYBOARD_SCEN) $(CONSOLE_BIN) $(CONSOLE_GEOM)
+
+ISO_KBDTEST      := $(BUILD_DIR)/safrox-kbdtest.iso
+ISO_KBDNOCAP     := $(BUILD_DIR)/safrox-kbdnocap.iso
+ISO_KBDDIES      := $(BUILD_DIR)/safrox-kbddies.iso
+ISO_KBDFLOOD     := $(BUILD_DIR)/safrox-kbdflood.iso
+ISO_KBDISOLATION := $(BUILD_DIR)/safrox-kbdisolation.iso
+ISO_KBDSCROLL    := $(BUILD_DIR)/safrox-kbdscroll.iso
+
+ALL_ISOS += $(ISO_KBDTEST) $(ISO_KBDNOCAP) $(ISO_KBDDIES) \
+            $(ISO_KBDFLOOD) $(ISO_KBDISOLATION) $(ISO_KBDSCROLL)
+
+.PHONY: keyboard console
+.PHONY: run-kbdtest run-kbdnocap run-kbddies run-kbdflood
+.PHONY: run-kbdisolation run-kbdscroll
+
+# Entry indices into boot/limine.conf.in, which had 66 entries before
+# M15 appended six.
+$(ISO_KBDTEST): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,67)
+
+$(ISO_KBDNOCAP): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,68)
+
+$(ISO_KBDDIES): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,69)
+
+$(ISO_KBDFLOOD): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,70)
+
+$(ISO_KBDISOLATION): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,71)
+
+$(ISO_KBDSCROLL): $(KERNEL) $(LIMINE_EXE) boot/limine.conf.in
+	$(call build_iso,$@,72)
+
+# **Five exit 33, one exits 35**, and the split follows M14's
+# reasoning exactly.
+#
+# `kbd-no-cap`, `kbd-driver-dies` and `kbd-flood` are *refusals and
+# survivals*: a component asked for what it may not have, or died,
+# or a device overran its queue. None is a kernel fault, and a
+# kernel that stopped for any of them would be one a component could
+# halt.
+#
+# `kbd-isolation` is a **fault**: the keyboard component writes to
+# the address the console mapped the framebuffer at, in an address
+# space where nothing is mapped there, and the kernel reports #PF
+# with CR2 at that address. A run that exited 33 would be one where
+# the write had quietly worked — which is the claim being tested
+# inverted.
+#
+# The console's half of that scenario is a refusal (`EmptySlot`) and
+# is reported before the keyboard faults, so one run shows both.
+
+# **`run-kbdtest` and `run-kbdscroll` inject keys**, which is the
+# only new thing in the test harness this milestone (ADR 056). The
+# `--keys` argument puts run.py on a second path: Popen, a reader
+# thread, and a QMP socket. The other sixty-five scenarios use the
+# code they always have, untouched.
+run-kbdtest: $(ISO_KBDTEST)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDTEST) --expect kbdtest -- $(QEMU_FLAGS)
+
+run-kbdnocap: $(ISO_KBDNOCAP)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDNOCAP) --expect kbdnocap -- $(QEMU_FLAGS)
+
+run-kbddies: $(ISO_KBDDIES)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDDIES) --expect kbddies -- $(QEMU_FLAGS)
+
+run-kbdflood: $(ISO_KBDFLOOD)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDFLOOD) --expect kbdflood -- $(QEMU_FLAGS)
+
+run-kbdisolation: $(ISO_KBDISOLATION)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDISOLATION) --expect kbdisolation -- $(QEMU_FLAGS)
+
+run-kbdscroll: $(ISO_KBDSCROLL)
+	@$(PYTHON) scripts/run.py --qemu "$(QEMU)" --iso $(ISO_KBDSCROLL) --expect kbdscroll -- $(QEMU_FLAGS)
+
+test: run-kbdtest run-kbdnocap run-kbddies run-kbdflood \
+      run-kbdisolation run-kbdscroll

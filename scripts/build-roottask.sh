@@ -97,7 +97,8 @@ fi
 # Eight pages, and every figure in this check's history was measured
 # rather than chosen: one in the first draft, two when the image came
 # out at 7432 bytes, four when M13 embedded the serial driver, eight
-# when M14 embedded the screen component too.
+# when M14 embedded the screen component too, twelve when M15 added
+# the keyboard and the console and the image reached 44792 bytes.
 #
 # The kernel maps exactly this many frames and the linker script
 # asserts the same bound, written down in both places so that a
@@ -105,7 +106,12 @@ fi
 # accident. M14 had to make it three times -- the `const _` in
 # kernel/src/roottask.rs carries a minimum size as well -- and all
 # three refused the build until they agreed.
-MAX=32768
+#
+# M15 made it four: this check fires before the linker's, because the
+# build script runs `ld` and then measures, so it is the one whose
+# message a person actually reads. It is also the only one that can
+# name the two files to change, which is why it does.
+MAX=49152
 SIZE=$(stat -c %s "$OUT")
 if [ "$SIZE" -gt "$MAX" ]; then
     echo "roottask image is $SIZE bytes; the kernel maps $MAX." >&2

@@ -67,6 +67,7 @@ mod io;
 mod ioapic;
 mod ipctest;
 mod irqtest;
+mod kbdtest;
 mod memory;
 mod memtest;
 mod panic;
@@ -1108,7 +1109,39 @@ extern "C" fn kmain() -> ! {
         None
     };
 
-    if let Some(which) = driver_scenario.or(fb_scenario) {
+    // M15's six.
+    //
+    // **`kbd-driver-dies` contains `driver-dies`**, and that is not
+    // a near miss — `contains` ignores word boundaries, so the M13
+    // branch above matches this milestone's token. Ordering these
+    // tests later would not help: `driver_scenario` is computed
+    // first and `.or()` prefers it.
+    //
+    // So the keyboard scenario is computed here and **takes
+    // precedence** in the `or` chain below, and the dispatch further
+    // down guards M13's branch with `!kbd_scenario.is_some()`.
+    //
+    // The same trap was paid for in M9c with a token that was a
+    // prefix of another, and the fix there was ordering because the
+    // tokens were only ever read in one place. This one is read in
+    // two, which is why ordering is not enough.
+    let kbd_scenario = if cmdline.contains("kbd-driver-dies") {
+        Some(safrox_abi::scenario::KBD_DRIVER_DIES)
+    } else if cmdline.contains("kbd-isolation") {
+        Some(safrox_abi::scenario::KBD_ISOLATION)
+    } else if cmdline.contains("kbd-no-cap") {
+        Some(safrox_abi::scenario::KBD_NO_CAP)
+    } else if cmdline.contains("kbd-scroll") {
+        Some(safrox_abi::scenario::KBD_SCROLL)
+    } else if cmdline.contains("kbd-flood") {
+        Some(safrox_abi::scenario::KBD_FLOOD)
+    } else if cmdline.contains("kbd-test") {
+        Some(safrox_abi::scenario::KBD_TEST)
+    } else {
+        None
+    };
+
+    if let Some(which) = kbd_scenario.or(driver_scenario).or(fb_scenario) {
         roottest::select_scenario(which);
     }
 
@@ -1117,6 +1150,7 @@ extern "C" fn kmain() -> ! {
         || cmdline.contains("root-dies")
         || driver_scenario.is_some()
         || fb_scenario.is_some()
+        || kbd_scenario.is_some()
         || cmdline.is_empty();
 
     if wants_root_task {
@@ -1155,7 +1189,11 @@ extern "C" fn kmain() -> ! {
         drivertest::run_hostile();
     }
 
-    if cmdline.contains("driver-dies") {
+    // **Guarded against `kbd-driver-dies`**, which contains this
+    // token. Without the guard, M15's scenario would run M13's test
+    // as well — and M13's would fail, looking like a regression in
+    // the serial driver rather than a token collision.
+    if cmdline.contains("driver-dies") && kbd_scenario.is_none() {
         println!("[boot] cmdline requested the dead-driver test");
         drivertest::run_dies();
     }
@@ -1179,6 +1217,37 @@ extern "C" fn kmain() -> ! {
     if cmdline.contains("fb-test") {
         println!("[boot] cmdline requested the framebuffer tests");
         fbtest::run();
+    }
+
+    // M15. Longer tokens first, as above.
+    if cmdline.contains("kbd-driver-dies") {
+        println!("[boot] cmdline requested the dead-keyboard test");
+        kbdtest::run_driver_dies();
+    }
+
+    if cmdline.contains("kbd-isolation") {
+        println!("[boot] cmdline requested the keyboard isolation test");
+        kbdtest::run_isolation();
+    }
+
+    if cmdline.contains("kbd-no-cap") {
+        println!("[boot] cmdline requested the no-keyboard-capability test");
+        kbdtest::run_no_cap();
+    }
+
+    if cmdline.contains("kbd-scroll") {
+        println!("[boot] cmdline requested the console scroll test");
+        kbdtest::run_scroll();
+    }
+
+    if cmdline.contains("kbd-flood") {
+        println!("[boot] cmdline requested the keyboard flood test");
+        kbdtest::run_flood();
+    }
+
+    if cmdline.contains("kbd-test") {
+        println!("[boot] cmdline requested the keyboard and console tests");
+        kbdtest::run();
     }
 
     if cmdline.contains("driver-test") {

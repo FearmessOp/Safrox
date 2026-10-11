@@ -478,6 +478,46 @@ için anlamsız.
 Bu soruyu sormanın maliyeti bir paragraf; sormamanın maliyeti M14'te
 üç ayrı hata ayıklama turu oldu.
 
+### K12 — Bir doğrulama, doğruladığı şeyin tamamını okumalı
+
+M15'te doğdu, ve K5'in donanım tarafındaki hâli.
+
+K5 diyor ki: başarısız olamayan bir test, kendi yokluğundan ayırt
+edilemez. K12 daha sinsi bir hâlini tarif ediyor — **başarısız
+olabilen ama yalnızca kendi yazdığına bakan** bir doğrulama.
+
+`ioapic::verify` M12'de yazıldı ve üç milestone boyunca her koşuda
+"bütün hatlar uyumlu" dedi. Yalan söylemiyordu: baktığı tek alan
+maske bitiydi, maske biti yazılıyordu, ve geri okunuyordu.
+
+Bir I/O APIC yönlendirme girdisi 64 bit. Kernel bunun **bir** bitini
+yazıyordu; diğer 63'ü — vektör, teslim kipi, hedef, polarite,
+tetikleme — firmware'in bıraktığı değerdeydi. Maskesi kaldırılan
+böyle bir hat hiçbir yere teslim etmiyor.
+
+M15'te ilk gerçek cihaz hattı (IRQ 1) geldiğinde kesme hiç
+ulaşmadı, ve `verify` hâlâ "hepsi uyumlu" diyordu.
+
+> Bir doğrulama, **yazdığı alanı değil, doğruladığı nesnenin
+> tamamını** okumalı. Yalnızca yazdığına bakan bir `verify`,
+> yazılmamış alanların yokluğunu kanıtlayamaz — çünkü o alanların
+> var olması gerektiğini bilmiyor.
+
+Pratik karşılığı: bir donanım yapısını doğrulayan kod, o yapının
+alan listesini kaynaktan (datasheet, SDM) alıp hepsini
+karşılaştırmalı. Atlanan her alan, "bu alan önemsiz" iddiasıdır ve
+yazılmalıdır.
+
+Düzeltilmiş hâli iki şey yapıyor: `verify` girdinin tamamını okuyor
+ve kernel'in **niyetiyle** karşılaştırıyor — niyet ayrı bir tabloda,
+çipin gölgesi olarak değil, çünkü gölge zaten kernel'in yazmak
+istediğiyle hemfikir olurdu. Ayrıca `kbdtest` çipten doğrudan
+okuyup "IRQ 1 vektör 34'te" diyor, yani iddia kabul testinde de
+görünür.
+
+Bedeli: `verify`'da otuz satır ve bir `u8` dizisi. Sormamanın
+bedeli beş milestone boyunca sessiz kalan bir eksiklikti.
+
 ## Elenen alternatifler
 
 **`#[inline(never)]` + `volatile` her yerde, kural olarak.** Fazla geniş:
@@ -520,6 +560,9 @@ başarısız oldu.
   adıyla gösterir ya "henüz yok" der; mümkünse derleyiciye söyletir.
 - **K11:** Bir kural yazıldığı bağlamı taşır. Yeni bir kaynak türüne
   genişletmeden önce gerekçesinin her cümlesi yeniden sorgulanır.
+- **K12:** Bir doğrulama, doğruladığı şeyin tamamını okumalı.
+  Yalnızca kendi yazdığı alana bakan bir `verify`, yazılmamış
+  alanların yokluğunu kanıtlayamaz.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten

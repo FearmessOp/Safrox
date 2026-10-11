@@ -821,14 +821,25 @@ fn dispatch(
         // Each test module gets first refusal on the channel, in
         // turn, and says whether it was theirs. The channels are
         // distinct bits (M8 uses 8, 9, 10, 16 and 17; M10 uses 20 and
-        // 21), so the order does not matter -- but asking rather than
-        // computing means a collision shows up as a report going to
-        // the wrong place rather than as a silent drop.
+        // 21; M15 adds 25 and 26), so the order does not matter --
+        // but asking rather than computing means a collision shows up
+        // as a report going to the wrong place rather than as a
+        // silent drop.
+        //
+        // **A module missing from this chain is silent**, and M15
+        // found out how silent: `kbdtest` was written, its channels
+        // were allocated, and nothing called it. The compiler said
+        // so only because `-D warnings` turns an unused function
+        // into an error -- had `record_step` been `pub` and reachable
+        // some other way, the six scenarios would have run, reported
+        // nothing, and failed with "the console verified zero
+        // characters" a long way from the cause.
         if !crate::usertest::record_forge_result(cptr_bits, arg0)
             && !crate::irqtest::record_user_report(cptr_bits, arg0)
             && !crate::vspaceuser::record_step(cptr_bits, arg0)
             && !crate::drivertest::record_step(cptr_bits, arg0)
             && !crate::fbtest::record_step(cptr_bits, arg0)
+            && !crate::kbdtest::record_step(cptr_bits, arg0)
             && !crate::roottest::record_step(cptr_bits, arg0)
         {
             crate::usertest::record_report(cptr_bits, arg0, kernel_rsp);

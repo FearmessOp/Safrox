@@ -284,3 +284,136 @@ aynı şeyi yapmak, cihaz mantığını kernel'e sokmak demek.
   istediğine karar edebildiği bir kesme (K8).
 - Maskeleme şimdilik **yazılım bayrağı**; gerçek IOAPIC maskelemesi
   M12'de gelir ve sözleşme değişmez, uygulayan katman değişir.
+
+---
+
+## Ek (M15): yol dört adım değil, beş — yönlendirme eksikti
+
+> Bu bölüm eklendi, üstteki metin değiştirilmedi (ADR 023, K7).
+> Yukarıda yazılanlar yanlış değil; **eksik**.
+
+Bu ADR'nin son satırı şunu söylüyordu:
+
+> *"Maskeleme şimdilik yazılım bayrağı; gerçek IOAPIC maskelemesi
+> M12'de gelir ve sözleşme değişmez, uygulayan katman değişir."*
+
+Maskeleme geldi. **Yönlendirme gelmedi, ve kimse farkına varmadı.**
+
+### Olgu
+
+Bir I/O APIC yönlendirme girdisi 64 bit: vektör, teslim kipi, hedef
+kipi, polarite, tetikleme kipi, hedef CPU, ve maske biti. M12'den
+M14'e kadar bu kernel **yalnızca maske bitini** yazdı. Diğer
+alanlar firmware'in bıraktığı değerde kaldı.
+
+Maskesi kaldırılan böyle bir girdi, tanımsız bir vektörü tanımsız
+bir CPU'ya teslim etmeye çalışıyor. QEMU'da sonuç: hiçbir şey
+gelmiyor.
+
+### Neden beş milestone boyunca görünmedi
+
+Çünkü hiçbir şey çipi kullanmamıştı.
+
+- **M10'un kesme testleri self-IPI ile çalışıyor.** `ioapic::init`
+  bunu kendi çıktısında söylüyor: *"irq-test raises interrupts with
+  a self-IPI, which goes LAPIC-to-CPU and does not pass through this
+  chip."* O senaryolar gerçek bir kesme üretiyor ama I/O APIC'e hiç
+  uğramıyor.
+- **M13'ün seri sürücüsü IRQ 4'ü sahipleniyor**, ve senaryoları
+  veri yolunu sınıyor — kesme ile gelen bir baytı değil.
+- **IRQ 1, bu kernel'in teslim etmek zorunda kaldığı ilk gerçek
+  cihaz hattı**, ve M15'te geldi.
+
+Belirtisi şuydu: klavye bileşeni sağlıklı başlıyor, i8042'nin durum
+register'ını okuyor (0x1C — gerçek bir değer), `IRQ_SET_NOTIFICATION`
+ve `Ack` başarılı dönüyor, "hazırım" diyor, ve sonra sonsuza kadar
+bekliyor. Tuşlar QEMU'ya enjekte ediliyor, cihaz hattı yükseltiyor,
+ve hiçbir şey olmuyor.
+
+### Karar: hat, **sahiplenildiğinde** yönlendirilir
+
+`IRQControl.Get` artık girdinin tamamını yazıyor:
+
+| Alan | Değer | Neden |
+|---|---|---|
+| Vektör | `IRQ_VECTOR_BASE + irq` | Kernel'in zaten ilan ettiği sözleşme |
+| Teslim kipi | Fixed | Diğerleri (SMI, NMI, INIT) vektörü yok sayıyor |
+| Hedef kipi | Physical | Mantıksal hedef şeması yok |
+| Polarite | Active high | ISA varsayımı — aşağıya bak |
+| Tetikleme | Edge | ISA varsayımı — aşağıya bak |
+| Hedef | LAPIC 0 | Tek CPU (`hardware-todo.md` madde 7) |
+| Maske | **Set** | Değişmedi: `Ack` açıyor |
+
+**`ioapic::init`'te değil, `IRQControl.Get`'te**, ve bu capability
+modelinin donanıma yansıması: sahipsiz bir hattın teslim edecek
+yeri yok, dolayısıyla ona vektör yazmak var olmayan bir bileşen
+adına donanım yapılandırmaktır. Sahiplenilmemiş hat maskeli ve
+yönlendirilmemiş kalıyor.
+
+Maske biti `route`'un yazdığı değerde de set. Yani sıralama
+değişmiyor: hat sahiplenildiğinde kapalı, `Ack` ile açılıyor.
+
+### M15'in iddiası bu yüzden daraldı
+
+M15 "kernel'e yeni mekanizma eklenmedi" diye başlamıştı. Doğrusu:
+
+- **Yeni nesne tipi yok, yeni syscall yok, yeni metot numarası yok.**
+  Klavye, M13'ün desenini ikinci bir cihaza çevirmekten ibaret.
+- **Ama bu ADR'nin tarif ettiği kesme yolu eksikti ve tamamlandı.**
+  Kernel artık yönlendirme girdisi yazıyor, ki bu yeni bir kernel
+  davranışı.
+
+İkincisini gizlemek, M13'ün "sürücü kernel'den çıktı" iddiasını
+kernel'de kalan register sayısıyla ölçme alışkanlığına aykırı
+olurdu.
+
+### Borç: ISA varsayımı
+
+Polarite ve tetikleme kipinin yetkili kaynağı ACPI'nin MADT
+tablosu, özellikle Interrupt Source Override girdileri. Bu kernel
+MADT okumuyor.
+
+QEMU'nun q35'inde IRQ 1 için tipik olarak bir override yok —
+override'lar genellikle IRQ 0→GSI 2 ve SCI için. Yani varsayım
+burada muhtemelen yalnızca "çalışıyor" değil, doğru. Bu borcu
+küçültüyor, kaldırmıyor: UEFI ile boot eden ya da hattı farklı
+kablolayan bir makinede yanlış yapılandırılır, ve level-triggered
+bir hattı edge sanmak eksik kesme değil **kesme fırtınası**
+demek.
+
+`docs/hardware-todo.md` madde 13.
+
+### Doğrulama da eksikti, ve bu ayrı bir ders
+
+`ioapic::verify` her hattı kontrol ediyordu ve her koşuda "hepsi
+uyumlu" diyordu. **Doğru söylüyordu:** yazdığı tek bit geri
+okunuyordu. Yazılmayan alanlara bakmıyordu.
+
+Bir guard yalnızca kendi yazdığını doğruluyorsa, yazmadığı şeyin
+yokluğunu göremez. ADR 023'e K12 olarak eklendi.
+
+`verify` artık sahiplenilmiş her hattın girdisinin tamamını okuyor:
+vektör, teslim/hedef/polarite/tetikleme bitleri, ve hedef CPU.
+Kernel'in *niyetiyle* karşılaştırıyor — niyeti ayrı bir tabloda
+tutuluyor, çipin gölgesi olarak değil, çünkü gölge zaten kernel'in
+ne yazmak istediğiyle hemfikir olurdu.
+
+Ayrıca `kbdtest` çipten doğrudan okuyor ve "IRQ 1 vektör 34'te,
+maskesi açık" diyor — kesmelerin geldiği gerçeğinin *yanında*,
+**neden** geldiğinin kanıtı olarak. Bir sonraki arıza artık
+"maskeli", "yanlış vektör" ve "cihaz bir şey söylemedi" arasında
+ayrım yapabiliyor.
+
+### Ölçülen
+
+```
+[kbd] IRQ 1 is owned by a user component; 18 interrupt(s) delivered,
+      19 acked, 0 orphaned
+[kbd] the I/O APIC has IRQ 1 on vector 34, unmasked, fixed delivery
+      to LAPIC 0, edge triggered and active high -- read back from
+      the chip, not from what the kernel meant to write
+[kbd] 1 routing write(s) and 38 mask write(s) reached the chip
+```
+
+Bir yönlendirme yazması: tek sahiplenilen hat. Otuz sekiz maske
+yazması: ilklendirmedeki 24 artı her `Ack`.

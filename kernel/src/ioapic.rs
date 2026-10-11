@@ -50,7 +50,7 @@
 //! Controller datasheet, sections 3.2 (register access) and 3.2.4
 //! (the redirection table).
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::memory::{PhysAddr, VirtAddr};
 use crate::println;
@@ -88,6 +88,61 @@ const REG_REDIR_BASE: u32 = 0x10;
 /// Reference: 82093AA datasheet, 3.2.4, "Interrupt Mask".
 const REDIR_MASKED: u32 = 1 << 16;
 
+// ---- The rest of a redirection entry -----------------------------------
+//
+// A redirection entry is 64 bits across two consecutive registers,
+// and until M15 this module wrote exactly one of those bits. The
+// others carry where the interrupt goes and how the line behaves,
+// and leaving them at whatever the firmware left behind means
+// unmasking an entry that delivers vector 0 to nobody.
+//
+// Reference throughout: 82093AA I/O APIC datasheet, 3.2.4,
+// "I/O Redirection Table Registers"; Intel SDM Vol. 3A, 11.5.1 for
+// the delivery modes the local APIC accepts.
+
+/// Delivery mode, bits 10:8. **000 = Fixed**: deliver the vector in
+/// bits 7:0 to the processors named by the destination field.
+///
+/// The alternatives are for things this kernel does not do — SMI,
+/// NMI, INIT and ExtINT all ignore the vector field, and Lowest
+/// Priority picks a CPU by TPR, which needs more than one CPU to
+/// mean anything (`hardware-todo.md` item 7).
+const REDIR_DELIVERY_FIXED: u32 = 0b000 << 8;
+
+/// Destination mode, bit 11. **0 = Physical**: the destination field
+/// is a LAPIC ID rather than a logical bitmask.
+///
+/// Physical because the kernel addresses the boot CPU by its ID and
+/// has no logical destination scheme to address it by.
+const REDIR_DEST_PHYSICAL: u32 = 0 << 11;
+
+/// Polarity, bit 13. **0 = active high.**
+///
+/// The ISA default, and an assumption: the authoritative answer is
+/// in ACPI's MADT, in the Interrupt Source Override entries, which
+/// this kernel does not read. `hardware-todo.md` item 13.
+const REDIR_ACTIVE_HIGH: u32 = 0 << 13;
+
+/// Trigger mode, bit 15. **0 = edge triggered.**
+///
+/// Also the ISA default and also an assumption; the same MADT
+/// entries carry the real answer. Edge matters here beyond
+/// correctness: a level-triggered line that is never de-asserted
+/// re-fires forever, so getting this wrong on real hardware is an
+/// interrupt storm rather than a missing interrupt.
+const REDIR_EDGE: u32 = 0 << 15;
+
+/// The CPU interrupts are delivered to.
+///
+/// Zero: the boot processor, which is the only one this kernel
+/// starts. The single-CPU assumption is already recorded as debt
+/// (`hardware-todo.md` item 7) and this is one more place it is
+/// built in.
+///
+/// In physical destination mode this is a LAPIC ID, and it goes in
+/// bits 59:56 of the entry — the **high** dword's bits 27:24.
+const REDIR_DESTINATION: u32 = 0;
+
 /// Virtual address of the register window, once mapped.
 static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -102,9 +157,36 @@ static REDIRECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// stops that, and [`verify`] is the other half.
 static MASK_WRITES: AtomicU64 = AtomicU64::new(0);
 
+/// How many lines this module tracks the routing of.
+///
+/// A bound on the table below, not on the hardware: a chip
+/// reporting more entries than this simply has the extra ones
+/// unverified, rather than this writing past an array.
+const MAX_LINES: usize = 32;
+
+/// Redirection entries pointed at a vector (M15).
+static ROUTE_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// What vector each line was routed to, as the kernel intended.
+///
+/// **Deliberately not a shadow of the hardware.** A shadow would
+/// agree with what the kernel meant to write, which is exactly the
+/// thing [`verify`] exists to doubt. This records the intent so
+/// that `verify` has something to hold the chip's own answer
+/// against; the two disagreeing is the finding.
+///
+/// Zero means "not routed". Vector 0 is #DE and no line is ever
+/// pointed at it, so the sentinel cannot collide with a real value.
+static ROUTED_VECTOR: [AtomicU8; MAX_LINES] = [const { AtomicU8::new(0) }; MAX_LINES];
+
 /// Whether the chip was found and initialised.
 pub fn present() -> bool {
     IOAPIC_BASE.load(Ordering::Acquire) != 0
+}
+
+/// How many redirection entries have been pointed at a vector.
+pub fn route_writes() -> u64 {
+    ROUTE_WRITES.load(Ordering::Acquire)
 }
 
 /// How many redirection entries the chip has.
@@ -153,6 +235,89 @@ unsafe fn write(register: u32, value: u32) {
 /// The register number of a line's low dword.
 const fn redirection_register(irq: u8) -> u32 {
     REG_REDIR_BASE + (irq as u32) * 2
+}
+
+/// Point a line at its vector, leaving it masked.
+///
+/// **This was missing until M15, and the hole was invisible for
+/// five milestones.** `set_masked` writes bit 16 and nothing else,
+/// so an entry's vector, delivery mode and destination stayed at
+/// whatever the firmware left. Unmasking such an entry opens a line
+/// that delivers an undefined vector to an undefined CPU — in QEMU,
+/// nothing arrives at all.
+///
+/// Nothing caught it because nothing had used the chip. M10's
+/// interrupt tests raise their interrupts with a self-IPI, which
+/// goes LAPIC-to-CPU and never passes through here (the note
+/// `init` prints says so). M13's serial driver owns IRQ 4 but its
+/// scenarios exercise the write path rather than the line. IRQ 1,
+/// in M15, is the first real device line this kernel has had to
+/// deliver.
+///
+/// # Called from `IRQControl.Get`, not from `init`
+///
+/// A line is routed when it is **claimed**, not when the chip is
+/// found. That follows the capability model: an unowned line has
+/// nowhere to deliver, and writing a vector for it would be
+/// configuring hardware on behalf of a component that does not
+/// exist. ADR 041 starts a claimed line masked for the same reason
+/// and this is the other half of that step.
+///
+/// The entry stays masked here. `Ack` opens it, once the driver has
+/// bound a Notification and is ready to receive (ADR 042).
+///
+/// # What is assumed
+///
+/// Edge triggered and active high: the ISA defaults. The
+/// authoritative source is ACPI's MADT, whose Interrupt Source
+/// Override entries say when a line differs, and this kernel does
+/// not read it. For IRQ 1 on QEMU's q35 there is typically no
+/// override, so the assumption is probably not merely convenient
+/// but correct — which shrinks the debt rather than removing it.
+/// `hardware-todo.md` item 13.
+///
+/// Reference: 82093AA datasheet, 3.2.4; Intel SDM Vol. 3A, 11.5.1.
+///
+/// # Safety
+///
+/// As [`set_masked`]: interrupts must be disabled, because this
+/// writes the select/data pair the interrupt path also uses.
+pub unsafe fn route(irq: u8, vector: u8) {
+    if !present() || (irq as usize) >= redirection_count() {
+        return;
+    }
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    let low = (vector as u32)
+        | REDIR_DELIVERY_FIXED
+        | REDIR_DEST_PHYSICAL
+        | REDIR_ACTIVE_HIGH
+        | REDIR_EDGE
+        | REDIR_MASKED;
+
+    // The destination is bits 59:56 of the entry, which is bits
+    // 27:24 of the high dword.
+    let high = REDIR_DESTINATION << 24;
+
+    let register = redirection_register(irq);
+    // SAFETY: The chip is mapped and `irq` is below the reported
+    // count, so both dwords of this entry exist.
+    unsafe {
+        // **The high dword first.** Writing the low dword is what
+        // arms the entry — it carries the mask bit and the vector —
+        // so setting the destination afterwards would leave a
+        // window in which a live entry points at a destination that
+        // has not been written yet. The entry is masked here, so
+        // the window is theoretical; the order costs nothing and
+        // the habit is worth more than the instruction.
+        write(register + 1, high);
+        write(register, low);
+    }
+
+    if (irq as usize) < MAX_LINES {
+        ROUTED_VECTOR[irq as usize].store(vector, Ordering::Release);
+    }
+    ROUTE_WRITES.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Mask or unmask a line in the hardware.
@@ -305,6 +470,12 @@ pub unsafe fn verify() -> usize {
     let mut disagreements = 0usize;
     let lines = redirection_count().min(crate::cap::irq::MAX_IRQ);
 
+    // `irq` indexes the hardware's registers, the software mask
+    // table and `ROUTED_VECTOR` — three things, only one of which
+    // is an array here. `.enumerate()` over one of them would name
+    // the loop after whichever was chosen and leave the others
+    // indexed anyway.
+    #[allow(clippy::needless_range_loop)]
     for irq in 0..lines {
         let software = crate::cap::irq::is_masked(irq as u8);
         let hardware = hardware_masked(irq as u8);
@@ -317,9 +488,95 @@ pub unsafe fn verify() -> usize {
             );
             disagreements += 1;
         }
+
+        // **The rest of the entry**, for a routed line.
+        //
+        // Reading only the mask bit is what let M15's bug live for
+        // five milestones: this function reported every line in
+        // agreement, and it was telling the truth — the bit it
+        // wrote did read back. The vector, which nothing wrote, was
+        // not being looked at (ADR 023, K12).
+        let intended = if irq < MAX_LINES {
+            ROUTED_VECTOR[irq].load(Ordering::Acquire)
+        } else {
+            0
+        };
+        if intended == 0 {
+            // Not routed, so there is nothing to agree with. An
+            // unowned line's entry holds whatever the firmware left
+            // and the kernel makes no claim about it.
+            continue;
+        }
+
+        let register = redirection_register(irq as u8);
+        // SAFETY: `irq` is below the reported count, so both dwords
+        // of this entry exist; interrupts are disabled per the
+        // function's contract.
+        let (low, high) = unsafe { (read(register), read(register + 1)) };
+
+        let vector = (low & 0xFF) as u8;
+        if vector != intended {
+            println!(
+                "[ioapic] line {}: routed to vector {} but the chip \
+                 holds {}. An entry that is unmasked now delivers \
+                 somewhere nobody is listening",
+                irq, intended, vector
+            );
+            disagreements += 1;
+        }
+
+        // Delivery mode, destination mode, polarity and trigger
+        // mode, all of which `route` writes as zero. Checked as one
+        // mask rather than four comparisons: the question is
+        // whether any of them came back different, and naming which
+        // in the message is what the hex is for.
+        const CHECKED: u32 = (0b111 << 8) | (1 << 11) | (1 << 13) | (1 << 15);
+        if low & CHECKED != 0 {
+            println!(
+                "[ioapic] line {}: delivery/polarity/trigger bits are \
+                 {:#010x}, expected zero (fixed, physical, active \
+                 high, edge)",
+                irq,
+                low & CHECKED
+            );
+            disagreements += 1;
+        }
+
+        let destination = (high >> 24) & 0xFF;
+        if destination != REDIR_DESTINATION {
+            println!(
+                "[ioapic] line {}: destination is LAPIC {} and not {}",
+                irq, destination, REDIR_DESTINATION
+            );
+            disagreements += 1;
+        }
     }
 
     disagreements
+}
+
+/// Report what the chip holds for a line, for the acceptance tests.
+///
+/// Returns `(vector, masked)` read **from the hardware**, or `None`
+/// if there is no chip or no such line.
+///
+/// Exists so that a test can say "IRQ 1 is pointed at vector 34 and
+/// open" with the chip's own answer rather than the kernel's
+/// intention — the distinction [`verify`] is built on.
+///
+/// # Safety
+///
+/// Interrupts must be disabled: this reads the select/data pair.
+pub unsafe fn routing_of(irq: u8) -> Option<(u8, bool)> {
+    if !present() || (irq as usize) >= redirection_count() {
+        return None;
+    }
+    debug_assert!(!crate::sched::interrupts_enabled());
+
+    let register = redirection_register(irq);
+    // SAFETY: Bounded above; interrupts disabled per the contract.
+    let low = unsafe { read(register) };
+    Some(((low & 0xFF) as u8, low & REDIR_MASKED != 0))
 }
 
 /// Map the I/O APIC's register window.

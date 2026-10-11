@@ -1,0 +1,60 @@
+# The console: characters on the framebuffer, driven from CPL 3.
+#
+# A separate crate for the reason every other component is one: the
+# compiler enforces what the design claims. This binary links against
+# `core` and the ABI and nothing else.
+#
+# It does **not** depend on `screen/`. That component is M14's
+# acceptance artefact, not a display service — zero `Recv`, no
+# drawing protocol. A real display server is a layer-2 design and
+# deserves its own pass; until then this component maps the
+# framebuffer itself and the two never run together (ADR 054).
+cargo-features = ["trim-paths"]
+
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2021"
+description = "Safrox console: a text console on the framebuffer, at CPL 3"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "console"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+safrox-abi = { path = "../abi" }
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = true
+codegen-units = 1
+# `s` rather than `2`, as the other components: the image is
+# embedded in the root task's, which the kernel maps into a fixed
+# number of frames, so size is the binding constraint.
+#
+# The drawing loop is the one place where that trade is worth
+# examining — it writes 128 pixels per character. It is still the
+# right call: those are volatile stores to write-combining memory
+# and the cost is the bus, not the instruction stream.
+opt-level = "s"
+lto = false
+trim-paths = "all"
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+trim-paths = "all"

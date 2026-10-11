@@ -1,0 +1,56 @@
+# The keyboard driver: the second device outside the kernel.
+#
+# A separate crate for the reason the serial driver is one — the
+# compiler enforces what the design claims. This binary links against
+# `core` and the ABI and nothing else; if a line of it needed a
+# kernel type it would not build.
+#
+# Loaded by the **root task**, not the kernel (ADR 043): built to a
+# flat image, embedded in the root task's .rodata, copied into a
+# Frame the root task maps read-execute.
+cargo-features = ["trim-paths"]
+
+[package]
+name = "keyboard-driver"
+version = "0.1.0"
+edition = "2021"
+description = "Safrox keyboard driver: PS/2 scan codes at CPL 3"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "keyboard-driver"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+safrox-abi = { path = "../abi" }
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = true
+codegen-units = 1
+# `s` rather than `2`, as the serial driver: this image is embedded
+# in the root task's, which the kernel maps into a fixed number of
+# frames, so size is the binding constraint. The driver is not on a
+# hot path either — it does a handful of port reads per keystroke and
+# then blocks.
+opt-level = "s"
+lto = false
+trim-paths = "all"
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+trim-paths = "all"

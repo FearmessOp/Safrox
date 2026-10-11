@@ -409,11 +409,41 @@ pub unsafe fn irq_control_get(
     handler.slot_generation = 0;
     handler.notification_slot = 0;
 
+    // **Point the line at its vector** (M15).
+    //
+    // A redirection entry carries a vector, a delivery mode, a
+    // destination and the line's electrical behaviour, and until
+    // M15 this kernel wrote none of them — only the mask bit, in
+    // `set_masked`. An entry left as the firmware found it delivers
+    // an undefined vector to an undefined CPU, so unmasking it
+    // opens a line that goes nowhere.
+    //
+    // The hole survived five milestones because nothing had used
+    // the chip: M10's interrupt tests raise theirs with a self-IPI,
+    // which goes LAPIC-to-CPU and never passes through the I/O
+    // APIC. IRQ 1 is the first real device line this kernel has had
+    // to deliver, and it arrived in M15.
+    //
+    // **Here and not in `ioapic::init`**, because routing is an
+    // answer to "who owns this line", and before this call nobody
+    // did. An unowned line stays masked and unrouted, which is the
+    // capability model showing through into the hardware: the chip
+    // is configured for lines that have an owner and for no others.
+    //
+    // SAFETY: An InterruptGuard is held for the whole function, and
+    // `irq` was bounded against MAX_IRQ above.
+    unsafe {
+        crate::ioapic::route(irq, crate::apic::IRQ_VECTOR_BASE + irq);
+    }
+
     // The line starts **masked**, and that is not caution but
     // arithmetic: an owner that has not yet attached a Notification
     // has nowhere to receive an interrupt, so delivering one would
     // produce a refusal by construction. `Ack` is what opens the
     // line, and a driver calls it when it is ready to be interrupted.
+    //
+    // `route` already leaves the mask bit set; this is what records
+    // it in the software flag the rest of the kernel reads.
     // SAFETY: An InterruptGuard is held for the whole function.
     unsafe {
         set_masked(irq as usize, true);

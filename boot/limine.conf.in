@@ -861,3 +861,84 @@ verbose: no
     protocol: limine
     path: boot():/boot/kernel.elf
     cmdline: fb-device-untyped-misuse
+
+
+/+Safrox (M15: keyboard and console)
+    comment: A keyboard component drives the i8042 at CPL 3 and a
+    comment: console component draws what it sends on the
+    comment: framebuffer. Keys are injected by the test harness over
+    comment: QEMU's QMP socket, so the path measured is a real one:
+    comment: IRQ 1, the driver, IPC, the console, pixels.
+    comment: The console reads its own pixels back out of the real
+    comment: framebuffer and checks them against the font bitmap --
+    comment: "I called the draw function" proves nothing.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-test
+
+/+Safrox (M15: a keyboard with no port capability)
+    comment: The keyboard component is built exactly as above and
+    comment: given no IOPort and no IRQHandler. It probes the device
+    comment: anyway and is refused at CPtr resolution -- the slot is
+    comment: empty, so there is nothing to invoke.
+    comment: Its scan code decoder still self-tests, which is what
+    comment: separates "refused the hardware" from "broken".
+    comment: Exit 33: a refusal is a caller-visible outcome.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-no-cap
+
+/+Safrox (M15: the keyboard driver dies)
+    comment: The keyboard's capabilities are revoked while the
+    comment: console waits on the endpoint they shared. The console
+    comment: survives, the system survives, and the shared Endpoint
+    comment: outlives the driver because it belongs to the root task
+    comment: rather than to either component.
+    comment: M13's driver-dies for a second device.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-driver-dies
+
+/+Safrox (M15: keys faster than the console draws)
+    comment: Keys are injected with no pause. The driver blocks in
+    comment: Send while the console draws, so it cannot accumulate
+    comment: -- what overflows is the i8042's own 16-byte queue,
+    comment: which reports an overrun the decoder counts.
+    comment: A bounded queue, overflowed for real, observed where it
+    comment: actually happens rather than in a buffer written to be
+    comment: overflowed.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-flood
+
+/+Safrox (M15: neither component can reach the other's device)
+    comment: Two claims, two mechanisms. The console names an IOPort
+    comment: it does not hold and gets EmptySlot -- isolation by
+    comment: construction (ADR 018). The keyboard reads the address
+    comment: the console mapped the framebuffer at and takes a #PF --
+    comment: isolation by paging.
+    comment: Both are shown because one does not imply the other,
+    comment: and because if either mechanism broke the remaining one
+    comment: would hide it.
+    comment: Exit 35: the second half is a fault.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-isolation
+
+/+Safrox (M15: the screen scrolls)
+    comment: Enough keys to fill the console and push it past the
+    comment: last row. The console holds a character grid in RAM and
+    comment: repaints only the cells that changed, so the cost is
+    comment: reported as cycles *and* as cells -- a saving that is
+    comment: measured rather than claimed.
+    comment: Verified by reading the real framebuffer at the top and
+    comment: the bottom: content moved up, last row cleared. Checking
+    comment: only the top would pass a scroll that left the old last
+    comment: row behind.
+    comment: Exit 33.
+    protocol: limine
+    path: boot():/boot/kernel.elf
+    cmdline: kbd-scroll

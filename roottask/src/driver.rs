@@ -143,19 +143,48 @@ pub struct Component {
     pub tables: [u32; 3],
     pub code: u32,
     pub stack: u32,
+    /// How many pages of stack. One for everybody until M15.
+    pub stack_pages: u32,
     pub kstack: u32,
 }
 
 impl Component {
     /// Reserve the slots one component needs.
     pub fn allocate(next: &mut u32, code_pages: u32) -> Component {
+        Component::allocate_sized(next, code_pages, 1)
+    }
+
+    /// As [`Component::allocate`], with the stack's size spelled out.
+    ///
+    /// # Why the stack became a parameter
+    ///
+    /// It was one page for everybody, and that was right for every
+    /// component up to M14: a driver's state is a few counters in
+    /// its main loop's locals.
+    ///
+    /// The console keeps a **character grid** — one byte per cell,
+    /// 160x50 on this screen, 8000 bytes — and it lives in `serve`'s
+    /// locals like everybody else's state, because the image is
+    /// mapped read-execute and `link.ld` asserts `.bss` is empty.
+    /// 8000 bytes does not fit in 4096.
+    ///
+    /// A parameter rather than raising it for everyone: a four-page
+    /// stack for a component that needs a few hundred bytes is waste
+    /// charged to the wrong budget (ADR 022), and three of the four
+    /// pages would never be touched.
+    ///
+    /// The alternative was a Frame mapped read-write for the grid.
+    /// It would work and buys nothing — the grid is private,
+    /// single-threaded, and exactly as large as a stack can hold.
+    pub fn allocate_sized(next: &mut u32, code_pages: u32, stack_pages: u32) -> Component {
         Component {
             tcb: take(next),
             cnode: take(next),
             vspace: take(next),
             tables: [take(next), take(next), take(next)],
             code: take_run(next, code_pages),
-            stack: take(next),
+            stack: take_run(next, stack_pages),
+            stack_pages,
             kstack: take_run(next, 4),
         }
     }
@@ -261,7 +290,14 @@ pub fn retype_component_sized(
     );
     worst = first_error(
         worst,
-        crate::retype(untyped, cap_type::FRAME, 0, 1, own_cnode, component.stack),
+        crate::retype(
+            untyped,
+            cap_type::FRAME,
+            0,
+            component.stack_pages as u64,
+            own_cnode,
+            component.stack,
+        ),
     );
     worst = first_error(
         worst,
@@ -357,17 +393,29 @@ pub fn setup_component_patched(
 
     worst = first_error(worst, load_image(info, component, image, code_pages, patch));
 
-    worst = first_error(
-        worst,
-        invoke(
-            slot(component.stack).0,
-            method::FRAME_MAP,
-            slot(component.vspace).0,
-            STACK,
-            perm::READ_WRITE,
-            0,
-        ),
-    );
+    // The stack grows **down**, so a multi-page stack is mapped with
+    // its last page at `STACK` and the earlier ones below it: page
+    // `n` of `stack_pages` goes to `STACK - (pages - 1 - n) * 4096`.
+    //
+    // Mapping them upwards from `STACK` instead would put the spare
+    // pages where the stack never goes, and the first push past
+    // 4 KiB would fault — a four-page stack that behaves exactly
+    // like a one-page stack, which is ADR 023's K5 in a mapping
+    // loop.
+    for page in 0..component.stack_pages {
+        let address = STACK - ((component.stack_pages - 1 - page) as u64) * 4096;
+        worst = first_error(
+            worst,
+            invoke(
+                slot(component.stack + page).0,
+                method::FRAME_MAP,
+                slot(component.vspace).0,
+                address,
+                perm::READ_WRITE,
+                0,
+            ),
+        );
+    }
 
     worst = first_error(
         worst,

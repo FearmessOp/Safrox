@@ -22,6 +22,13 @@ __pycache__/
 
 # The question-7 probe builds its own crate.
 /scripts/m9-index-probe/target/
+
+# The M15 spike assembles a boot sector to answer one question:
+# does QMP `send-key` actually reach port 0x60 (ADR 056). The
+# source is committed and the image is not — it is 512 bytes of
+# build output and `run.py` there rebuilds it.
+/scripts/m15-spike/probe.img
+/scripts/m15-spike/*.o
 # The root task is built as a separate crate (M12), so it has a
 # `target/` of its own. `/target/` above is anchored to the
 # repository root and does not reach it — the first `git add -A`

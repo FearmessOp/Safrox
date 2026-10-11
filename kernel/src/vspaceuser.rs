@@ -205,7 +205,51 @@ const _: () = assert!(A_ONLY_VSPACE < (1usize << COMPONENT_LEAF_RADIX));
 // low byte is the step number.
 
 const CHANNEL: u64 = 1 << 24;
-const CHANNEL_DONE: u64 = 1 << 25;
+
+/// M11's "the child finished" channel.
+///
+/// **Bit 23, and it was bit 25 until M15.** `channel::CONSOLE` is
+/// bit 25, so every report the console component made was taken by
+/// this module, recorded as "the M11 child is done", and answered
+/// `true` — which stopped the chain before `kbdtest` ever saw it.
+/// The console looked silent and the scenario blamed it for never
+/// starting.
+///
+/// This is the third time a channel bit has been reused, and the
+/// first two are written up in `abi::channel::KEYBOARD`. The cost
+/// each time is the same: a component that reports faithfully into
+/// a slot belonging to someone else, and a failure a long way from
+/// its cause.
+///
+/// It stays here rather than moving to `abi::channel` because this
+/// one is **not** a component's: the program that sends it is
+/// hand-assembled by this module a few hundred lines below, and
+/// nothing outside the kernel can name it. What ADR 047 asks for is
+/// that the *components'* channels be declared once, which is now
+/// true -- `screen`, `keyboard` and `console` all take theirs from
+/// the ABI. The bits those occupy are what this had to move out of.
+const CHANNEL_DONE: u64 = 1 << 23;
+
+// Bits 25, 26 and 27 belong to the console, the keyboard and the
+// screen (`abi::channel`). Asserted rather than remembered: the
+// next person to pick a bit here gets a failed build instead of a
+// silent theft.
+const _: () = assert!(
+    CHANNEL
+        & (safrox_abi::channel::CONSOLE
+            | safrox_abi::channel::KEYBOARD
+            | safrox_abi::channel::SCREEN)
+        == 0,
+    "vspaceuser's channel overlaps a component's"
+);
+const _: () = assert!(
+    CHANNEL_DONE
+        & (safrox_abi::channel::CONSOLE
+            | safrox_abi::channel::KEYBOARD
+            | safrox_abi::channel::SCREEN)
+        == 0,
+    "vspaceuser's done channel overlaps a component's"
+);
 
 /// Steps a component reports, one slot each.
 const STEP_COUNT: usize = 18;

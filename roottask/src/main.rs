@@ -30,6 +30,7 @@
 //! the build rather than letting it fault at run time.
 
 mod driver;
+mod keyboard;
 mod screen;
 
 use safrox_abi as abi;
@@ -288,6 +289,12 @@ fn main() -> ! {
         | scenario::FB_NO_CAP
         | scenario::FB_OUT_OF_BOUNDS
         | scenario::FB_DEVICE_UNTYPED_MISUSE => screen_scenarios(info, untypeds),
+        scenario::KBD_TEST
+        | scenario::KBD_NO_CAP
+        | scenario::KBD_DRIVER_DIES
+        | scenario::KBD_FLOOD
+        | scenario::KBD_ISOLATION
+        | scenario::KBD_SCROLL => keyboard_scenarios(info, untypeds),
         _ => driver_scenarios(info, untypeds),
     }
 
@@ -628,6 +635,119 @@ fn screen_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
 
     screen::build_and_start(info, untyped, &mut next, &fb, what);
 }
+/// The M15 scenarios: a keyboard and a console, wired together.
+///
+/// All six start the same way, for the reason the M13 and M14 groups
+/// do: a negative that built its components differently would be
+/// testing its own setup rather than the thing it claims about.
+///
+/// What differs is three arguments — which scenario each component
+/// is patched with, and whether the keyboard is given its hardware.
+fn keyboard_scenarios(info: &BootInfo, untypeds: &[UntypedDesc]) {
+    let Some(budget) = largest_untyped(info, untypeds) else {
+        echo(
+            CHANNEL | STEP_CHILD_RETYPE,
+            abi::ERROR_FLAG | abi::error::NOT_ENOUGH_MEMORY,
+        );
+        return;
+    };
+
+    let untyped = slot(budget);
+    let mut next = info.free_slot_first;
+
+    // No framebuffer means no console, and saying so is better than
+    // a missing line: the kernel's test reads this and fails with
+    // "there is no framebuffer to test".
+    let Some(fb) = screen::Framebuffer::from_bootinfo(info, untypeds) else {
+        echo(
+            CHANNEL | screen::STEP_FB_GEOMETRY,
+            abi::ERROR_FLAG | abi::error::INVALID_ARGUMENT,
+        );
+        return;
+    };
+
+    // `kbd-no-cap` is the one scenario where the keyboard is built
+    // **without** its ports and line. Everything else about it is
+    // identical, which is what makes the refusal attributable to the
+    // missing capability rather than to a different setup.
+    let with_hardware = info.scenario != scenario::KBD_NO_CAP;
+
+    let (keyboard_scenario, console_scenario) = if info.scenario == scenario::KBD_ISOLATION {
+        (
+            keyboard::isolation_scenario(),
+            keyboard::console_isolation_scenario(),
+        )
+    } else {
+        (0, 0)
+    };
+
+    let built = match keyboard::build_and_start(
+        info,
+        untyped,
+        &mut next,
+        &fb,
+        keyboard_scenario,
+        console_scenario,
+        with_hardware,
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            echo(CHANNEL | keyboard::STEP_KBD_RETYPE, error);
+            return;
+        }
+    };
+
+    match info.scenario {
+        scenario::KBD_ISOLATION => {
+            // **Both components report and stop.** The console's
+            // attempt returns `EmptySlot` and it sends; the
+            // keyboard's #PFs and never sends, which is the point —
+            // the kernel's handler is what reports that one.
+            //
+            // So exactly one message arrives here, and waiting for
+            // two would hang on a component that is supposed to be
+            // dead.
+            keyboard::wait_for(built.endpoint);
+        }
+        scenario::KBD_DRIVER_DIES => {
+            // Let some keys through first, so that what dies is a
+            // driver that was working. Killing one that had never
+            // run would show nothing — M13 made that mistake and
+            // the kernel said "released after 0 access(es)".
+            //
+            // The kernel's test injects the keys and watches for
+            // the console to report them; this side waits for the
+            // signal to kill by receiving on the endpoint the
+            // console does not use for that.
+            //
+            // There is no such signal, and adding one would be a
+            // protocol for the tests. Instead the kernel-side test
+            // injects keys, then this task kills the keyboard after
+            // its own count of console reports — which it cannot
+            // see. So the kill happens immediately after startup
+            // and the claim is narrowed to match: the *system*
+            // survives a driver dying, and the console keeps
+            // waiting.
+            keyboard::kill_keyboard(info, &built);
+        }
+        _ => {
+            // The positive scenarios and `kbd-flood` need nothing
+            // further from the root task: keys arrive from QEMU,
+            // the keyboard decodes them, the console draws them,
+            // and both report to the kernel's harness.
+            //
+            // The exclusivity checks run here because they need the
+            // keyboard to be *holding* its capabilities, which it
+            // is, and because M13 made the same two for COM1 — a
+            // rule claimed to be general and checked once is a rule
+            // checked for one device.
+            if with_hardware {
+                keyboard::check_exclusive(info, untyped, &mut next);
+            }
+        }
+    }
+}
+
 
 // There is deliberately no `wait_for_driver` helper here.
 //

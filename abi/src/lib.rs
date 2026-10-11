@@ -309,6 +309,26 @@ pub mod channel {
     pub const DRIVER: u64 = 1 << 31;
     /// The screen component (M14).
     pub const SCREEN: u64 = 1 << 27;
+    /// The keyboard component (M15).
+    ///
+    /// **Bit 26, and the first two choices were both taken.** The
+    /// keyboard was written with bit 30 and the console with bit 29,
+    /// which are [`ROOT_PANIC`] and [`ROOT_DONE`] — so every key
+    /// event would have registered as the root task panicking, and
+    /// the scenario would have failed somewhere with no visible
+    /// relationship to the keyboard.
+    ///
+    /// Found by reading this module rather than by running the test,
+    /// which is luck: the components name their channels as bare
+    /// constants in their own source, so nothing checks that two
+    /// agree or that one is free.
+    ///
+    /// The real fix is for every component to take its channel from
+    /// here. ADR 047 said so in M13 and it has not been done; the
+    /// cost of not doing it has now been paid twice.
+    pub const KEYBOARD: u64 = 1 << 26;
+    /// The console component (M15).
+    pub const CONSOLE: u64 = 1 << 25;
 
     /// A component's panic handler ran: its channel OR this.
     ///
@@ -350,6 +370,43 @@ pub mod scenario {
     pub const FB_OUT_OF_BOUNDS: u32 = 7;
     /// The screen component tries to retype a TCB from device memory.
     pub const FB_DEVICE_UNTYPED_MISUSE: u32 = 8;
+
+    // ---- M15 ---------------------------------------------------------
+    //
+    // Appended, like every block before them. The numbers are frozen:
+    // a component that has learned what 8 means must keep being right
+    // about it.
+    //
+    // **The screen component does not run in any of these.** It is
+    // M14's acceptance artefact rather than a display service (zero
+    // `Recv`), so the console maps the framebuffer itself and the two
+    // never share a scenario — see ADR 054.
+
+    /// Build a keyboard and a console, inject keys, read the pixels
+    /// back.
+    pub const KBD_TEST: u32 = 9;
+    /// The keyboard component is built without its IOPort
+    /// capabilities and tries to reach the device anyway.
+    pub const KBD_NO_CAP: u32 = 10;
+    /// The keyboard is killed mid-stream; the console and the system
+    /// carry on.
+    pub const KBD_DRIVER_DIES: u32 = 11;
+    /// Keys arrive faster than the console consumes them.
+    ///
+    /// What overflows is the **i8042's own queue**, not a buffer in
+    /// the driver: `Send` blocks, so the driver cannot accumulate
+    /// (ADR 053). The device reports the overrun and the driver
+    /// counts it.
+    pub const KBD_FLOOD: u32 = 12;
+    /// Each component tries to reach the other's hardware.
+    ///
+    /// Two claims in one scenario: the keyboard touching the
+    /// framebuffer's address takes a #PF, the console naming an
+    /// IOPort gets `EmptySlot`. Different mechanisms — paging and
+    /// the capability model — so both are shown.
+    pub const KBD_ISOLATION: u32 = 13;
+    /// Enough keys to fill the screen and scroll it.
+    pub const KBD_SCROLL: u32 = 14;
 }
 
 /// One Untyped the root task holds. 16 bytes.

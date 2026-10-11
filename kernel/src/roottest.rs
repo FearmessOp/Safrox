@@ -40,7 +40,7 @@ const CHANNEL_DONE: u64 = 1 << 29;
 const CHANNEL_PANIC: u64 = 1 << 30;
 
 /// How many steps the root task reports.
-const STEP_COUNT: usize = 20;
+const STEP_COUNT: usize = 80;
 
 const STEP_MAGIC: u64 = 0;
 const STEP_VERSION: u64 = 1;
@@ -99,6 +99,29 @@ pub fn record_step(channel: u64, value: u64) -> bool {
 
 fn step(which: u64) -> u64 {
     STEPS[which as usize].load(Ordering::Acquire)
+}
+
+/// Read a step this module does not itself check.
+///
+/// **M15's steps are the root task's, and M15's checks are not.**
+/// The root task reports building the keyboard and the console on
+/// *this* channel — it is the root task talking — but what those
+/// reports mean belongs to `kbdtest`, which owns that scenario.
+///
+/// Exposed rather than duplicated: a second recorder on a second
+/// channel would mean the root task choosing a channel per
+/// milestone, and the channel collisions ADR 047 keeps paying for
+/// are exactly that habit.
+///
+/// Returns [`NOT_REPORTED`] for a step nobody sent, which a caller
+/// has to distinguish from a step reported as zero — most
+/// invocations succeed with zero.
+pub fn m15_step(which: u64) -> u64 {
+    let index = which as usize;
+    if index >= STEP_COUNT {
+        return NOT_REPORTED;
+    }
+    STEPS[index].load(Ordering::Acquire)
 }
 
 /// Reassemble a 64-bit value the root task reported in halves.

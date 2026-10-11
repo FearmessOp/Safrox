@@ -31,7 +31,11 @@ members = []
 # linked with the kernel's script *as well as* its own — producing a
 # binary at -2 GiB, in the kernel half, where CPL 3 cannot fetch a
 # single instruction.
-exclude = ["roottask", "driver", "screen"]
+# `keyboard` and `console` join the list for the same reason, which
+# by now is a property of every user component: its own linker
+# script, its own load address, and a build script that replaces
+# RUSTFLAGS rather than adding to them.
+exclude = ["roottask", "driver", "screen", "keyboard", "console"]
 
 [dependencies]
 # Limine boot protocol bindings. Only the request/response structures are

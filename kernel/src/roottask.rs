@@ -73,10 +73,53 @@ static ROOT_TASK_IMAGE: &[u8] = include_bytes!("../../build/roottask.bin");
 /// Two pages failed the link, which is the guard working: the
 /// message named the limit rather than producing a program with its
 /// tail missing.
-const ROOT_CODE_PAGES: usize = 8;
+///
+/// **Twelve from M15.** Eight was enough through M14; M15 embedded
+/// the keyboard and the console and the image became 44792 bytes.
+/// The guard worked again, and again it named the limit rather than
+/// truncating the program:
+///
+/// ```text
+/// roottask image is 44792 bytes; the kernel maps 32768.
+/// ```
+///
+/// What the four embedded images cost, measured rather than
+/// estimated:
+///
+/// | component | bytes |
+/// |---|---|
+/// | serial-driver.bin | 1212 |
+/// | screen.bin | 4230 |
+/// | keyboard.bin | 5885 |
+/// | console.bin | 10696 |
+///
+/// Twelve rather than sixteen. Sixteen would not have to be revisited
+/// for two more milestones, and that is the whole of its case —
+/// against which stand three pages charged to a budget that does not
+/// need them (ADR 022). The wall is cheap: it is a link-time error
+/// that names the limit and says what to change. Paying three pages
+/// up front to avoid a cheap wall buys nothing.
+///
+/// **This is a size parameter, not a mechanism.** M15 adds no object
+/// type, no method number and no syscall; growing a constant that
+/// says how many pages an image needs is not the kernel learning
+/// something new.
+///
+/// # The rule for next time
+///
+/// This is the third increase. **The fourth will not be made as a
+/// constant bump**: at that point embedding should give way to
+/// loading modules separately (Limine modules, or an initrd), and
+/// that discussion deserves an ADR.
+///
+/// The reason to write the rule down now rather than when it is
+/// needed: a constant increase looks justified every single time and
+/// never stops itself. Each component embedded grows this linearly,
+/// and naming the limit is cheaper than hitting it.
+const ROOT_CODE_PAGES: usize = 12;
 
 const _: () = assert!(
-    ROOT_CODE_PAGES * 4096 >= 21000,
+    ROOT_CODE_PAGES * 4096 >= 44792,
     "ROOT_CODE_PAGES is too small for the root task image"
 );
 

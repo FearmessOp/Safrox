@@ -8,7 +8,7 @@ Bir şeyin bu listede olması "muhtemelen bozuk" demek değil. "Testlerin
 geçmesi bu konuda hiçbir şey kanıtlamıyor" demek — ki test takımına
 güvenirken bilinmesi gereken bir şey.
 
-Güncelleme: M4.
+Güncelleme: M15.
 
 ---
 
@@ -389,3 +389,167 @@ kısa devresi yüzünden kazara doğru çalışıyordu. Artık `is_huge`
 seviyeyi alıyor. Bu, donanım doğrulaması gerektirmiyor — SDM Vol. 3A
 Tablo 4-19 yeterli — ama 2 MiB sayfa kullanan ilk kod o kısa devreye
 güvenemeyecek.
+
+---
+
+## 11. Klavye scan code seti 1'e bağlı, çünkü BIOS öyle bıraktı (M15)
+
+**İddia** ([ADR 053](adr/053-klavye-surucu-modeli.md)): klavye
+sürücüsü scan code **set 1** çözüyor. Set 2 değil — brief set 2
+varsayıyordu ve ölçüm yanlışladı.
+
+**Ölçüm.** `scripts/m15-spike/`, 512 baytlık bir boot sector, 0x64'ü
+yoklayıp 0x60'tan okuduğu baytları seri porta basıyor. Projenin
+kendi QEMU bayraklarıyla:
+
+```
+SPIKE-READY 1e 9e 2a 1e 9e aa e0 48 e0 c8 1d 2e ae 9d 38 2d ad b8
+```
+
+`a` → `1e 9e`. Set 2 olsaydı `1c` ve break iki baytlı (`f0 1c`)
+olurdu. Gelen set 1: i8042'nin çeviri biti açık, ve onu açan
+SeaBIOS.
+
+**Neden burada sınanamıyor.** QEMU'da yalnızca bir firmware var ve o
+da çeviriyi açıyor. "Çeviri kapalıyken ne olur" sorusunu bu ortamda
+sormanın tek yolu denetleyiciyi ilklendirmek — ki kapsam dışı
+bırakıldı, çünkü ilklendirmeyi *eklemek* bu maddeyi kapatmaz, sadece
+başka bir varsayıma taşır.
+
+**Gerçek donanımda.** Üç makine, üç soru:
+
+1. **UEFI ile boot eden bir makine, CSM kapalı.** Legacy USB desteği
+   yoksa i8042 hiç olmayabilir. Beklenen: sürücü 0x64'ten 0xFF okur
+   (boş bus) ve tek bir tuş üretmez. Bu durumda `kbd-test` vacuous
+   geçmemeli — sürücü "hiç bayt gelmedi" diye raporluyor.
+2. **Gerçek PS/2 klavyesi olan eski bir makine.** Beklenen: aynı
+   baytlar, aynı davranış.
+3. **USB klavye, legacy emülasyon açık.** Beklenen: yine set 1, ama
+   firmware'e göre değişebilir.
+
+Her üçünde de sürücünün **tanınmayan bayt sayacı** okunacak. Sıfırdan
+büyükse akış beklenenden farklı, ve rakam ne kadarının anlaşılmadığını
+söylüyor.
+
+**Yanlış çıkarsa.** Bir makinede set 2 gelirse sürücü her baytı
+tanınmaz sayar ve tek karakter basmaz — sessizce yanlış karakter
+basmaz, ki bu kasıtlı bir tasarım: tanınmayan bayt atılıyor ve
+sayılıyor, tahmin edilmiyor. Çözüm, ilklendirme ekleyip seti açıkça
+seçmek olurdu (ADR 053'ün elenen (b) seçeneği).
+
+---
+
+## 12. Gölge tampon kazancı ve WC bellekten okuma maliyeti (M15)
+
+**İddia** ([ADR 054](adr/054-konsol-font-ve-kaydirma.md)): konsol
+RAM'de gölge tampon tutuyor ve framebuffer'ı yalnızca yazıyor,
+çünkü write-combining bellekten **okumak** patolojik olarak yavaş.
+Kaydırma, gölge tamponda `copy_within` + framebuffer'a tek yönlü
+blit.
+
+**Neden QEMU'da sınanamıyor.** Madde 10 ile aynı sebep: TCG bir WC
+tamponu modellemiyor, ve okuma tarafında da gerçek bir PCIe
+gidiş-dönüşü yok. Emülasyonda okuma ile yazma neredeyse aynı
+maliyette, yani gölge tamponun kazancı **ölçülemiyor** — hatta
+negatif görünebilir, çünkü fazladan bir RAM kopyası var.
+
+Ölçüm yine de raporlanıyor: kaydırma süresi bir taban ve yolun
+çalıştığının kanıtı.
+
+**Gerçek donanımda.** İki ölçüm:
+
+1. Kaydırmayı iki yolla koş — gölge tamponlu (bugünkü kod) ve
+   doğrudan framebuffer içinde `memmove` ile. Beklenen: gölge
+   tamponlu olan belirgin biçimde hızlı, çünkü ikincisi 1 milyon
+   piksel **okuyor**. Değilse ADR 054'ün (a) seçeneğini eleme
+   gerekçesi yanlıştı.
+2. Framebuffer'dan tek bir piksel okumanın maliyetini ölç ve
+   yazmayla karşılaştır. ADR 054'ün doğrulama stratejisi — tam ekran
+   yerine ~50 piksel örneklemek — bu rakamın büyük olduğu
+   varsayımına dayanıyor. Küçükse örnekleme gereksiz ve doğrulama
+   genişletilebilir.
+
+**Yanlış çıkarsa.** Gölge tampon 3,9 MiB RAM ve bir kopyalama adımı
+demek. Kazanç yoksa ikisi de boşa gidiyor ve doğrudan framebuffer'a
+çizmek daha basit olurdu.
+
+---
+
+## 13. I/O APIC yönlendirmesi ISA varsayımına dayanıyor (M15)
+
+**Durum:** açık borç, QEMU'da muhtemelen doğru, gerçek donanımda
+doğrulanmadı.
+
+### Ne yapıldı
+
+M15'e kadar bu kernel I/O APIC yönlendirme girdisinin yalnızca
+maske bitini yazıyordu. Diğer 63 bit — vektör, teslim kipi, hedef
+kipi, polarite, tetikleme kipi, hedef CPU — firmware'in bıraktığı
+değerdeydi, ve maskesi kaldırılan böyle bir hat hiçbir yere teslim
+etmiyordu. IRQ 1 bu yoldan geçen ilk gerçek cihaz hattı olduğu için
+eksiklik beş milestone boyunca görünmedi (ADR 042'nin M15 eki).
+
+`IRQControl.Get` artık girdinin tamamını yazıyor:
+
+| Alan | Değer | Kaynağı |
+|---|---|---|
+| Vektör | `IRQ_VECTOR_BASE + irq` | Kernel'in kendi sözleşmesi |
+| Teslim kipi | Fixed | Tek anlamlı seçenek (SDM 11.5.1) |
+| Hedef kipi | Physical | Mantıksal şema yok |
+| **Polarite** | **Active high** | **ISA varsayımı** |
+| **Tetikleme** | **Edge** | **ISA varsayımı** |
+| Hedef | LAPIC 0 | Tek CPU (madde 7) |
+
+Kalın yazılan ikisi varsayım.
+
+### Risk
+
+Polarite ve tetikleme kipinin yetkili kaynağı ACPI'nin MADT
+tablosundaki **Interrupt Source Override** girdileri. Bu kernel
+MADT okumuyor; Limine RSDP'yi veriyor ama hiçbir ACPI tablosu
+ayrıştırılmıyor.
+
+QEMU'nun q35 makinesinde IRQ 1 için tipik olarak override yok —
+override'lar genellikle IRQ 0→GSI 2 ve SCI hattı için üretiliyor.
+Yani varsayım burada muhtemelen yalnızca işe yarıyor değil, doğru.
+Bu borcu **küçültüyor, kaldırmıyor.**
+
+Yanlış olursa iki farklı arıza:
+
+- **Polarite ters:** hat hiç tetiklenmez ya da sürekli tetiklenir.
+- **Level-triggered bir hattı edge sanmak:** cihaz hattı indirene
+  kadar yeniden tetikleme beklenmediği için ilk kesmeden sonra
+  sessizlik; ya da tersi durumda **kesme fırtınası**. İkincisi
+  eksik kesmeden daha kötü, çünkü sistem meşgul görünerek durur.
+
+PCI cihazları level-triggered ve active-low; bu kernel bir PCI
+cihazına kesme hattı verdiği anda varsayım kesin olarak yanlış
+olacak.
+
+### Nasıl doğrulanır
+
+1. **Gerçek donanım, legacy PS/2 klavyeli eski bir makine.**
+   Beklenen: `kbd-test` geçer ve `[kbd] the I/O APIC has IRQ 1 on
+   vector 34, unmasked, fixed delivery to LAPIC 0, edge triggered
+   and active high` satırı çıkar. Çıkmazsa `ioapic::verify` hangi
+   alanın farklı olduğunu söyler.
+
+2. **MADT'yi elle oku ve karşılaştır.** `acpidump` ile MADT'yi
+   dökmek ve Interrupt Source Override girdilerini listelemek
+   yeterli. IRQ 1 için bir girdi varsa varsayım o makinede yanlış.
+
+3. **UEFI ile boot eden bir makine.** Madde 11'in senaryosuyla
+   aynı koşu; orada scan code seti, burada hat yapılandırması
+   sınanıyor.
+
+### Çözüm
+
+MADT okuma. Limine RSDP'yi veriyor, oradan XSDT'ye, oradan MADT'ye;
+Interrupt Source Override girdileri GSI numarasını, polariteyi ve
+tetikleme kipini bildiriyor.
+
+**M16 veya sonrası, ve bir ADR hak ediyor:** ACPI tablolarına
+dokunmak kernel'e yeni bir ayrıştırıcı sokmak demek, ve hangi
+tabloların kernel'de hangilerinin bir bileşende okunacağı M15'in
+içinde aceleyle verilecek bir karar değil. ADR 046'nın "kernel'de
+kalan donanım" listesi bu soruyu da kapsamalı.

@@ -293,6 +293,7 @@ fn report(frame: &ExceptionFrame) {
         // runs again before the fault. The only code that sees both
         // the prediction and CR2 is this handler.
         crate::fbtest::check_predicted_fault(cr2);
+        crate::kbdtest::check_predicted_fault(cr2);
     }
 }
 
@@ -443,6 +444,18 @@ unsafe fn handle_irq(vector: u64) {
     // own. This is the first time it is reached from a path a user
     // component triggers.
     crate::irqtest::allocate_from_handler_if_armed();
+
+    // **The kernel's end of M15's latency measurement.**
+    //
+    // Taken here rather than in the keyboard component because the
+    // component's first instruction runs after the kernel has
+    // already delivered this interrupt, signalled a Notification,
+    // scheduled a thread and returned to CPL 3. A reading taken
+    // there would exclude the part of the path the microkernel is
+    // responsible for — which is the part worth measuring.
+    //
+    // Two atomic stores on the interrupt path, and only for line 1.
+    crate::kbdtest::record_irq(irq);
 
     // SAFETY: We are in interrupt context with IF clear, which is
     // exactly `handle_interrupt`'s precondition.
