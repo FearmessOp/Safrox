@@ -668,6 +668,12 @@ başarısız oldu.
 - **K14:** Bir commit'in içeriği kasıtlıdır. `git add -A`'den önce
   `git status --porcelain` okunur ve dosya listesi doğrulanır;
   `.gitignore` bir sigorta, bilerek eklemek politika.
+- **K15:** Etkileşimli istem açabilen komutlar (sudo, git push/pull,
+  ssh, apt, gh auth) **borulanmaz**. Boru istemi yutar; süreç
+  sessizce beklerken dışarıdan bakılırsa durmuş görünür. Çıktı
+  gerekiyorsa dosyaya yazılır ve exit kodu okunur. K8'in araç
+  tarafındaki hali: görünmeyen bir bekleme, olmayan bir bekleme
+  gibi davranamaz.
 - Otomatik denetim ertelendi; üç yol değerlendirildi ve her birinin
   maliyeti yazıldı.
 - M6+ testleri bu kurallara uyacak. Mevcut testler M4'te zaten
